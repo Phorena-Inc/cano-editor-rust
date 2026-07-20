@@ -1,0 +1,29 @@
+[package]
+name = "cano-fresh"
+version = "0.1.0"
+edition = "2024"
+exclude = ["build/", "result", "target/", "**/__pycache__/", "*.py[cod]"]
+license = "Apache-2.0"
+description = "Fresh Rust implementation of Cano from the migration specification"
+default-run = "cano"
+
+[lib]
+name = "cano_fresh"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cano"
+path = "src/main.rs"
+
+[dependencies]
+crossterm = "0.29.0"
+mlua = { version = "0.12.0", features = ["lua54", "vendored"] }
+ratatui = "0.30.2"
+
+[profile.release]
+opt-level = "z"     # Optimize for size; "z" also turns off loop vectorization
+strip = true        # Automatically strip symbols and debuginfo from the binary
+lto = true          # Enable Link-Time Optimization across all crates
+codegen-units = 1   # Reduce parallel code generation units to allow more aggressive size optimization
+panic = "abort"     # Remove stack unwinding code; application aborts immediately on panic
+

@@ -1,0 +1,24 @@
+Commands
+  set-var name expression  update a runtime option
+  set-output "path"       choose the save destination
+  set-map key "keys"      add a key mapping (expands in Normal mode)
+  let name expression     append an integer variable
+  echo value              display a string or variable
+  :w                      save
+  :q                      quit if there are no unsaved changes
+  :q!                     quit and discard unsaved changes
+  :wq                     save and quit
+  :e / :we                legacy exit / save-and-exit aliases
+                          (:e respects the unsaved-changes guard)
+  !command                run through sh -c and show the last stdout line
+
+Special mapping keys
+  <space> <esc>/<escape> <tab> <nul>
+  <cr>/<enter>/<return> <bs>/<backspace>
+  <up> <down> <left> <right> <home> <end>
+  <delete>/<del> <insert>/<ins>
+  <pageup>/<page-up> <pagedown>/<page-down>
+  <c-a> through <c-z> (also <ctrl-a> through <ctrl-z>) and <c-?>
+
+  A mapping can run a colon command by embedding the Enter that submits it,
+  e.g. set-map <c-p> ":wq" with a literal newline before the closing quote.

@@ -1,0 +1,249 @@
+use std::io::{self, Stdout, stdout};
+use std::time::{Duration, Instant};
+
+use crossterm::cursor::{SetCursorStyle, Show};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
+};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+
+use crate::editor::Mode;
+
+const SIZE_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Input {
+    Byte(u8),
+    Control(u8),
+    Escape,
+    Enter,
+    Backspace,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    Delete,
+    Insert,
+    PageUp,
+    PageDown,
+    Resize,
+    Unsupported,
+}
+
+pub fn translate_key(key: KeyEvent) -> Input {
+    match key.code {
+        KeyCode::Char(character)
+            if character.is_ascii() && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            Input::Control((character as u8) & 0x1f)
+        }
+        KeyCode::Char(character) if character.is_ascii() => Input::Byte(character as u8),
+        KeyCode::Esc => Input::Escape,
+        KeyCode::Enter => Input::Enter,
+        KeyCode::Tab => Input::Byte(b'\t'),
+        KeyCode::Backspace => Input::Backspace,
+        KeyCode::Left => Input::Left,
+        KeyCode::Right => Input::Right,
+        KeyCode::Up => Input::Up,
+        KeyCode::Down => Input::Down,
+        KeyCode::Home => Input::Home,
+        KeyCode::End => Input::End,
+        KeyCode::Delete => Input::Delete,
+        KeyCode::Insert => Input::Insert,
+        KeyCode::PageUp => Input::PageUp,
+        KeyCode::PageDown => Input::PageDown,
+        _ => Input::Unsupported,
+    }
+}
+
+fn read_event() -> io::Result<Input> {
+    loop {
+        match event::read()? {
+            // Windows delivers both Press and Release key events; acting on
+            // releases would process every keystroke twice.
+            Event::Key(key) if key.kind == KeyEventKind::Release => continue,
+            Event::Key(key) => return Ok(translate_key(key)),
+            Event::Resize(_, _) => return Ok(Input::Resize),
+            _ => return Ok(Input::Unsupported),
+        }
+    }
+}
+
+pub struct TerminalSession {
+    pub terminal: Terminal<CrosstermBackend<Stdout>>,
+    last_size: (u16, u16),
+}
+
+/// Restores the terminal before the default panic output runs.
+///
+/// The release profile aborts on panic, so `Drop for TerminalSession` never
+/// runs on that path; without this hook a panic leaves the user's shell in
+/// raw mode on the alternate screen, and the panic message is either
+/// invisible or erased along with that screen.
+fn install_panic_hook() {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = disable_raw_mode();
+            let _ = execute!(
+                stdout(),
+                LeaveAlternateScreen,
+                SetCursorStyle::DefaultUserShape,
+                Show
+            );
+            default(info);
+        }));
+    });
+}
+
+impl TerminalSession {
+    pub fn start() -> io::Result<Self> {
+        install_panic_hook();
+        enable_raw_mode()?;
+        let mut output = stdout();
+        if let Err(error) = execute!(output, EnterAlternateScreen, SetCursorStyle::SteadyBlock) {
+            let _ = disable_raw_mode();
+            let _ = execute!(
+                stdout(),
+                LeaveAlternateScreen,
+                SetCursorStyle::DefaultUserShape,
+                Show
+            );
+            return Err(error);
+        }
+
+        let terminal = match Terminal::new(CrosstermBackend::new(output)) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let _ = disable_raw_mode();
+                let _ = execute!(
+                    stdout(),
+                    LeaveAlternateScreen,
+                    SetCursorStyle::DefaultUserShape,
+                    Show
+                );
+                return Err(error);
+            }
+        };
+        let mut session = Self {
+            terminal,
+            last_size: (0, 0),
+        };
+        session.last_size = size()?;
+        Ok(session)
+    }
+
+    fn size_changed(&mut self) -> io::Result<bool> {
+        let current = size()?;
+        let changed = current != self.last_size;
+        self.last_size = current;
+        Ok(changed)
+    }
+
+    fn poll_input(&mut self, timeout: Duration) -> io::Result<Option<Input>> {
+        if event::poll(timeout)? {
+            let input = read_event()?;
+            let _ = self.size_changed()?;
+            return Ok(Some(input));
+        }
+        Ok(self.size_changed()?.then_some(Input::Resize))
+    }
+
+    pub fn read_input(&mut self) -> io::Result<Input> {
+        loop {
+            if let Some(input) = self.poll_input(SIZE_CHECK_INTERVAL)? {
+                return Ok(input);
+            }
+        }
+    }
+
+    pub fn read_input_before(&mut self, deadline: Instant) -> io::Result<Option<Input>> {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            if let Some(input) = self.poll_input(remaining.min(SIZE_CHECK_INTERVAL))? {
+                return Ok(Some(input));
+            }
+        }
+    }
+
+    pub fn update_cursor(&mut self, mode: Mode) -> io::Result<()> {
+        if mode == Mode::Visual {
+            self.terminal.hide_cursor()?;
+        } else {
+            self.terminal.show_cursor()?;
+        }
+        execute!(
+            self.terminal.backend_mut(),
+            if mode == Mode::Insert {
+                SetCursorStyle::BlinkingBar
+            } else {
+                SetCursorStyle::DefaultUserShape
+            }
+        )
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            LeaveAlternateScreen,
+            SetCursorStyle::DefaultUserShape,
+            Show
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translates_ascii_control_and_navigation_input() {
+        assert_eq!(
+            translate_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Input::Byte(b'x')
+        );
+        assert_eq!(
+            translate_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            Input::Control(19)
+        );
+        assert_eq!(
+            translate_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            Input::Backspace
+        );
+        assert_eq!(
+            translate_key(KeyEvent::new(KeyCode::Char('é'), KeyModifiers::NONE)),
+            Input::Unsupported
+        );
+
+        let special_keys = [
+            (KeyCode::Left, Input::Left),
+            (KeyCode::Right, Input::Right),
+            (KeyCode::Up, Input::Up),
+            (KeyCode::Down, Input::Down),
+            (KeyCode::Home, Input::Home),
+            (KeyCode::End, Input::End),
+            (KeyCode::Delete, Input::Delete),
+            (KeyCode::Insert, Input::Insert),
+            (KeyCode::PageUp, Input::PageUp),
+            (KeyCode::PageDown, Input::PageDown),
+        ];
+        for (key, expected) in special_keys {
+            assert_eq!(
+                translate_key(KeyEvent::new(key, KeyModifiers::NONE)),
+                expected
+            );
+        }
+    }
+}

@@ -1,0 +1,35 @@
+Cano — byte-oriented modal terminal editor
+
+Usage
+  cano [--config init.lua] [file]
+  cano --help
+
+  A file that does not exist yet opens as an empty buffer and is created on
+  the first save.
+
+Modes
+  Normal   motions, editing, undo/redo, explorer, search and commands
+  Insert   byte insertion, indentation and brace autoclose
+  Visual   character/line selection, delete, yank and indentation
+  Search   wrapped search and s/old/new replacement
+  Command  runtime commands and ! shell execution
+
+Global keys
+  Ctrl-Q   quit from any mode (refuses if there are unsaved changes)
+  Ctrl-S   save and quit (Normal and Insert modes)
+  Ctrl-N   toggle explorer in Normal mode (Escape closes it)
+  Ctrl-C   acts as Escape in every mode
+
+File commands
+  :w       save
+  :q       quit if there are no unsaved changes
+  :q!      quit and discard unsaved changes
+  :wq      save and quit
+
+Configuration
+  If present, the default file is ~/.config/cano/init.lua. Cano uses
+  built-in defaults when that file is absent, and options the file does not
+  set keep those defaults. Calling setup(table) is optional; its argument
+  must be a table when called. syntax, auto_indent, relative, indent and
+  undo_size retain the documented Boolean compatibility behavior. setup
+  returns exit(code[, message]).

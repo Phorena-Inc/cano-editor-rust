@@ -1,0 +1,29 @@
+Normal
+  h j k l       move left/down/up/right (arrow keys also work)
+  0 $ w b e     line and word motions
+  g G %         file start/end and matching brace
+  N motion      count prefix repeats a motion (also n, u, U)
+  N g / N G     go to line N
+  N d           delete N lines
+  i I a A       enter Insert mode
+  o O           open line below/above
+  x dd yy p     delete, delete line, yank line, paste
+  d motion      delete over the next motion
+  v V           character/line Visual mode
+  u U           undo/redo
+  / n           search/search next
+  :             Command mode
+  r             replace with the next typed key (Escape cancels)
+  Ctrl-N        toggle file explorer (Escape closes it)
+
+Insert
+  Escape        return to Normal
+  arrows        move and split insertion history
+  Tab           insert the configured indentation
+  Backspace     delete byte before cursor
+  Enter         newline plus brace-depth indentation
+
+Visual
+  motions       extend selection (h j k l 0 $ w b e g G % and arrows)
+  d/x y         delete or yank
+  > <           indent or unindent selected rows
