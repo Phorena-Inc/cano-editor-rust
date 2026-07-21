@@ -3,7 +3,8 @@
 Cano (kay-no) is a Vim-inspired modal terminal editor written in Rust using
 Ratatui and Crossterm. This implementation was created independently from Code
 Atlas migration specifications and does not depend on the original C
-implementation or an earlier Rust port.
+implementation or an earlier Rust port. The original C implementation lives at
+[Cano-Projects/Cano](https://github.com/Cano-Projects/Cano).
 
 ## Demo
 [![asciicast](https://asciinema.org/a/655184.svg)](https://asciinema.org/a/655184)
@@ -256,34 +257,68 @@ undo-size # retained compatibility no-op
 
 ## Installation
 
-### Arch
-[![Packaging status](https://repology.org/badge/vertical-allrepos/cano.svg)](https://repology.org/project/cano/versions) \
-A package is provided within this [AUR](https://aur.archlinux.org/packages/cano).
-You can install it using your preferred aur helper:
+Cano builds from source on Windows, Linux, and macOS. All three platforms
+need a current Rust toolchain (installed with [rustup](https://rustup.rs))
+and a C compiler, because the vendored Lua 5.4 is compiled by the `mlua`
+dependency during the build.
 
-For instance, if using yay, do the following:
-```sh
-yay -S cano-git
-```
+### Windows
 
-### Nix / NixOS
+1. Install rustup, either with winget or from <https://rustup.rs>:
+   ```powershell
+   winget install Rustlang.Rustup
+   ```
+2. When prompted, install the Visual Studio C++ Build Tools (rustup offers
+   this automatically); the default `stable-msvc` toolchain is what you want.
+3. Build and run from a fresh terminal:
+   ```powershell
+   cd path\to\cano
+   cargo build --release --locked
+   .\target\release\cano.exe .\file.txt
+   ```
+   Copy `target\release\cano.exe` somewhere on your `PATH` to install it.
+   Note that `:!command` shell execution requires `sh` and is not available
+   on Windows.
 
-Build the `.#cano` package from this flake.
+### Linux
 
-### Debian/Ubuntu
+1. Install a C toolchain if you do not have one (`sudo apt install
+   build-essential` on Debian/Ubuntu, `sudo dnf group install
+   development-tools` on Fedora, `sudo pacman -S base-devel` on Arch).
+2. Install rustup:
+   ```sh
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   ```
+3. Build and install:
+   ```sh
+   cd path/to/cano
+   cargo build --release --locked
+   sudo make install PREFIX=/usr/local
+   ```
+   `make install` places the binary at `/usr/local/bin/cano` and the help
+   pages under `/usr/local/share/cano/help`.
 
-You may build from source with a current Rust toolchain by cloning this
-repository:
+   On Nix or NixOS you can instead build the `.#cano` package from the
+   included flake.
 
-```sh
-cd path/to/cano
-cargo build --release --locked
-sudo make install PREFIX=/usr/local
-```
+### macOS
 
-### Canoon (Beta)
-The official Cano installer and manager, currently in Beta.
-[canoon](https://github.com/kul-sudo/canoon)
+1. Install the Xcode command-line tools for the C compiler:
+   ```sh
+   xcode-select --install
+   ```
+2. Install rustup, either with Homebrew (`brew install rustup-init &&
+   rustup-init`) or the script above.
+3. Build and install:
+   ```sh
+   cd path/to/cano
+   cargo build --release --locked
+   sudo make install PREFIX=/usr/local
+   ```
+
+Prebuilt distribution packages (such as the AUR package) target the original
+C implementation; see [Cano-Projects/Cano](https://github.com/Cano-Projects/Cano)
+for those.
 
 ## License
 
