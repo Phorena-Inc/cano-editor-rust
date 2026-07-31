@@ -62,7 +62,7 @@ pub struct RenderOptions<'a> {
 struct ScreenLayout {
     area: Rect,
     editor_height: u16,
-    gutter_width: u16,
+    gutter_digit_width: u16,
     content_x: u16,
     content_width: u16,
     scrollbar_x: Option<u16>,
@@ -71,9 +71,15 @@ struct ScreenLayout {
 }
 
 impl ScreenLayout {
-    fn new(area: Rect) -> Self {
+    fn new(area: Rect, line_count: usize) -> Self {
         let editor_height = area.height.saturating_sub(STATUS_ROWS);
-        let gutter_width = area.width.min(LINE_NUMBER_WIDTH);
+        let line_digits = u16::try_from(line_count.max(1).to_string().len()).unwrap_or(u16::MAX);
+        let desired_digit_width = LINE_NUMBER_WIDTH.saturating_sub(1).max(line_digits);
+        let gutter_width = area.width.min(desired_digit_width.saturating_add(1));
+        // On a pane narrower than the desired gutter, use every available
+        // column for digits instead of reserving a separator and truncating
+        // one additional leading digit.
+        let gutter_digit_width = gutter_width.min(desired_digit_width);
         let editor_width = area.width.saturating_sub(gutter_width);
         let scrollbar_x = (editor_height > 0 && editor_width > 0)
             .then(|| area.x.saturating_add(area.width.saturating_sub(1)));
@@ -82,7 +88,7 @@ impl ScreenLayout {
         Self {
             area,
             editor_height,
-            gutter_width,
+            gutter_digit_width,
             content_x: area.x.saturating_add(gutter_width),
             content_width,
             scrollbar_x,
@@ -105,7 +111,12 @@ pub fn draw(
         return;
     }
 
-    let layout = ScreenLayout::new(area);
+    let line_count = if options.explorer.is_none() {
+        editor.buffer.rows.len()
+    } else {
+        0
+    };
+    let layout = ScreenLayout::new(area, line_count);
     let cursor = {
         let buffer = frame.buffer_mut();
         clear_area(buffer, area);
@@ -246,16 +257,16 @@ fn draw_line_number(
     cursor_row: usize,
     relative: bool,
 ) {
-    if layout.gutter_width == 0 {
+    if layout.gutter_digit_width == 0 {
         return;
     }
-    let number = if relative {
+    let number = if relative && row != cursor_row {
         row.abs_diff(cursor_row)
     } else {
         row.saturating_add(1)
     };
     let number = number.to_string();
-    let digit_width = usize::from(layout.gutter_width.saturating_sub(1));
+    let digit_width = usize::from(layout.gutter_digit_width);
     let visible_start = number.len().saturating_sub(digit_width);
     let visible = &number[visible_start..];
     let padding = digit_width.saturating_sub(visible.len());
@@ -264,16 +275,19 @@ fn draw_line_number(
         layout.area.x.saturating_add(
             u16::try_from(padding)
                 .unwrap_or(u16::MAX)
-                .min(layout.gutter_width),
+                .min(layout.gutter_digit_width),
         ),
         y,
-        layout.gutter_width.saturating_sub(
+        layout.gutter_digit_width.saturating_sub(
             u16::try_from(padding)
                 .unwrap_or(u16::MAX)
-                .min(layout.gutter_width),
+                .min(layout.gutter_digit_width),
         ),
         visible,
-        Style::default().fg(Color::DarkGray),
+        // A terminal multiplexer may remap fixed ANSI palette entries. The
+        // terminal's default foreground is the only color guaranteed to
+        // contrast with its configured background.
+        Style::default(),
     );
 }
 
@@ -670,11 +684,59 @@ mod tests {
             .unwrap();
 
         let backend = terminal.backend();
-        assert!(line(backend.buffer(), 0).starts_with("   0 a    b"));
+        assert!(line(backend.buffer(), 0).starts_with("   1 a    b"));
         assert!(line(backend.buffer(), 1).starts_with("   1 second"));
+        assert_eq!(backend.buffer().cell((3, 0)).unwrap().fg, Color::Reset);
+        assert_eq!(backend.buffer().cell((3, 1)).unwrap().fg, Color::Reset);
         assert!(line(backend.buffer(), 4).starts_with("COMMAND file.txt (3,1) Saved"));
         assert!(line(backend.buffer(), 5).starts_with(":write"));
         assert_eq!(backend.cursor_position(), Position::new(3, 5));
+    }
+
+    #[test]
+    fn relative_numbers_keep_the_cursor_line_absolute() {
+        let mut editor = Editor::new(b"first\nsecond\nthird".to_vec());
+        editor.buffer.cursor = 6;
+        let backend = TestBackend::new(16, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut render_options = options();
+        render_options.relative_numbers = true;
+
+        terminal
+            .draw(|frame| draw(frame, &editor, render_options, &mut Scroll::default()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert!(line(buffer, 0).starts_with("   1 first"));
+        assert!(line(buffer, 1).starts_with("   2 second"));
+        assert!(line(buffer, 2).starts_with("   1 third"));
+    }
+
+    #[test]
+    fn gutter_expands_without_truncating_large_line_numbers() {
+        let mut data = b"x\n".repeat(9_999);
+        data.push(b'x');
+        let mut editor = Editor::new(data);
+        editor.buffer.cursor = editor.buffer.data.len();
+        let mut render_options = options();
+        render_options.relative_numbers = true;
+
+        let backend = TestBackend::new(20, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &editor, render_options, &mut Scroll::default()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert!(line(buffer, 0).starts_with("    1 x"));
+        assert!(line(buffer, 1).starts_with("10000 x"));
+
+        let backend = TestBackend::new(5, 3);
+        let mut narrow_terminal = Terminal::new(backend).unwrap();
+        narrow_terminal
+            .draw(|frame| draw(frame, &editor, render_options, &mut Scroll::default()))
+            .unwrap();
+        assert_eq!(line(narrow_terminal.backend().buffer(), 0), "10000");
     }
 
     #[test]
