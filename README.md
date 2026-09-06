@@ -87,21 +87,163 @@ Command - For executing commands
 |Normal| U              | Redo                                            |
 |Normal| /              | Enter Search mode                               |
 |Normal| n              | Jump to next search                             |
+|Normal| N              | Jump to previous search                         |
 |Normal/Insert| Ctrl + S| Save and exit                                   |
 |Normal| r              | Replace current char with the next typed key (Esc cancels) |
 |Normal| d + motion     | Delete over the next motion                     |
-|Normal| (n) + motion   | Repeat next motion n times (also `n`, `u`, `U`) |
+|Normal| (n) + motion   | Repeat next motion n times (also `n`, `N`, `u`, `U`) |
 |Normal| (n) + d        | Delete n lines                                  |
 |Normal| (n) + g / G    | Go to line n                                    |
 |Normal| Ctrl + n       | Toggle file explorer (Esc closes it)            |
+|Normal| Ctrl + r       | Toggle the recent-file list (Esc closes it)     |
+|Normal| [space] n      | Leader mapping for Ctrl + n                     |
+|Normal| [space] r      | Leader mapping for Ctrl + r                     |
+|Normal| Ctrl + m       | Toggle markdown display (Enter is the same key) |
+|Normal/Visual| s{char} | EasyMotion: jump to any {char} on screen, forward or back |
+|Normal| t{char}        | EasyMotion: jump just before the next {char} (forward only) |
+|Normal| *              | Search the word under the cursor and highlight every match |
+|Normal| [space] i      | Leader mapping for `*`                          |
+|Normal| [space] o      | Leader mapping for `:nohl`                      |
 |Normal/Visual| Arrow keys | Move like h/j/k/l                            |
 |Insert| Tab            | Insert the configured indentation               |
+
+## Mouse
+The mouse is on by default and can be turned off with `:set-var mouse 0`, or
+from `init.lua` with `setup({ mouse = false })`. The setting takes effect
+immediately, without a restart.
+
+| Gesture | Action |
+|---------|--------|
+| Click | Move the cursor there. A click in the gutter goes to the start of that line, and a click past the end of a line goes to its end. |
+| Click and drag | Select from where the button went down, in charwise Visual mode. |
+| Wheel | Scroll three lines, bringing the cursor along only as far as it must. |
+| Click or drag the scrollbar | Scroll to that position. The thumb lands on the row you clicked and follows a drag, which keeps working even if the pointer strays off the column. |
+| Click in the explorer or recent list | Select that entry; clicking the entry already selected opens it, so a double click opens. Its scrollbar moves the selection instead, and never opens anything. |
+
+While Cano has the mouse the terminal does not, so its own click-to-select stops
+working. Most terminals still offer a native selection with Shift held; turning
+`mouse` off hands it back entirely.
+
+A click is not a key: it cannot answer the save prompt, complete an `:imap`, or
+pick an `s`/`t` jump label.
+
+## Recent files
+`Ctrl + r` opens a list of the files you have opened before, most recent first.
+`j`/`k` and the arrow keys move through it, Enter opens the selection, and Esc
+or a second `Ctrl + r` closes it. It shares the pane with the file explorer, so
+opening one closes the other.
+
+If the buffer has unsaved changes, both keys ask `Save changes? (y/n, Esc
+cancels)` before leaving it: `y` writes the file and then opens the pane, `n`
+opens it and keeps the changes in the buffer, and Esc stays put. A failed write
+leaves the pane shut, so unsaved work is never one keystroke from being
+replaced.
+
+The list is stored beside the effective configuration file — `~/.config/cano/recent`
+by default — as one absolute path per line, and it survives across sessions. It
+holds up to 50 entries, records a file each time one is opened, and never offers
+an entry whose file has since been deleted. Built-in help pages are left out of
+it. Long paths are shown with their beginning elided, because the file name is
+the part that tells two entries apart.
+
+## Jump motions
+`s` and `t` are the two find motions from
+[vim-easymotion](https://github.com/easymotion/vim-easymotion). Both ask for one
+character, label every occurrence you can see, and jump to whichever label you
+type next. They differ the way the plugin's do:
+
+- `s{char}` finds the character **in both directions**.
+- `t{char}` is **forward only** and stops one byte **before** the match, like
+  vim's own `t`. (Upstream's bidirectional till is a separate `bd-t` mapping.)
+
+Labels come from EasyMotion's default key order, `asdghklqwertyuiopzxcvbnmfj;`,
+and are handed out nearest-first, so the closest match is always one keystroke.
+When there are more matches than keys the trailing keys become prefixes for
+two-key labels, and typing the first key narrows the labels still on screen. A
+single match skips the label and jumps straight there. Escape, or any key that
+matches no label, cancels.
+
+`s` also works in Visual mode, where it is a motion like any other: the labels
+appear over the text and picking one extends the selection to it, keeping the
+anchor where you started. A linewise selection (`V`) still grows by whole rows.
+Escape cancels the jump and leaves the selection alone, so it takes a second
+Escape to leave Visual mode.
+
+Targets are limited to the rows currently on screen, because a label you cannot
+read is not a label you can reach. While a jump is collecting keys it owns the
+keyboard, so a `set-map` mapping cannot fire out from under the labels.
+
+## Search and replace
+`:s` is vim's substitute command:
+
+```vim
+:%s/foo/bar/g
+```
+
+| Command | Action |
+|---------|--------|
+| `:%s/foo/bar/g` | Replace every `foo` with `bar` in the whole file |
+| `:%s/foo/bar/gc` | Confirm each change (`y` yes, `n` no, `a` all the rest, `q` stop) |
+| `:%s/foo/bar/gi` | Case-insensitive: also matches `Foo`, `FOO` |
+| `:%s/\<foo\>/bar/g` | Whole word only, so `foobar` and `seafood` are left alone |
+| `:5,12s/foo/bar/g` | Only lines 5 through 12 |
+| `:s/foo/bar/g` | Only the line the cursor is on |
+| `:%s#http://#https://#g` | Any punctuation can be the delimiter, so slashes need no escaping |
+
+The range may be `%` for the whole file, a line number, `.` for the current
+line, `$` for the last, or a `from,to` pair of any of those; without one the
+command acts on the cursor's line. Without `g` only the first match on each line
+is replaced. Flags may be combined, as in `gc` or `gi`. `substitute` may be
+spelled out in place of `s`.
+
+One `:s` command is **one undo step**, however many lines it changed — including
+a confirmed run, where `u` takes back everything you said yes to.
+
+Patterns are literal text rather than regular expressions, with the two vim
+assertions `\<` and `\>` for word boundaries. Inside the pattern or the
+replacement, `\` escapes the delimiter and itself.
+
+## Highlighting the word under the cursor
+`*` takes the word under the cursor (or the next one on the line), moves to its
+next **whole-word** occurrence, and highlights every match — so `*` on `the`
+leaves `then` and `other` alone. `/` highlights its matches too, as a substring
+search, and `n` repeats whichever kind was last used.
+
+`n` repeats the search forward and `N` repeats it backward; both wrap around
+the end of the buffer and take a count, so `3N` goes back three matches.
+
+`:nohl` (or `:nohlsearch`) stops showing the highlight without forgetting the
+pattern, so `n` and `N` keep working afterwards.
+
+The leader is space, giving the two mappings:
+
+```vim
+let mapleader = " "
+map <leader>i *          " [space] [i] to highlight a word
+map <leader>o :nohl<cr>  " [space] [o] to un-highlight all words
+```
+
+Both are built in, so no configuration is needed. Space followed by any other
+key does nothing.
+
+## Markdown
+Markdown display formats the buffer in place: headings, emphasis, code, links,
+lists, quotes, tables and rules are colored, and the syntax punctuation is
+dimmed rather than hidden. Every byte keeps the cell it occupies in the normal
+display, so the cursor, selections, search and every motion behave identically
+and the file stays fully editable while it is on.
+
+It is on by default for `.md`, `.markdown`, `.mdown`, `.mkd`, `.mkdn` and
+`.mdx` files, replaces source-code highlighting while active, and is shown as
+`[MD]` in the status line. `Ctrl + m` toggles it; most terminals send the same
+byte for `Ctrl + m` and `Enter`, so `Enter` toggles it in Normal mode too.
 
 ## Visual
 Visual mode works the same as Normal mode, except it works on the entire selection, instead of character by character.
 The motions `h j k l 0 $ w b e g G %` and the arrow keys extend the selection.
 | Keybind        | Action                                          |
 |----------------|-------------------------------------------------|
+| s{char}        | Extend the selection to any {char} on screen    |
 | d / x          | Delete the selection                            |
 | y              | Yank the selection                              |
 | >              | Indent current selection                        |
@@ -220,6 +362,40 @@ The following functions are available:
 function exit(code, message) end
 ```
 
+## Syntax highlighting
+Cano highlights C, C++, Rust and Python out of the box, with no configuration.
+The language is chosen from the file's extension:
+
+| Language | Extensions |
+|----------|------------|
+| C        | `c`, `h` |
+| C++      | `cc`, `cpp`, `cxx`, `c++`, `hh`, `hpp`, `hxx`, `h++`, `ipp`, `tpp` |
+| Rust     | `rs` |
+| Python   | `py`, `pyi`, `pyw` |
+| Bash     | `sh`, `bash`, `zsh`, `ksh`, `ash`, `dash`, and the names `.bashrc`, `.bash_profile`, `.bash_aliases`, `.bash_logout`, `.profile`, `.zshrc`, `.zprofile`, `.zshenv`, `.zlogin`, `.zlogout`, `.kshrc` |
+| Vimscript | `vim`, `vimrc`, and the names `.vimrc`, `_vimrc`, `.gvimrc`, `.exrc` |
+| Lua      | `lua` |
+
+The language picks the scanner as well as the word lists, because the languages
+disagree about what the same characters mean: `//` opens a comment in C, C++ and
+Rust but is floor division in Python; `'a` is a lifetime in Rust and a string
+delimiter elsewhere; `#` is a directive in C and C++, an attribute in Rust, a
+comment in Python, and in shell a comment only at the start of a word so that
+`${name#prefix}` survives; `"` is a string everywhere except vimscript, where it
+is also the comment marker; `--` is a comment in Lua and a minus sign elsewhere.
+Rust raw strings (`r#"…"#`) and nested block comments, Python triple-quoted and
+prefixed (`f"…"`, `rb'…'`) strings, shell parameter expansion, vim key notation
+(`<leader>`, `<C-x>`) and Lua long brackets (`[[…]]`, `[=[…]=]`) are all
+understood.
+
+Because `.vimrc` and `.bashrc` have no extension at all, the whole file name is
+consulted before falling back to one. A `.cyntax` palette is still keyed by
+extension, so a file named rather than extended gets the built-in colors but
+cannot be given a custom palette.
+
+Any other extension is left uncolored unless you supply a `.cyntax` palette for
+it, and `:set-var syntax 0` turns highlighting off entirely.
+
 There is a secondary config file, which is for custom syntax highlighting. It is stored in the same folder as the regular config, but uses a different naming format.
 An example is ~/.config/cano/c.cyntax (spelled cyntax, with a c). The c can be replaced with whatever the file extension of your language is, such as go.cyntax for Golang.
 Here is an example of a cyntax file:
@@ -240,7 +416,29 @@ k - Keyword
 t - Type
 w - Word
 The type is then followed by the RGB values, all comma separated <b>without</b> spaces. After the RGB values, there is the actual keywords. End each type with a dot '.' as seen above, to indicate to Cano that the list is finished. The words are meant to be left blank, as it will highlight any words not found in the keywords above with the chosen RGB color.
-If you wish to only set the color, you can provide no keywords to any, and it will fill in the keywords with C keywords by default.
+If you wish to only set the color, you can provide no keywords to any, and it will fill in the keywords with the built-in list for that file's language (C for an extension Cano does not recognize). A `.cyntax` file supplies colors and words only; it never changes how the file is scanned, so `rs.cyntax` still gets Rust's lexer.
+
+## Insert-mode mappings
+`:imap {keys} {rhs}` maps a sequence of keys typed in Insert mode:
+
+```vim
+imap ;; <Esc>
+imap jk <Esc>
+imap ,d hello
+```
+
+The left-hand side may be more than one key. The right-hand side is a key
+sequence: `<...>` spellings become their byte and everything else is taken
+literally, so `imap ;; <Esc> :w <CR>` works too. Whitespace separates tokens, so
+quote a right-hand side that needs spaces of its own.
+
+Only an uninterrupted run of typed keys completes a mapping — moving the cursor
+or leaving Insert mode between them breaks the run. Because there is no input
+timeout to wait on, a mapping fires as soon as its keys are all in, which means
+a longer mapping sharing a shorter one's prefix is unreachable. Re-running
+`:imap` with the same left-hand side replaces the earlier binding. Keys with no
+single-byte spelling (the arrows, say) cannot be a right-hand side, because
+replay feeds it back one byte at a time.
 
 ## Config Variables
 Config variables can also be modified at runtime by using `:set-var ...`.
@@ -253,6 +451,18 @@ auto-indent # retained compatibility no-op
 syntax # toggle syntax highlighting on-off
 indent # set indent
 undo-size # retained compatibility no-op
+cursorline # mark the line the cursor is on (also spelled cursor-line)
+mouse # let Cano handle the mouse
+```
+
+`cursorline` is vim's option of the same name, off by default as it is in vim.
+It underlines the cursor's line rather than tinting its background, which is
+what vim itself does in a terminal (`CursorLine` defaults to `cterm=underline`)
+and the only thing that stays readable without knowing whether the terminal's
+background is light or dark. It can also be set from `init.lua`:
+
+```lua
+setup({ cursorline = true })
 ```
 
 ## Installation

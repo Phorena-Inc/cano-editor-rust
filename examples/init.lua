@@ -5,6 +5,8 @@
 local cano = setup({
     syntax = true,       -- Enable syntax highlighting.
     relative = true,     -- Show relative line numbers.
+    cursorline = true,   -- Underline the line the cursor is on.
+    mouse = true,        -- Let Cano handle the mouse; false gives it back.
     indent = false,      -- false uses tabs; true uses one-space indentation.
     auto_indent = false, -- Retained for compatibility; currently a no-op.
     undo_size = false,   -- Retained for compatibility; currently a no-op.

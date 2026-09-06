@@ -2,7 +2,10 @@ use std::io::{self, Stdout, stdout};
 use std::time::{Duration, Instant};
 
 use crossterm::cursor::{SetCursorStyle, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
@@ -14,9 +17,27 @@ use crate::editor::Mode;
 
 const SIZE_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
+/// What the mouse did, reduced to the four gestures Cano acts on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MouseKind {
+    Press,
+    Drag,
+    ScrollUp,
+    ScrollDown,
+}
+
+/// One mouse gesture, in screen cells.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mouse {
+    pub kind: MouseKind,
+    pub column: u16,
+    pub row: u16,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Input {
     Byte(u8),
+    Mouse(Mouse),
     Control(u8),
     Escape,
     Enter,
@@ -61,6 +82,27 @@ pub fn translate_key(key: KeyEvent) -> Input {
     }
 }
 
+/// Reduces a crossterm mouse event to a gesture, or `None` for the ones Cano
+/// ignores.
+///
+/// Button releases and bare motion are dropped rather than delivered: an
+/// unhandled input still clears a pending operator, so a mouse merely crossing
+/// the window would cancel a half-typed `d`.
+pub fn translate_mouse(mouse: MouseEvent) -> Option<Mouse> {
+    let kind = match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => MouseKind::Press,
+        MouseEventKind::Drag(MouseButton::Left) => MouseKind::Drag,
+        MouseEventKind::ScrollUp => MouseKind::ScrollUp,
+        MouseEventKind::ScrollDown => MouseKind::ScrollDown,
+        _ => return None,
+    };
+    Some(Mouse {
+        kind,
+        column: mouse.column,
+        row: mouse.row,
+    })
+}
+
 fn read_event() -> io::Result<Input> {
     loop {
         match event::read()? {
@@ -68,6 +110,10 @@ fn read_event() -> io::Result<Input> {
             // releases would process every keystroke twice.
             Event::Key(key) if key.kind == KeyEventKind::Release => continue,
             Event::Key(key) => return Ok(translate_key(key)),
+            Event::Mouse(mouse) => match translate_mouse(mouse) {
+                Some(mouse) => return Ok(Input::Mouse(mouse)),
+                None => continue,
+            },
             Event::Resize(_, _) => return Ok(Input::Resize),
             _ => return Ok(Input::Unsupported),
         }
@@ -77,6 +123,7 @@ fn read_event() -> io::Result<Input> {
 pub struct TerminalSession {
     pub terminal: Terminal<CrosstermBackend<Stdout>>,
     last_size: (u16, u16),
+    mouse: bool,
 }
 
 /// Restores the terminal before the default panic output runs.
@@ -93,6 +140,7 @@ fn install_panic_hook() {
             let _ = disable_raw_mode();
             let _ = execute!(
                 stdout(),
+                DisableMouseCapture,
                 LeaveAlternateScreen,
                 SetCursorStyle::DefaultUserShape,
                 Show
@@ -134,9 +182,27 @@ impl TerminalSession {
         let mut session = Self {
             terminal,
             last_size: (0, 0),
+            mouse: false,
         };
         session.last_size = size()?;
         Ok(session)
+    }
+
+    /// Turns terminal mouse reporting on or off to match the `mouse` option.
+    ///
+    /// While it is on the terminal hands the mouse to Cano, which means its
+    /// own click-to-select stops working; most terminals still offer it with
+    /// Shift held.
+    pub fn set_mouse(&mut self, enabled: bool) -> io::Result<()> {
+        if self.mouse == enabled {
+            return Ok(());
+        }
+        self.mouse = enabled;
+        if enabled {
+            execute!(self.terminal.backend_mut(), EnableMouseCapture)
+        } else {
+            execute!(self.terminal.backend_mut(), DisableMouseCapture)
+        }
     }
 
     fn size_changed(&mut self) -> io::Result<bool> {
@@ -195,6 +261,9 @@ impl TerminalSession {
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
+        if self.mouse {
+            let _ = execute!(self.terminal.backend_mut(), DisableMouseCapture);
+        }
         let _ = execute!(
             self.terminal.backend_mut(),
             LeaveAlternateScreen,

@@ -2,7 +2,7 @@ Normal
   h j k l       move left/down/up/right (arrow keys also work)
   0 $ w b e     line and word motions
   g G %         file start/end and matching brace
-  N motion      count prefix repeats a motion (also n, u, U)
+  N motion      count prefix repeats a motion (also n, N, u, U)
   N g / N G     go to line N
   N d           delete N lines
   i I a A       enter Insert mode
@@ -11,10 +11,26 @@ Normal
   d motion      delete over the next motion
   v V           character/line Visual mode
   u U           undo/redo
-  / n           search/search next
+  / n N         search, next match, previous match
   :             Command mode
   r             replace with the next typed key (Escape cancels)
   Ctrl-N        toggle file explorer (Escape closes it)
+  Ctrl-R        toggle the recent-file list (Escape closes it)
+  space n       leader mapping for Ctrl-N
+  space r       leader mapping for Ctrl-R
+  Ctrl-M        toggle markdown display (Enter is the same key)
+  s char        EasyMotion jump to any char on screen (both directions)
+  t char        EasyMotion jump just before the next char (forward only)
+  *             search the word under the cursor, highlight every match
+  space i       leader mapping for *
+  space o       leader mapping for :nohl
+
+Mouse
+  click         move the cursor (gutter goes to the line start)
+  click+drag    select in Visual mode
+  wheel         scroll three lines
+  scrollbar     click or drag the bar on the right to scroll
+  click in list select an entry; click it again to open
 
 Insert
   Escape        return to Normal
@@ -25,5 +41,6 @@ Insert
 
 Visual
   motions       extend selection (h j k l 0 $ w b e g G % and arrows)
+  s char        extend the selection to an EasyMotion label
   d/x y         delete or yank
   > <           indent or unindent selected rows

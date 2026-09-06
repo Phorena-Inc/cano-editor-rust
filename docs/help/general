@@ -8,9 +8,9 @@ Usage
   the first save.
 
 Modes
-  Normal   motions, editing, undo/redo, explorer, search and commands
+  Normal   motions, editing, undo/redo, explorer, recents, search, commands
   Insert   byte insertion, indentation and brace autoclose
-  Visual   character/line selection, delete, yank and indentation
+  Visual   character/line selection, jumps, delete, yank and indentation
   Search   wrapped search and s/old/new replacement
   Command  runtime commands and ! shell execution
 
@@ -18,18 +18,89 @@ Global keys
   Ctrl-Q   quit from any mode (refuses if there are unsaved changes)
   Ctrl-S   save and quit (Normal and Insert modes)
   Ctrl-N   toggle explorer in Normal mode (Escape closes it)
+  Ctrl-R   toggle the recent-file list in Normal mode (Escape closes it)
+  Ctrl-M   toggle markdown display in Normal mode (so does Enter)
   Ctrl-C   acts as Escape in every mode
+
+Markdown display
+  Formats the buffer in place: headings, emphasis, code, links, lists,
+  quotes, tables and rules are colored and the syntax punctuation is dimmed.
+  Bytes keep their cells, so every motion and edit works unchanged. It starts
+  on for .md and related extensions, replaces syntax highlighting while it is
+  active, and shows as [MD] in the status line.
+
+Mouse
+  On by default; :set-var mouse 0 hands the mouse back to the terminal, whose
+  own click-to-select it otherwise takes (most terminals still offer that with
+  Shift held). Click moves the cursor, click-and-drag selects in Visual mode,
+  the wheel scrolls three lines, and clicking or dragging the scrollbar on
+  the right scrolls to that position. A click in the explorer or recent list
+  selects an entry -- clicking the selected one opens it, while their
+  scrollbar only moves the selection.
+
+Recent files
+  Ctrl-R lists the files opened before, most recent first. j/k and the arrows
+  move, Enter opens, Escape closes. It shares the pane with the explorer. The
+  list is kept beside the configuration file (~/.config/cano/recent by
+  default), holds 50 entries, and skips files that no longer exist. Both keys
+  ask before leaving an unsaved buffer: y writes then opens, n opens and keeps
+  the changes, Escape stays put. [space] n and [space] r do the same.
+
+Jump motions
+  s and t are vim-easymotion's find motions. Each asks for one character,
+  labels every occurrence on screen and jumps to the label you type. s
+  searches both directions; t is forward only and stops one byte before the
+  match. Labels use asdghklqwertyuiopzxcvbnmfj; nearest-first, growing to two
+  keys when there are more matches than keys. A single match jumps at once,
+  and Escape cancels. s also works in Visual mode, where picking a label
+  extends the selection to it instead of moving a bare cursor.
+
+Search highlighting
+  * searches the word under the cursor whole-word and highlights every match;
+  / highlights its matches as a substring search. n repeats it forward and N
+  backward, both wrapping. The leader is space: [space] i is *, [space] o is
+  :nohl.
+
+Insert-mode mappings
+  :imap {keys} {rhs} maps a run of keys typed in Insert mode, for example
+  ":imap ;; <Esc>". The right-hand side is a key sequence; <...> spellings
+  become their byte. Only keys typed in a row complete a mapping, and one
+  fires as soon as its keys are all in.
+
+Search and replace
+  :%s/foo/bar/g replaces every foo with bar in the file. The range may be %,
+  a line number, . or $, or a from,to pair; without one it is the cursor's
+  line. Flags: g every match on a line, c confirm each (y/n/a/q), i ignore
+  case. \<foo\> matches whole words. Any punctuation may be the delimiter,
+  so :%s#http://#https://#g needs no escaping. Patterns are literal text, not
+  regular expressions, and one :s command is one undo step.
 
 File commands
   :w       save
   :q       quit if there are no unsaved changes
   :q!      quit and discard unsaved changes
   :wq      save and quit
+  :nohl    stop showing the search highlight (:nohlsearch also works)
+  :imap    map a key sequence in Insert mode
+  :s       substitute; see Search and replace above
+
+Syntax highlighting
+  C, C++, Rust and Python are highlighted out of the box, chosen by the file
+  extension (c h / cc cpp cxx c++ hh hpp hxx h++ ipp tpp / rs / py pyi pyw /
+  sh bash zsh ksh / vim / lua), or by name for the dotfiles that have no
+  extension, such as .vimrc, .bashrc and .zshrc.
+  The language selects the scanner as well as the word lists, so // is a
+  comment in C but floor division in Python, 'a is a Rust lifetime, and # is
+  a directive, an attribute or a comment depending on the language. Any other
+  extension needs a <extension>.cyntax palette beside the configuration file,
+  which also overrides the built-in colors. :set-var syntax 0 turns it off.
 
 Configuration
   If present, the default file is ~/.config/cano/init.lua. Cano uses
   built-in defaults when that file is absent, and options the file does not
   set keep those defaults. Calling setup(table) is optional; its argument
   must be a table when called. syntax, auto_indent, relative, indent and
-  undo_size retain the documented Boolean compatibility behavior. setup
+  undo_size retain the documented Boolean compatibility behavior. cursorline
+  marks the cursor's line by underlining it, the way vim's own terminal
+  default for CursorLine does; it is off unless set. setup
   returns exit(code[, message]).

@@ -4,6 +4,8 @@ Commands
   set-map key "keys"      add a key mapping (expands in Normal mode)
   let name expression     append an integer variable
   echo value              display a string or variable
+  imap keys rhs           map a key sequence typed in Insert mode
+  nohl / nohlsearch       stop showing the search highlight
   :w                      save
   :q                      quit if there are no unsaved changes
   :q!                     quit and discard unsaved changes
@@ -11,6 +13,21 @@ Commands
   :e / :we                legacy exit / save-and-exit aliases
                           (:e respects the unsaved-changes guard)
   !command                run through sh -c and show the last stdout line
+
+Search and replace
+  :[range]s/pattern/replacement/[flags]
+
+  range     % whole file, N a line, N,M a span, . the cursor's line, $ the
+            last; omitted means the cursor's line
+  flags     g every match on a line (not just the first)
+            c confirm each one: y yes, n no, a all the rest, q stop
+            i ignore case
+  pattern   literal text, not a regular expression; \<foo\> matches whole
+            words, and \ escapes the delimiter or itself
+  delimiter any punctuation, so :%s#http://#https://#g needs no escaping
+
+  Examples: :%s/foo/bar/g   :%s/foo/bar/gc   :5,12s/foo/bar/g
+  One :s command is one undo step, however many lines it changed.
 
 Special mapping keys
   <space> <esc>/<escape> <tab> <nul>

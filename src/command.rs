@@ -132,6 +132,9 @@ const COMMANDS: &[&[u8]] = &[
     b"wq",
     b"e",
     b"we",
+    b"nohl",
+    b"nohlsearch",
+    b"imap",
 ];
 
 const CONFIGS: &[&[u8]] = &[
@@ -140,10 +143,12 @@ const CONFIGS: &[&[u8]] = &[
     b"auto_indent",
     b"indent",
     b"undo_size",
+    b"cursorline",
+    b"mouse",
 ];
 
 fn is_config(bytes: &[u8]) -> bool {
-    CONFIGS.contains(&bytes) || matches!(bytes, b"auto-indent" | b"undo-size")
+    CONFIGS.contains(&bytes) || matches!(bytes, b"auto-indent" | b"undo-size" | b"cursor-line")
 }
 
 fn classify(bytes: &[u8]) -> TokenKind {
@@ -238,6 +243,8 @@ pub enum ConfigVariable {
     AutoIndent,
     Indent,
     UndoSize,
+    CursorLine,
+    Mouse,
 }
 
 impl ConfigVariable {
@@ -248,6 +255,8 @@ impl ConfigVariable {
             b"auto_indent" | b"auto-indent" => Some(Self::AutoIndent),
             b"indent" => Some(Self::Indent),
             b"undo_size" | b"undo-size" => Some(Self::UndoSize),
+            b"cursorline" | b"cursor-line" => Some(Self::CursorLine),
+            b"mouse" => Some(Self::Mouse),
             _ => None,
         }
     }
@@ -283,6 +292,15 @@ pub enum Action {
     },
     Exit,
     WriteExit,
+    /// `:nohl`, which stops showing the current search highlight without
+    /// forgetting the pattern `n` repeats.
+    NoHighlight,
+    /// `:imap`, an Insert-mode mapping whose left-hand side may be several
+    /// keys long.
+    InsertMap {
+        from: Vec<u8>,
+        to: Vec<u8>,
+    },
 }
 
 fn invalid(expected: &'static str, token: &Token) -> CommandError {
@@ -532,6 +550,40 @@ pub fn parse(tokens: &[Token]) -> Result<Action, CommandError> {
             exact_arity(tokens, 1)?;
             Ok(Action::Exit)
         }
+        b"imap" => {
+            if tokens.len() < 3 {
+                return Err(CommandError::NotEnoughArgs);
+            }
+            if !matches!(tokens[1].kind, TokenKind::Identifier | TokenKind::String) {
+                return Err(invalid("identifier", &tokens[1]));
+            }
+            let from = tokens[1].value();
+            if from.is_empty() {
+                return Err(CommandError::NotEnoughArgs);
+            }
+            // The right-hand side is a key sequence: `<...>` spellings become
+            // their byte, everything else is taken literally.  Whitespace
+            // between tokens is a separator, so a run of spaces has to be
+            // quoted to survive.
+            let mut to = Vec::new();
+            for token in &tokens[2..] {
+                if token.kind == TokenKind::SpecialKey {
+                    let code = decode_special_key(&token.bytes)?;
+                    // Replay feeds the right-hand side back through the input
+                    // path one byte at a time, so a key with no byte spelling
+                    // (an arrow, say) cannot be expressed here.
+                    let byte = u8::try_from(code).map_err(|_| CommandError::InvalidSpecialKey)?;
+                    to.push(byte);
+                } else {
+                    to.extend_from_slice(&token.value());
+                }
+            }
+            Ok(Action::InsertMap { from, to })
+        }
+        b"nohl" | b"nohlsearch" => {
+            exact_arity(tokens, 1)?;
+            Ok(Action::NoHighlight)
+        }
         b"we" => {
             exact_arity(tokens, 1)?;
             Ok(Action::WriteExit)
@@ -544,6 +596,18 @@ pub fn parse(tokens: &[Token]) -> Result<Action, CommandError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalEffect {
     Save(Vec<u8>),
+    /// Stop showing the search highlight.  The pattern itself belongs to the
+    /// application, so the command state only reports the request.
+    ClearHighlight,
+}
+
+/// One Insert-mode mapping, as declared by `:imap`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsertMap {
+    /// The keys that trigger it, which may be more than one.
+    pub from: Vec<u8>,
+    /// The keys replayed in their place.
+    pub to: Vec<u8>,
 }
 
 /// One key mapping.  Expansions include the source-compatible trailing NUL.
@@ -569,8 +633,15 @@ pub struct CommandState {
     pub auto_indent: i64,
     pub indent: i64,
     pub undo_size: i64,
+    /// Vim's `cursorline`, off by default the way vim leaves it.
+    pub cursorline: i64,
+    /// Terminal mouse reporting.  On by default; turning it off hands the
+    /// mouse back to the terminal, whose own selection it otherwise takes.
+    pub mouse: i64,
     pub output: Vec<u8>,
     pub maps: Vec<KeyMap>,
+    /// Insert-mode mappings, in the order they were declared.
+    pub insert_maps: Vec<InsertMap>,
     pub variables: Vec<Variable>,
     pub message: Option<String>,
     pub quit: bool,
@@ -590,12 +661,32 @@ impl CommandState {
             auto_indent: 1,
             indent: 4,
             undo_size: 32,
+            cursorline: 0,
+            mouse: 1,
             output,
             maps: Vec::new(),
+            insert_maps: Vec::new(),
             variables: Vec::new(),
             message: None,
             quit: false,
         }
+    }
+
+    /// The Insert mapping the keys just typed complete exactly.
+    ///
+    /// The first match wins rather than the longest: without an input timeout
+    /// there is nothing to wait on, so a mapping fires as soon as its keys are
+    /// all in.  A longer mapping sharing a shorter one's prefix is therefore
+    /// unreachable.
+    pub fn insert_map(&self, typed: &[u8]) -> Option<&InsertMap> {
+        self.insert_maps.iter().find(|map| map.from == typed)
+    }
+
+    /// Whether more keys could still complete some Insert mapping.
+    pub fn insert_prefix(&self, typed: &[u8]) -> bool {
+        self.insert_maps
+            .iter()
+            .any(|map| map.from.starts_with(typed))
     }
 
     /// Returns the first mapping for a key, including its terminating NUL.
@@ -616,6 +707,8 @@ impl CommandState {
                 ConfigVariable::AutoIndent => self.auto_indent = value,
                 ConfigVariable::Indent => self.indent = value,
                 ConfigVariable::UndoSize => self.undo_size = value,
+                ConfigVariable::CursorLine => self.cursorline = value,
+                ConfigVariable::Mouse => self.mouse = value,
             },
             Action::SetOutput(output) => self.output = output,
             Action::SetMap { key, mut expansion } => {
@@ -640,6 +733,13 @@ impl CommandState {
             Action::WriteExit => {
                 self.quit = true;
                 return Ok(Some(ExternalEffect::Save(self.output.clone())));
+            }
+            Action::NoHighlight => return Ok(Some(ExternalEffect::ClearHighlight)),
+            Action::InsertMap { from, to } => {
+                // A repeated left-hand side replaces the earlier binding, the
+                // way re-running `:imap` in vim does.
+                self.insert_maps.retain(|map| map.from != from);
+                self.insert_maps.push(InsertMap { from, to });
             }
         }
         Ok(None)
@@ -728,6 +828,70 @@ mod tests {
             expression(&lex(source.as_bytes()).unwrap()),
             Err(CommandError::IntegerOverflow)
         );
+    }
+
+    #[test]
+    fn imap_takes_a_multi_key_left_side_and_a_key_sequence_right_side() {
+        assert_eq!(
+            action(b"imap ;; <Esc>"),
+            Ok(Action::InsertMap {
+                from: b";;".to_vec(),
+                to: vec![27]
+            })
+        );
+        // Several right-hand tokens concatenate, so `<Esc>` can be followed
+        // by more keys.
+        assert_eq!(
+            action(b"imap jk <Esc> :w <CR>"),
+            Ok(Action::InsertMap {
+                from: b"jk".to_vec(),
+                to: b"\x1b:w\n".to_vec()
+            })
+        );
+        // A quoted left-hand side keeps whatever it holds.
+        assert_eq!(
+            action(b"imap \",,\" x"),
+            Ok(Action::InsertMap {
+                from: b",,".to_vec(),
+                to: b"x".to_vec()
+            })
+        );
+        assert_eq!(action(b"imap ;;"), Err(CommandError::NotEnoughArgs));
+        // Replay works a byte at a time, so a key with no byte spelling
+        // cannot be the right-hand side.
+        assert_eq!(
+            action(b"imap ;; <Left>"),
+            Err(CommandError::InvalidSpecialKey)
+        );
+    }
+
+    #[test]
+    fn insert_mappings_replace_a_repeated_left_side_and_match_by_prefix() {
+        let mut state = CommandState::default();
+        state
+            .apply(Action::InsertMap {
+                from: b";;".to_vec(),
+                to: vec![27],
+            })
+            .unwrap();
+        state
+            .apply(Action::InsertMap {
+                from: b";;".to_vec(),
+                to: b"x".to_vec(),
+            })
+            .unwrap();
+
+        assert_eq!(state.insert_maps.len(), 1);
+        assert_eq!(
+            state.insert_map(b";;").map(|map| map.to.clone()),
+            Some(b"x".to_vec())
+        );
+        assert!(state.insert_map(b";").is_none());
+        // A partial left-hand side is not a match, but it is still worth
+        // waiting on.
+        assert!(state.insert_prefix(b";"));
+        assert!(state.insert_prefix(b";;"));
+        assert!(!state.insert_prefix(b"q"));
     }
 
     #[test]

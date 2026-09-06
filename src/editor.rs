@@ -525,7 +525,7 @@ impl Editor {
         }
     }
 
-    fn start_visual(&mut self, linewise: bool) {
+    pub fn start_visual(&mut self, linewise: bool) {
         if linewise {
             let row = self.buffer.rows[self.buffer.cursor_row().unwrap_or(0)];
             self.visual = VisualSelection {
@@ -623,22 +623,33 @@ impl Editor {
             }
             _ => return false,
         }
-        if self.mode == Mode::Visual {
-            if self.visual.linewise {
-                let anchor = self.buffer.row_for_index(self.visual.anchor).unwrap_or(0);
-                let current = self.buffer.cursor_row().unwrap_or(0);
-                let (first, last) = if anchor <= current {
-                    (anchor, current)
-                } else {
-                    (current, anchor)
-                };
-                self.visual.start = self.buffer.rows[first].start;
-                self.visual.end = self.buffer.rows[last].end;
-            } else {
-                self.visual.end = self.buffer.cursor;
-            }
-        }
+        self.refresh_visual();
         true
+    }
+
+    /// Recomputes the selection from its anchor and the cursor.
+    ///
+    /// Every visual motion ends here, so anything else that moves the cursor
+    /// while Visual mode is active has to call it too or the selection is
+    /// left behind: a jump would move the cursor without taking the
+    /// highlighted range with it.
+    pub fn refresh_visual(&mut self) {
+        if self.mode != Mode::Visual {
+            return;
+        }
+        if self.visual.linewise {
+            let anchor = self.buffer.row_for_index(self.visual.anchor).unwrap_or(0);
+            let current = self.buffer.cursor_row().unwrap_or(0);
+            let (first, last) = if anchor <= current {
+                (anchor, current)
+            } else {
+                (current, anchor)
+            };
+            self.visual.start = self.buffer.rows[first].start;
+            self.visual.end = self.buffer.rows[last].end;
+        } else {
+            self.visual.end = self.buffer.cursor;
+        }
     }
 
     fn indent_visual(&mut self) {

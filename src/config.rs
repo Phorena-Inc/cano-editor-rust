@@ -34,6 +34,8 @@ pub struct LuaConfig {
     pub auto_indent: Option<i64>,
     pub indent: Option<i64>,
     pub undo_size: Option<i64>,
+    pub cursorline: Option<i64>,
+    pub mouse: Option<i64>,
     pub exit: Option<ExitRequest>,
 }
 
@@ -117,6 +119,12 @@ fn evaluate_named(source: &[u8], name: &str) -> Result<LuaConfig, ConfigError> {
             }
             if let Some(value) = boolean_slot(&table, "undo_size")? {
                 config.undo_size = Some(value);
+            }
+            if let Some(value) = boolean_slot(&table, "cursorline")? {
+                config.cursorline = Some(value);
+            }
+            if let Some(value) = boolean_slot(&table, "mouse")? {
+                config.mouse = Some(value);
             }
             Ok::<_, mlua::Error>(())
         })??;
@@ -208,7 +216,9 @@ mod tests {
                     relative = false,
                     auto_indent = true,
                     indent = 4,
-                    undo_size = "32"
+                    undo_size = "32",
+                    cursorline = true,
+                    mouse = false
                 })
             "#,
         )
@@ -218,6 +228,8 @@ mod tests {
         assert_eq!(config.auto_indent, Some(1));
         assert_eq!(config.indent, None);
         assert_eq!(config.undo_size, None);
+        assert_eq!(config.cursorline, Some(1));
+        assert_eq!(config.mouse, Some(0));
     }
 
     #[test]

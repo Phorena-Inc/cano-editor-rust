@@ -33,6 +33,12 @@ pub enum UndoKind {
     DeleteChar,
     /// Replace the byte at `start` with `data[0]`.
     ReplaceChar,
+    /// Replace the half-open range `start..end` with `data`.
+    ///
+    /// A substitution rewrites a whole region at once, so it has to be undone
+    /// at once: built from a delete and an insert it would cost two presses
+    /// of `u` to take back one command.
+    ReplaceRegion,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -73,6 +79,10 @@ impl UndoRecord {
 
     pub fn delete_char(at: usize) -> Self {
         Self::new(UndoKind::DeleteChar, Vec::new(), at, at.saturating_add(1))
+    }
+
+    pub fn replace_region(start: usize, end: usize, data: Vec<u8>) -> Self {
+        Self::new(UndoKind::ReplaceRegion, data, start, end)
     }
 
     pub fn replace_char(at: usize, byte: u8) -> Self {
@@ -230,6 +240,28 @@ pub fn apply_record(
                 record.end,
             ))
         }
+        UndoKind::ReplaceRegion => {
+            // The inverse is the same shape with the two halves swapped, so
+            // undo and redo of a substitution are one press each.
+            let displaced = buffer
+                .replace_region(record.start, record.end, &record.data)
+                .ok_or(HistoryError::InvalidRange {
+                    start: record.start,
+                    end: record.end,
+                    len: buffer.data.len(),
+                })?;
+            let end =
+                record
+                    .start
+                    .checked_add(record.data.len())
+                    .ok_or(HistoryError::InvalidRange {
+                        start: record.start,
+                        end: usize::MAX,
+                        len: buffer.data.len(),
+                    })?;
+            buffer.cursor = record.start.min(buffer.data.len());
+            Ok(UndoRecord::replace_region(record.start, end, displaced))
+        }
     }
 }
 
@@ -277,6 +309,29 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_region_replacement_is_its_own_inverse() {
+        let mut buffer = Buffer::new(b"one two three".to_vec());
+        // Swap `two` for something longer, then take it back.
+        let forward = UndoRecord::replace_region(4, 7, b"FOUR!".to_vec());
+        let inverse = apply_record(&mut buffer, forward).unwrap();
+        assert_eq!(buffer.data, b"one FOUR! three");
+        assert_eq!(inverse, UndoRecord::replace_region(4, 9, b"two".to_vec()));
+
+        let redo = apply_record(&mut buffer, inverse).unwrap();
+        assert_eq!(buffer.data, b"one two three");
+        assert_eq!(redo, UndoRecord::replace_region(4, 7, b"FOUR!".to_vec()));
+        assert!(buffer.invariants_hold());
+
+        // A range outside the buffer is a bounded error, not a panic.
+        let bad = UndoRecord::replace_region(99, 120, b"x".to_vec());
+        assert!(matches!(
+            apply_record(&mut buffer, bad),
+            Err(HistoryError::InvalidRange { .. })
+        ));
+        assert_eq!(buffer.data, b"one two three");
+    }
 
     #[test]
     fn empty_stacks_are_noops() {

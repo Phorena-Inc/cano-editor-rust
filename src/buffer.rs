@@ -48,6 +48,69 @@ pub struct Buffer {
     pub cursor: usize,
 }
 
+/// A search pattern that `hlsearch` is currently showing.
+///
+/// An empty needle means nothing is highlighted, which is the state `:nohl`
+/// restores.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Highlight {
+    pub needle: Vec<u8>,
+    /// `*` matches whole words the way vim's `\<word\>` does; `/` matches any
+    /// substring.  Without the distinction, `*` on `the` would light up every
+    /// `then` and `other` on screen.
+    pub whole_word: bool,
+}
+
+impl Highlight {
+    pub fn is_empty(&self) -> bool {
+        self.needle.is_empty()
+    }
+
+    /// Reports whether the occurrence starting at `at` counts as a match.
+    fn accepts(&self, data: &[u8], at: usize) -> bool {
+        if !self.whole_word {
+            return true;
+        }
+        let before = at.checked_sub(1).map(|index| data[index]);
+        let after = data.get(at + self.needle.len()).copied();
+        !before.is_some_and(Buffer::is_word) && !after.is_some_and(Buffer::is_word)
+    }
+
+    /// The start of the first occurrence at or after `from`.
+    pub fn find(&self, data: &[u8], from: usize) -> Option<usize> {
+        if self.needle.is_empty() || self.needle.len() > data.len() {
+            return None;
+        }
+        (from.min(data.len())..=data.len() - self.needle.len())
+            .find(|at| data[*at..].starts_with(&self.needle) && self.accepts(data, *at))
+    }
+
+    /// The start of the last occurrence that begins before `before`.
+    pub fn rfind(&self, data: &[u8], before: usize) -> Option<usize> {
+        if self.needle.is_empty() || self.needle.len() > data.len() {
+            return None;
+        }
+        let limit = before.min(data.len() - self.needle.len() + 1);
+        (0..limit)
+            .rev()
+            .find(|at| data[*at..].starts_with(&self.needle) && self.accepts(data, *at))
+    }
+
+    /// Every occurrence in `data`, as half-open byte ranges.
+    pub fn matches(&self, data: &[u8]) -> Vec<(usize, usize)> {
+        let mut found = Vec::new();
+        let mut at = 0;
+        while let Some(start) = self.find(data, at) {
+            let end = start + self.needle.len();
+            found.push((start, end));
+            // Overlapping matches would paint the same cells twice; step past
+            // the one just taken.
+            at = end.max(start + 1);
+        }
+        found
+    }
+}
+
 impl Default for Buffer {
     fn default() -> Self {
         Self::new(Vec::new())
@@ -116,6 +179,31 @@ impl Buffer {
         self.rows.iter().position(|row| index <= row.end)
     }
 
+    /// The byte range of the word `*` would search for from `index`.
+    ///
+    /// Vim looks under the cursor first and then forward on the same line, so
+    /// a cursor resting on punctuation still picks up the next word.
+    pub fn word_at(&self, index: usize) -> Option<(usize, usize)> {
+        let row = *self.rows.get(self.row_for_index(index)?)?;
+        let mut start = index.clamp(row.start, row.end);
+        while start < row.end && !Self::is_word(self.data[start]) {
+            start += 1;
+        }
+        if start >= row.end {
+            return None;
+        }
+        // The cursor may have landed inside a word rather than on its first
+        // byte, so walk back to where the word actually starts.
+        while start > row.start && Self::is_word(self.data[start - 1]) {
+            start -= 1;
+        }
+        let mut end = start;
+        while end < row.end && Self::is_word(self.data[end]) {
+            end += 1;
+        }
+        Some((start, end))
+    }
+
     pub fn cursor_row(&self) -> Option<usize> {
         self.row_for_index(self.cursor)
     }
@@ -167,6 +255,22 @@ impl Buffer {
         self.data.drain(start..end);
         self.calculate_rows();
         Some(SelectionDeletion { clipboard, undo })
+    }
+
+    /// Replaces `start..end` with `bytes`, returning what was taken out.
+    ///
+    /// A substitution changes a whole region in one step, and has to be able
+    /// to come back in one step; composing it from a delete and an insert
+    /// would put two entries on the undo stack for one command.
+    pub fn replace_region(&mut self, start: usize, end: usize, bytes: &[u8]) -> Option<Vec<u8>> {
+        if start > end || end > self.data.len() {
+            return None;
+        }
+        let removed = self.data[start..end].to_vec();
+        self.data.splice(start..end, bytes.iter().copied());
+        self.calculate_rows();
+        self.cursor = self.cursor.min(self.data.len());
+        Some(removed)
     }
 
     /// Inserts bytes at `start`.  Legacy paste leaves the cursor at the first
@@ -442,6 +546,63 @@ fn quoted_bytes(data: &[u8]) -> Vec<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_at_reads_under_the_cursor_then_forward_on_the_line() {
+        //                          0123456789012345
+        let buffer = Buffer::new(b"the fox_1 ... go\nnext".to_vec());
+        // Anywhere inside a word gives the whole word.
+        assert_eq!(buffer.word_at(0), Some((0, 3)));
+        assert_eq!(buffer.word_at(2), Some((0, 3)));
+        assert_eq!(buffer.word_at(6), Some((4, 9)));
+        // On punctuation, vim looks forward on the same line.
+        assert_eq!(buffer.word_at(3), Some((4, 9)));
+        assert_eq!(buffer.word_at(10), Some((14, 16)));
+        // A line with nothing left ahead of the cursor has no word, and the
+        // search never runs on into the next line.
+        let trailing = Buffer::new(b"go ..\nword".to_vec());
+        assert_eq!(trailing.word_at(3), None);
+        assert_eq!(buffer.word_at(usize::MAX), None);
+    }
+
+    #[test]
+    fn highlight_matches_whole_words_or_substrings_on_request() {
+        let data = b"the then other the";
+        let substring = Highlight {
+            needle: b"the".to_vec(),
+            whole_word: false,
+        };
+        assert_eq!(
+            substring.matches(data),
+            [(0, 3), (4, 7), (10, 13), (15, 18)]
+        );
+
+        let word = Highlight {
+            needle: b"the".to_vec(),
+            whole_word: true,
+        };
+        assert_eq!(word.matches(data), [(0, 3), (15, 18)]);
+        assert_eq!(word.find(data, 1), Some(15));
+        assert_eq!(word.find(data, 16), None);
+
+        // Backwards, `rfind` stops short of its bound the way `find` starts
+        // past it, so `n` and `N` never land where the cursor already is.
+        assert_eq!(word.rfind(data, 18), Some(15));
+        assert_eq!(word.rfind(data, 15), Some(0));
+        assert_eq!(word.rfind(data, 0), None);
+        assert_eq!(substring.rfind(data, 15), Some(10));
+
+        // An empty or oversized needle matches nothing instead of looping.
+        assert!(Highlight::default().matches(data).is_empty());
+        assert!(Highlight::default().is_empty());
+        let oversized = Highlight {
+            needle: vec![b'x'; data.len() + 1],
+            whole_word: false,
+        };
+        assert!(oversized.matches(data).is_empty());
+        assert_eq!(oversized.rfind(data, data.len()), None);
+        assert_eq!(Highlight::default().rfind(data, data.len()), None);
+    }
 
     #[test]
     fn rows_cover_empty_final_newline_blank_binary_and_utf8_bytes() {

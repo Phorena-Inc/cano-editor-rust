@@ -1,14 +1,15 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use cano_fresh::app::{App, AppEffect};
+use cano_fresh::app::{App, AppEffect, Jump};
 use cano_fresh::cli::{CliError, parse};
 use cano_fresh::config::{load as load_config, load_or_default};
 use cano_fresh::io::{help_page, load_buffer, save_buffer};
 use cano_fresh::process::run_shell;
-use cano_fresh::render::{RenderOptions, Scroll, draw};
-use cano_fresh::syntax::{SyntaxConfig, load as load_syntax};
+use cano_fresh::recent::Recent;
+use cano_fresh::render::{RenderOptions, draw};
+use cano_fresh::syntax::{Language, SyntaxConfig, load as load_syntax};
 use cano_fresh::terminal::TerminalSession;
 
 fn main() -> ExitCode {
@@ -102,29 +103,48 @@ fn run() -> Result<u8, String> {
     if let Some(undo_size) = config.undo_size {
         app.commands.undo_size = undo_size;
     }
+    if let Some(cursorline) = config.cursorline {
+        app.commands.cursorline = cursorline;
+    }
+    if let Some(mouse) = config.mouse {
+        app.commands.mouse = mouse;
+    }
     app.editor.indent = app.commands.indent.max(0) as usize;
 
-    // The `.cyntax` palette lives next to the configuration file, wherever
-    // that configuration came from.
-    let syntax: Option<SyntaxConfig> = if app.commands.syntax != 0 {
-        filename
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .and_then(|extension| {
-                config_path.parent().and_then(|parent| {
-                    load_syntax(&parent.join(format!("{extension}.cyntax"))).ok()
-                })
-            })
-    } else {
-        None
-    };
+    // The recent list lives beside the effective configuration file, wherever
+    // that configuration came from, the same way `.cyntax` palettes do.
+    if let Some(directory) = config_path.parent() {
+        let list = directory.join("recent");
+        app.recent = Recent::load(&list);
+        app.recent_path = Some(list);
+    }
+    // Built-in help pages are documentation, not the user's own files, so they
+    // stay out of the history.
+    if !showing_help {
+        app.record_recent(&filename);
+    }
+
+    let mut palette = Palette::new(config_path);
 
     let mut terminal = TerminalSession::start().map_err(|error| error.to_string())?;
     let mut message_deadline = None::<Instant>;
-    let mut scroll = Scroll::default();
     loop {
+        // Mouse reporting follows the option, so `:set-var mouse 0` hands the
+        // terminal its own selection back without a restart.
+        terminal
+            .set_mouse(app.commands.mouse != 0)
+            .map_err(|error| error.to_string())?;
+        let syntax = palette.refresh(&app.filename, app.commands.syntax != 0);
+        // The wheel scrolls by writing to the viewport, so the frame starts
+        // from whatever the application left there.
+        let mut viewport = app.viewport;
         let prompt = String::from_utf8_lossy(&app.prompt);
-        let count = String::from_utf8_lossy(&app.count);
+        let pending = app.pending_hint();
+        // Borrowed across the draw closure, so the labels have to outlive it.
+        let jump = match &app.jump {
+            Some(Jump::Target { targets, typed }) => Some((targets.as_slice(), typed.as_slice())),
+            _ => None,
+        };
         let filename = app
             .filename
             .file_name()
@@ -143,19 +163,25 @@ fn run() -> Result<u8, String> {
                         relative_numbers: app.commands.relative != 0,
                         prompt: &prompt,
                         prompt_cursor: app.prompt_cursor,
-                        count: &count,
+                        pending: &pending,
+                        jump,
+                        highlight: &app.highlight,
+                        cursorline: app.commands.cursorline != 0,
                         explorer: app.explorer.as_ref(),
-                        syntax: (app.commands.syntax != 0)
-                            .then_some(syntax.as_ref())
-                            .flatten(),
+                        recent: app.recent_open.then_some(&app.recent),
+                        syntax,
+                        markdown: app.markdown,
                         message: app.commands.message.as_deref(),
                         filename: &filename,
                         saved: app.saved,
                     },
-                    &mut scroll,
+                    &mut viewport,
                 );
             })
             .map_err(|error| error.to_string())?;
+
+        app.viewport = viewport;
+        app.mark_rendered();
 
         if app.message_pending {
             app.message_pending = false;
@@ -174,10 +200,84 @@ fn run() -> Result<u8, String> {
         };
 
         let effects = app.handle(input);
-        if apply_effects(&mut app, effects)? {
+        let quit = apply_effects(&mut app, effects)?;
+        // A pane held back by the save prompt opens only now that the write
+        // has actually been applied.
+        app.open_pending_pane();
+        if quit {
             return Ok(0);
         }
     }
+}
+
+/// Keeps the syntax palette in step with the file being edited.
+///
+/// The buffer can be replaced at any time by the explorer or the recent-file
+/// picker, and `syntax` can be toggled at runtime, so the palette cannot be
+/// settled once at startup: doing that leaves a `.rs` file opened from a `.md`
+/// one with markdown's highlighting, which is to say none. It is reloaded only
+/// when the file or the flag actually changes, which keeps the `.cyntax`
+/// lookup off every frame.
+struct Palette {
+    config_path: PathBuf,
+    current: Option<SyntaxConfig>,
+    source: Option<(PathBuf, bool)>,
+}
+
+impl Palette {
+    fn new(config_path: PathBuf) -> Self {
+        Self {
+            config_path,
+            current: None,
+            source: None,
+        }
+    }
+
+    fn refresh(&mut self, filename: &Path, enabled: bool) -> Option<&SyntaxConfig> {
+        let stale = self
+            .source
+            .as_ref()
+            .is_none_or(|(path, was)| path != filename || *was != enabled);
+        if stale {
+            self.current = highlighting(filename, &self.config_path, enabled);
+            self.source = Some((filename.to_path_buf(), enabled));
+        }
+        self.current.as_ref()
+    }
+}
+
+/// Chooses the highlighting for one file.
+///
+/// A `<extension>.cyntax` palette beside the effective configuration file wins,
+/// so a user's own colors keep overriding the built-ins; otherwise Cano uses
+/// its built-in lists for the languages it knows. An extension with neither is
+/// left uncolored.
+fn highlighting(filename: &Path, config_path: &Path, enabled: bool) -> Option<SyntaxConfig> {
+    if !enabled {
+        return None;
+    }
+    // Dotfiles such as `.vimrc` carry their language in the file name, so the
+    // whole path decides it.
+    let language = Language::for_path(filename);
+    // A `.cyntax` palette is keyed by extension, so a file without one still
+    // gets built-in highlighting but cannot be given a custom palette -- and
+    // must not be handed whatever a literal `.cyntax` file happens to hold.
+    let palette = filename
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .and_then(|extension| {
+            config_path.parent().and_then(|parent| {
+                // The palette is parsed for the detected language so its
+                // omitted `k`/`t` word lists fall back to that language
+                // rather than always to C.
+                load_syntax(
+                    &parent.join(format!("{extension}.cyntax")),
+                    language.unwrap_or_default(),
+                )
+                .ok()
+            })
+        });
+    palette.or_else(|| language.map(SyntaxConfig::for_language))
 }
 
 fn apply_effects(app: &mut App, effects: Vec<AppEffect>) -> Result<bool, String> {
@@ -217,6 +317,7 @@ fn apply_effects(app: &mut App, effects: Vec<AppEffect>) -> Result<bool, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cano_fresh::syntax::Rgb;
     use cano_fresh::terminal::Input;
 
     fn make_dirty(app: &mut App) {
@@ -243,6 +344,101 @@ mod tests {
             "cano-fresh-main-{label}-{}-{stamp}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn the_palette_follows_the_file_rather_than_the_one_opened_at_startup() {
+        let root = fixture("palette");
+        std::fs::create_dir(&root).unwrap();
+        let mut palette = Palette::new(root.join("init.lua"));
+        let language = |palette: &mut Palette, name: &str, enabled: bool| {
+            palette
+                .refresh(Path::new(name), enabled)
+                .map(|config| config.language)
+        };
+
+        // Markdown has no palette of its own, and opening a Rust file from it
+        // has to pick Rust up rather than keep markdown's nothing.
+        assert_eq!(language(&mut palette, "a/doc.md", true), None);
+        assert_eq!(
+            language(&mut palette, "a/code.rs", true),
+            Some(Language::Rust)
+        );
+        assert_eq!(language(&mut palette, "a/doc.md", true), None);
+        assert_eq!(
+            language(&mut palette, "a/code.rs", true),
+            Some(Language::Rust)
+        );
+        assert_eq!(
+            language(&mut palette, "a/main.py", true),
+            Some(Language::Python)
+        );
+
+        // The runtime `syntax` toggle is followed too, in both directions,
+        // even though it was on when the palette was first asked for.
+        assert_eq!(language(&mut palette, "a/main.py", false), None);
+        assert_eq!(
+            language(&mut palette, "a/main.py", true),
+            Some(Language::Python)
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn highlighting_prefers_a_palette_and_falls_back_to_the_built_in_language() {
+        let root = fixture("syntax");
+        std::fs::create_dir(&root).unwrap();
+        let config_path = root.join("init.lua");
+
+        // A known extension with no palette beside it gets the built-in lists.
+        let rust = highlighting(Path::new("a/b.rs"), &config_path, true).unwrap();
+        assert_eq!(rust.language, Language::Rust);
+        assert_eq!(rust.keyword.color, Rgb::new(255, 0, 0));
+        let python = highlighting(Path::new("a/b.py"), &config_path, true).unwrap();
+        assert_eq!(python.language, Language::Python);
+        assert_eq!(
+            highlighting(Path::new("a/b.cpp"), &config_path, true)
+                .unwrap()
+                .language,
+            Language::Cpp
+        );
+
+        // A dotfile with no extension is still recognized by its name.
+        assert_eq!(
+            highlighting(Path::new("/home/u/.vimrc"), &config_path, true)
+                .unwrap()
+                .language,
+            Language::Vim
+        );
+        assert_eq!(
+            highlighting(Path::new(".bashrc"), &config_path, true)
+                .unwrap()
+                .language,
+            Language::Bash
+        );
+        assert_eq!(
+            highlighting(Path::new("a/init.lua"), &config_path, true)
+                .unwrap()
+                .language,
+            Language::Lua
+        );
+
+        // An unknown extension, and syntax turned off, stay uncolored.
+        assert!(highlighting(Path::new("a/b.go"), &config_path, true).is_none());
+        assert!(highlighting(Path::new("plain"), &config_path, true).is_none());
+        std::fs::write(root.join(".cyntax"), b"k,1,2,3.").unwrap();
+        assert!(highlighting(Path::new("plain"), &config_path, true).is_none());
+        assert!(highlighting(Path::new("a/b.rs"), &config_path, false).is_none());
+
+        // A palette beside the config still wins, and its omitted word lists
+        // fall back to the detected language rather than to C.
+        std::fs::write(root.join("rs.cyntax"), b"k,1,2,3.").unwrap();
+        let configured = highlighting(Path::new("a/b.rs"), &config_path, true).unwrap();
+        assert_eq!(configured.keyword.color, Rgb::new(1, 2, 3));
+        assert!(configured.keyword.words.contains(&b"fn".to_vec()));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
