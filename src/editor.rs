@@ -627,6 +627,20 @@ impl Editor {
         true
     }
 
+    /// The byte range of the whole rows the selection covers.
+    ///
+    /// Indentation belongs to a line rather than to a span inside it, so an
+    /// operator that rewrites it takes every line the selection touches.
+    pub fn visual_rows(&self) -> Option<(usize, usize)> {
+        if self.mode != Mode::Visual {
+            return None;
+        }
+        let (start, end) = self.visual_bounds();
+        let first = self.buffer.row_for_index(start)?;
+        let last = self.buffer.row_for_index(end)?;
+        Some((self.buffer.rows[first].start, self.buffer.rows[last].end))
+    }
+
     /// Recomputes the selection from its anchor and the cursor.
     ///
     /// Every visual motion ends here, so anything else that moves the cursor
@@ -708,7 +722,8 @@ impl Editor {
     }
 }
 
-fn brace_depth(data: &[u8], end: usize) -> usize {
+/// The nesting depth at `end`, ignoring brackets inside string literals.
+pub fn brace_depth(data: &[u8], end: usize) -> usize {
     let mut depth = 0usize;
     let mut quote = None;
     let mut escaped = false;

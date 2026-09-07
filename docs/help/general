@@ -10,7 +10,7 @@ Usage
 Modes
   Normal   motions, editing, undo/redo, explorer, recents, search, commands
   Insert   byte insertion, indentation and brace autoclose
-  Visual   character/line selection, jumps, delete, yank and indentation
+  Visual   character/line selection, jumps, delete, yank, indent, format
   Search   wrapped search and s/old/new replacement
   Command  runtime commands and ! shell execution
 
@@ -37,6 +37,19 @@ Mouse
   the right scrolls to that position. A click in the explorer or recent list
   selects an entry -- clicking the selected one opens it, while their
   scrollbar only moves the selection.
+
+Autoformat
+  :autoformat (or :Autoformat) tidies the buffer's whitespace, as
+  vim-autoformat does when no external formatter is set: re-indent from the
+  bracket nesting, retab leading whitespace to match indent, then strip
+  trailing spaces. Each step has a switch -- autoformat_autoindent,
+  autoformat_retab, autoformat_remove_trailing_spaces -- all on by default;
+  :set noautoformat_retab matters for a Makefile. [space] f runs it on the
+  whole buffer; = in Visual mode runs it on the selected lines, taking every
+  line the selection touches whole.
+  Brackets inside strings are
+  ignored, the line count never changes, and the whole rewrite is one undo
+  step.
 
 Invisible characters
   :set list draws them. The default set names every kind:

@@ -8,6 +8,7 @@ Commands
   set name?               report an option's current value
   set listchars=spec      glyphs for invisible characters (see :set list)
   imap keys rhs           map a key sequence typed in Insert mode
+  autoformat              tidy the buffer's whitespace (:Autoformat too)
   nohl / nohlsearch       stop showing the search highlight
   :w                      save
   :q                      quit if there are no unsaved changes

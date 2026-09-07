@@ -21,7 +21,9 @@ use crate::syntax::{Rgb, SyntaxConfig, SyntaxKind, tokens};
 
 const LINE_NUMBER_WIDTH: u16 = 5;
 const STATUS_ROWS: u16 = 2;
-const TAB_WIDTH: usize = 4;
+/// Columns a tab occupies.  Autoformat shares it: converting between tabs
+/// and spaces has to agree with what a tab actually looks like.
+pub const TAB_WIDTH: usize = 4;
 
 /// Markdown display palette.  One color per heading level, then the shared
 /// colors for the remaining constructs.  These stay mid-toned rather than

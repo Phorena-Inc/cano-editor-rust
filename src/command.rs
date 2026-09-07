@@ -137,6 +137,8 @@ const COMMANDS: &[&[u8]] = &[
     b"nohl",
     b"nohlsearch",
     b"imap",
+    b"autoformat",
+    b"Autoformat",
 ];
 
 const CONFIGS: &[&[u8]] = &[
@@ -149,6 +151,9 @@ const CONFIGS: &[&[u8]] = &[
     b"mouse",
     b"backup",
     b"list",
+    b"autoformat_autoindent",
+    b"autoformat_retab",
+    b"autoformat_remove_trailing_spaces",
 ];
 
 fn is_config(bytes: &[u8]) -> bool {
@@ -251,6 +256,9 @@ pub enum ConfigVariable {
     Mouse,
     Backup,
     List,
+    AutoFormatIndent,
+    AutoFormatRetab,
+    AutoFormatTrailing,
 }
 
 impl ConfigVariable {
@@ -267,6 +275,9 @@ impl ConfigVariable {
             b"mouse" => Some(Self::Mouse),
             b"backup" | b"bk" => Some(Self::Backup),
             b"list" => Some(Self::List),
+            b"autoformat_autoindent" => Some(Self::AutoFormatIndent),
+            b"autoformat_retab" => Some(Self::AutoFormatRetab),
+            b"autoformat_remove_trailing_spaces" => Some(Self::AutoFormatTrailing),
             _ => None,
         }
     }
@@ -311,6 +322,8 @@ pub enum Action {
         from: Vec<u8>,
         to: Vec<u8>,
     },
+    /// `:autoformat`, which rewrites the whole buffer's whitespace.
+    AutoFormat,
 }
 
 fn invalid(expected: &'static str, token: &Token) -> CommandError {
@@ -590,6 +603,10 @@ pub fn parse(tokens: &[Token]) -> Result<Action, CommandError> {
             }
             Ok(Action::InsertMap { from, to })
         }
+        b"autoformat" | b"Autoformat" => {
+            exact_arity(tokens, 1)?;
+            Ok(Action::AutoFormat)
+        }
         b"nohl" | b"nohlsearch" => {
             exact_arity(tokens, 1)?;
             Ok(Action::NoHighlight)
@@ -609,6 +626,9 @@ pub enum ExternalEffect {
     /// Stop showing the search highlight.  The pattern itself belongs to the
     /// application, so the command state only reports the request.
     ClearHighlight,
+    /// Rewrite the buffer's whitespace.  The buffer belongs to the
+    /// application, so the command state only reports the request.
+    AutoFormat,
 }
 
 /// One Insert-mode mapping, as declared by `:imap`.
@@ -655,6 +675,10 @@ pub struct CommandState {
     pub list: i64,
     /// Vim's `listchars`, which decides what `list` draws.
     pub listchars: ListChars,
+    /// The three steps `:autoformat` runs, each on as the plugin has them.
+    pub autoformat_autoindent: i64,
+    pub autoformat_retab: i64,
+    pub autoformat_remove_trailing_spaces: i64,
     pub output: Vec<u8>,
     pub maps: Vec<KeyMap>,
     /// Insert-mode mappings, in the order they were declared.
@@ -683,6 +707,9 @@ impl CommandState {
             backup: 1,
             list: 0,
             listchars: ListChars::default(),
+            autoformat_autoindent: 1,
+            autoformat_retab: 1,
+            autoformat_remove_trailing_spaces: 1,
             output,
             maps: Vec::new(),
             insert_maps: Vec::new(),
@@ -704,6 +731,9 @@ impl CommandState {
             ConfigVariable::Mouse => self.mouse,
             ConfigVariable::Backup => self.backup,
             ConfigVariable::List => self.list,
+            ConfigVariable::AutoFormatIndent => self.autoformat_autoindent,
+            ConfigVariable::AutoFormatRetab => self.autoformat_retab,
+            ConfigVariable::AutoFormatTrailing => self.autoformat_remove_trailing_spaces,
         }
     }
 
@@ -746,6 +776,11 @@ impl CommandState {
                 ConfigVariable::Mouse => self.mouse = value,
                 ConfigVariable::Backup => self.backup = value,
                 ConfigVariable::List => self.list = value,
+                ConfigVariable::AutoFormatIndent => self.autoformat_autoindent = value,
+                ConfigVariable::AutoFormatRetab => self.autoformat_retab = value,
+                ConfigVariable::AutoFormatTrailing => {
+                    self.autoformat_remove_trailing_spaces = value;
+                }
             },
             Action::SetOutput(output) => self.output = output,
             Action::SetMap { key, mut expansion } => {
@@ -772,6 +807,7 @@ impl CommandState {
                 return Ok(Some(ExternalEffect::Save(self.output.clone())));
             }
             Action::NoHighlight => return Ok(Some(ExternalEffect::ClearHighlight)),
+            Action::AutoFormat => return Ok(Some(ExternalEffect::AutoFormat)),
             Action::InsertMap { from, to } => {
                 // A repeated left-hand side replaces the earlier binding, the
                 // way re-running `:imap` in vim does.

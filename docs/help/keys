@@ -25,6 +25,7 @@ Normal
   space i       leader mapping for *
   space o       leader mapping for :nohl
   space l       leader mapping for :set list!
+  space f       leader mapping for :autoformat
 
 Mouse
   click         move the cursor (gutter goes to the line start)
@@ -45,3 +46,4 @@ Visual
   s char        extend the selection to an EasyMotion label
   d/x y         delete or yank
   > <           indent or unindent selected rows
+  =             autoformat the selected lines

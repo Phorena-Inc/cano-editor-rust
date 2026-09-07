@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 /// Buffer rows one wheel notch moves, matching the usual terminal default.
 const SCROLL_LINES: isize = 3;
 
+use crate::autoformat::{self, Steps};
 use crate::buffer::Highlight;
 use crate::command::{Action, CommandState, ConfigVariable, ExternalEffect, key, lex, parse};
 use crate::editor::{Editor, Leader, Mode, MoveDirection};
@@ -333,6 +334,7 @@ impl App {
                     let shown = i64::from(self.commands.list == 0);
                     self.assign(ConfigVariable::List, shown);
                 }
+                Input::Byte(b'f') => self.autoformat(),
                 _ => {}
             }
             return Vec::new();
@@ -658,6 +660,14 @@ impl App {
             Input::Byte(b's') => {
                 self.jump = Some(Jump::Character(Kind::Find));
             }
+            // `=` re-indents a selection in vim, and sits beside `>` and `<`
+            // here for the same reason: all three rewrite whole lines.
+            Input::Byte(b'=') => {
+                if let Some(region) = self.editor.visual_rows() {
+                    self.editor.visual_key(27);
+                    self.autoformat_region(region);
+                }
+            }
             Input::Byte(byte) => {
                 self.editor.visual_key(byte);
             }
@@ -791,6 +801,14 @@ impl App {
                         effects.push(AppEffect::Quit);
                     }
                     effects
+                }
+                Ok(Some(ExternalEffect::AutoFormat)) => {
+                    self.autoformat();
+                    self.commands
+                        .quit
+                        .then_some(AppEffect::Quit)
+                        .into_iter()
+                        .collect()
                 }
                 Ok(Some(ExternalEffect::ClearHighlight)) => {
                     self.highlight = Highlight::default();
@@ -949,6 +967,61 @@ impl App {
         // `apply` is the one place a variable is written, so `:set` and
         // `:set-var` cannot drift apart.
         let _ = self.commands.apply(Action::SetVar { variable, value });
+    }
+
+    /// Rewrites the buffer's whitespace, as vim-autoformat's fallback does.
+    ///
+    /// The whole rewrite is one undo step, and the record is narrowed to the
+    /// span that actually changed so reformatting a file does not put a copy
+    /// of all of it on the undo stack.
+    pub fn autoformat(&mut self) {
+        let region = (0, self.editor.buffer.data.len());
+        self.autoformat_region(region);
+    }
+
+    /// Formats only the lines `region` touches.
+    fn autoformat_region(&mut self, region: (usize, usize)) {
+        if self.readonly {
+            self.set_message("Buffer is read-only");
+            return;
+        }
+        let steps = Steps {
+            autoindent: self.commands.autoformat_autoindent != 0,
+            retab: self.commands.autoformat_retab != 0,
+            remove_trailing_spaces: self.commands.autoformat_remove_trailing_spaces != 0,
+        };
+        let indent = self.commands.indent.max(0) as usize;
+        let before = &self.editor.buffer.data;
+        let Some(after) = autoformat::format(before, region, steps, indent) else {
+            self.set_message("Already formatted");
+            return;
+        };
+        let lines = autoformat::changed_lines(before, &after);
+
+        let (start, old_end, new_end) = changed_span(before, &after);
+        let original = before[start..old_end].to_vec();
+        // The cursor is put back on the line it was on, since the byte it was
+        // on has almost certainly moved.
+        let row = self.editor.buffer.cursor_row().unwrap_or(0);
+        if self
+            .editor
+            .buffer
+            .replace_region(start, old_end, &after[start..new_end])
+            .is_some()
+        {
+            self.editor
+                .history
+                .push_undo(UndoRecord::replace_region(start, new_end, original));
+        }
+        let line = self
+            .editor
+            .buffer
+            .rows
+            .get(row)
+            .or_else(|| self.editor.buffer.rows.last());
+        self.editor.buffer.cursor = line.map_or(0, |row| row.start);
+        let many = if lines == 1 { "" } else { "s" };
+        self.set_message(format!("Formatted {lines} line{many}"));
     }
 
     /// Runs a substitution, or opens the `c` confirmation for it.
@@ -1600,6 +1673,26 @@ impl App {
             Err(error) => self.set_message(error.to_string()),
         }
     }
+}
+
+/// The span that differs between two versions of a buffer, as
+/// `(start, old end, new end)`.
+///
+/// Formatting usually leaves the head and tail of a file alone, so narrowing
+/// the undo record to what moved keeps it small.
+fn changed_span(before: &[u8], after: &[u8]) -> (usize, usize, usize) {
+    let start = before
+        .iter()
+        .zip(after)
+        .position(|(before, after)| before != after)
+        .unwrap_or(before.len().min(after.len()));
+    let tail = before[start..]
+        .iter()
+        .rev()
+        .zip(after[start..].iter().rev())
+        .position(|(before, after)| before != after)
+        .unwrap_or_else(|| before.len().min(after.len()) - start);
+    (start, before.len() - tail, after.len() - tail)
 }
 
 fn unknown(name: &[u8]) -> String {
@@ -2988,6 +3081,153 @@ b"
         assert_eq!(
             app.commands.message.as_deref(),
             Some("Unknown option: nosuchoption")
+        );
+    }
+
+    #[test]
+    fn autoformat_rewrites_the_whitespace_and_undoes_in_one_press() {
+        let messy = b"f() {\nlet x = 1;   \n  if x {\n\tbody;\n}\n}\n".to_vec();
+        let mut app = App::new(messy.clone(), PathBuf::from("f.rs"));
+        assert!(ex(&mut app, b"set sw=4").is_empty());
+
+        assert!(ex(&mut app, b"autoformat").is_empty());
+        assert_eq!(
+            app.editor.buffer.data,
+            b"f() {\n    let x = 1;\n    if x {\n        body;\n    }\n}\n"
+        );
+        assert_eq!(app.commands.message.as_deref(), Some("Formatted 4 lines"));
+        assert!(!app.saved);
+        assert!(app.editor.buffer.invariants_hold());
+
+        // The whole rewrite is one step, and one step back.
+        assert!(app.handle(Input::Byte(b'u')).is_empty());
+        assert_eq!(app.editor.buffer.data, messy);
+        assert!(app.saved);
+        assert!(app.handle(Input::Byte(b'U')).is_empty());
+        assert_eq!(
+            app.editor.buffer.data,
+            b"f() {\n    let x = 1;\n    if x {\n        body;\n    }\n}\n"
+        );
+
+        // A second pass has nothing left to do.
+        assert!(ex(&mut app, b"autoformat").is_empty());
+        assert_eq!(app.commands.message.as_deref(), Some("Already formatted"));
+        // The plugin's own spelling works too.
+        assert!(ex(&mut app, b"Autoformat").is_empty());
+        assert_eq!(app.commands.message.as_deref(), Some("Already formatted"));
+    }
+
+    #[test]
+    fn the_leader_runs_autoformat_too() {
+        let messy = b"f() {\nbody;  \n}\n".to_vec();
+        let mut app = App::new(messy.clone(), PathBuf::from("f.rs"));
+        assert!(ex(&mut app, b"set sw=4").is_empty());
+
+        assert!(app.handle(Input::Byte(b' ')).is_empty());
+        assert!(app.handle(Input::Byte(b'f')).is_empty());
+        assert_eq!(app.editor.buffer.data, b"f() {\n    body;\n}\n");
+        assert_eq!(app.commands.message.as_deref(), Some("Formatted 1 line"));
+
+        // It is the same one undo step the command produces.
+        assert!(app.handle(Input::Byte(b'u')).is_empty());
+        assert_eq!(app.editor.buffer.data, messy);
+        assert!(app.saved);
+    }
+
+    #[test]
+    fn visual_equals_formats_only_the_selected_lines() {
+        let messy = b"f() {\nbad;\n  worse;\nalso bad;\n}\n".to_vec();
+        let mut app = App::new(messy, PathBuf::from("f.rs"));
+        assert!(ex(&mut app, b"set sw=4").is_empty());
+
+        // Select the middle line only.
+        app.editor.buffer.cursor = 11;
+        assert!(app.handle(Input::Byte(b'V')).is_empty());
+        assert!(app.handle(Input::Byte(b'=')).is_empty());
+
+        assert_eq!(
+            app.editor.buffer.data,
+            b"f() {\nbad;\n    worse;\nalso bad;\n}\n"
+        );
+        assert_eq!(app.commands.message.as_deref(), Some("Formatted 1 line"));
+        // `=` finishes the operator, the way `>` and `<` do.
+        assert_eq!(app.editor.mode, Mode::Normal);
+        assert!(app.editor.buffer.invariants_hold());
+
+        // Still one undo step.
+        assert!(app.handle(Input::Byte(b'u')).is_empty());
+        assert!(app.saved);
+    }
+
+    #[test]
+    fn a_charwise_selection_still_takes_the_lines_it_touches() {
+        let mut app = App::new(b"f() {\nbad;\nworse;\n}\n".to_vec(), PathBuf::from("f.rs"));
+        assert!(ex(&mut app, b"set sw=4").is_empty());
+
+        // A few bytes spanning the middle of two lines, not whole ones.
+        app.editor.buffer.cursor = 8;
+        assert!(app.handle(Input::Byte(b'v')).is_empty());
+        for _ in 0..4 {
+            assert!(app.handle(Input::Byte(b'l')).is_empty());
+        }
+        assert!(app.handle(Input::Byte(b'=')).is_empty());
+
+        // Indentation belongs to a line, so both lines were taken whole.
+        assert_eq!(app.editor.buffer.data, b"f() {\n    bad;\n    worse;\n}\n");
+    }
+
+    #[test]
+    fn each_autoformat_step_can_be_switched_off() {
+        let messy = b"f() {\nbody;  \n}\n".to_vec();
+        let formatted = |line: &[u8]| {
+            let mut app = App::new(messy.clone(), PathBuf::from("f.rs"));
+            assert!(ex(&mut app, line).is_empty());
+            assert!(ex(&mut app, b"autoformat").is_empty());
+            app.editor.buffer.data.clone()
+        };
+
+        assert_eq!(formatted(b"set sw=4"), b"f() {\n    body;\n}\n");
+        // Without re-indenting, only the trailing whitespace goes.
+        assert_eq!(
+            formatted(b"set sw=4 noautoformat_autoindent"),
+            b"f() {\nbody;\n}\n"
+        );
+        // Without the trailing step, the spaces at the end survive.
+        assert_eq!(
+            formatted(b"set sw=4 noautoformat_remove_trailing_spaces"),
+            b"f() {\n    body;  \n}\n"
+        );
+        // Tabs are what a zero indent width means.
+        assert_eq!(formatted(b"set sw=0"), b"f() {\n\tbody;\n}\n");
+
+        // Retab on its own converts without re-indenting: a tab is four
+        // columns, so it becomes four spaces.
+        let mut tabbed = App::new(b"\tone\n".to_vec(), PathBuf::from("f.rs"));
+        assert!(ex(&mut tabbed, b"set sw=4 noautoformat_autoindent").is_empty());
+        assert!(ex(&mut tabbed, b"autoformat").is_empty());
+        assert_eq!(tabbed.editor.buffer.data, b"    one\n");
+    }
+
+    #[test]
+    fn autoformat_leaves_the_cursor_on_its_line_and_refuses_a_help_page() {
+        let mut app = App::new(b"f() {\nbody;\n}\n".to_vec(), PathBuf::from("f.rs"));
+        assert!(ex(&mut app, b"set sw=4").is_empty());
+        // Put the cursor on the line that is about to move.
+        app.editor.buffer.cursor = 6;
+        assert_eq!(app.editor.buffer.cursor_row(), Some(1));
+        assert!(ex(&mut app, b"autoformat").is_empty());
+        // The byte it was on has moved, so it lands at the start of the line
+        // it was on rather than somewhere arbitrary.
+        assert_eq!(app.editor.buffer.cursor_row(), Some(1));
+        assert!(app.editor.buffer.invariants_hold());
+
+        let mut help = App::new(b"  help\n".to_vec(), PathBuf::from("general"));
+        help.readonly = true;
+        assert!(ex(&mut help, b"autoformat").is_empty());
+        assert_eq!(help.editor.buffer.data, b"  help\n");
+        assert_eq!(
+            help.commands.message.as_deref(),
+            Some("Buffer is read-only")
         );
     }
 

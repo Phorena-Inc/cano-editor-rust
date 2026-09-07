@@ -105,6 +105,7 @@ Command - For executing commands
 |Normal| [space] i      | Leader mapping for `*`                          |
 |Normal| [space] o      | Leader mapping for `:nohl`                      |
 |Normal| [space] l      | Leader mapping for `:set list!`                 |
+|Normal| [space] f      | Leader mapping for `:autoformat`                |
 |Normal/Visual| Arrow keys | Move like h/j/k/l                            |
 |Insert| Tab            | Insert the configured indentation               |
 
@@ -127,6 +128,36 @@ working. Most terminals still offer a native selection with Shift held; turning
 
 A click is not a key: it cannot answer the save prompt, complete an `:imap`, or
 pick an `s`/`t` jump label.
+
+## Autoformat
+`:autoformat` (or `:Autoformat`) tidies the whole buffer's whitespace. It is
+the fallback that
+[vim-autoformat](https://github.com/vim-autoformat/vim-autoformat) runs when no
+external formatter is configured, in the same order and each behind its own
+switch:
+
+| Step | Option | Does |
+|------|--------|------|
+| Re-indent | `autoformat_autoindent` | Sets each line's indentation from its bracket nesting, like `gg=G`. A line opening with a closing bracket sits a level out; a blank line is left blank |
+| Retab | `autoformat_retab` | Rewrites leading whitespace as tabs or spaces to match `indent`, preserving the column it found |
+| Strip line ends | `autoformat_remove_trailing_spaces` | Removes trailing spaces and tabs |
+
+All three are on by default. Turn one off with `:set noautoformat_retab` — worth
+knowing for a Makefile, where a leading tab is not decoration.
+
+Indentation follows `indent`: a width of `0` means one tab per level, anything
+else that many spaces. Brackets inside string literals are ignored, so `a =
+"{";` does not open a block. The rewrite is **one undo step**, and never
+changes how many lines a file has.
+
+It reports what it did (`Formatted 4 lines`, or `Already formatted`), and
+refuses on a read-only help page. There is no on-save hook — run it when you
+want it, or bind it:
+
+```lua
+cano.command([[set-map <c-f> ":autoformat
+"]])
+```
 
 ## Showing invisible characters
 `:set list` draws the characters that otherwise show nothing, and `:set
@@ -546,6 +577,9 @@ cursorline # mark the line the cursor is on (also spelled cursor-line)
 mouse # let Cano handle the mouse
 backup # keep a copy of what each save overwrites
 list # draw the invisible characters named by listchars
+autoformat_autoindent # :autoformat re-indents
+autoformat_retab # :autoformat normalises leading whitespace
+autoformat_remove_trailing_spaces # :autoformat strips line ends
 ```
 
 `cursorline` is vim's option of the same name, off by default as it is in vim.

@@ -25,6 +25,7 @@ local cano = setup({
 -- cano.command([[set listchars=tab:> ,trail:.,eol:$]])
 -- cano.command("imap ;; <Esc>")
 -- cano.command("set cursorline nomouse")
+-- cano.command("set noautoformat_retab")   -- a Makefile needs its tabs
 --
 -- cano.exit(0, "Configuration loaded")
 

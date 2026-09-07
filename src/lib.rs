@@ -1,6 +1,7 @@
 //! Fresh Cano implementation derived exclusively from the migration documents.
 
 pub mod app;
+pub mod autoformat;
 pub mod backup;
 pub mod buffer;
 pub mod cli;
