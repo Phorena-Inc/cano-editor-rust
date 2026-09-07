@@ -3,6 +3,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use cano_fresh::app::{App, AppEffect, Jump};
+use cano_fresh::backup;
 use cano_fresh::cli::{CliError, parse};
 use cano_fresh::config::{load as load_config, load_or_default};
 use cano_fresh::io::{help_page, load_buffer, save_buffer};
@@ -109,7 +110,22 @@ fn run() -> Result<u8, String> {
     if let Some(mouse) = config.mouse {
         app.commands.mouse = mouse;
     }
+    if let Some(backup) = config.backup {
+        app.commands.backup = backup;
+    }
+    if let Some(list) = config.list {
+        app.commands.list = list;
+    }
     app.editor.indent = app.commands.indent.max(0) as usize;
+
+    // Anything the configuration asked to run, in the order it asked. These
+    // come last so a command can override a slot set above it.
+    for line in &config.commands {
+        let effects = app.run_command(line);
+        if apply_effects(&mut app, effects)? {
+            return Ok(0);
+        }
+    }
 
     // The recent list lives beside the effective configuration file, wherever
     // that configuration came from, the same way `.cyntax` palettes do.
@@ -167,6 +183,7 @@ fn run() -> Result<u8, String> {
                         jump,
                         highlight: &app.highlight,
                         cursorline: app.commands.cursorline != 0,
+                        list: (app.commands.list != 0).then_some(&app.commands.listchars),
                         explorer: app.explorer.as_ref(),
                         recent: app.recent_open.then_some(&app.recent),
                         syntax,
@@ -290,14 +307,25 @@ fn apply_effects(app: &mut App, effects: Vec<AppEffect>) -> Result<bool, String>
                 app.commands.quit = false;
                 save_failed = true;
             }
-            AppEffect::Save(path) => match save_buffer(&path, &app.editor.buffer.data) {
-                Ok(()) => app.mark_saved(),
-                Err(error) => {
-                    app.set_message(format!("Could not write {}: {error}", path.display()));
-                    app.commands.quit = false;
-                    save_failed = true;
+            AppEffect::Save(path) => {
+                // The copy is taken before the write, because what is worth
+                // keeping is the version about to be replaced. A backup that
+                // cannot be written is worth saying so, but not worth
+                // refusing the save over: the unsaved edit is what is at risk.
+                if app.commands.backup != 0
+                    && let Err(error) = backup::write(&path)
+                {
+                    app.set_message(format!("Could not back up {}: {error}", path.display()));
                 }
-            },
+                match save_buffer(&path, &app.editor.buffer.data) {
+                    Ok(()) => app.mark_saved(),
+                    Err(error) => {
+                        app.set_message(format!("Could not write {}: {error}", path.display()));
+                        app.commands.quit = false;
+                        save_failed = true;
+                    }
+                }
+            }
             // A shell that cannot even be spawned is a status message, not a
             // reason to exit the editor and discard unsaved changes.
             AppEffect::Shell(command) => match run_shell(&command) {

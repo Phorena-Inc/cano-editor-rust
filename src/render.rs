@@ -14,6 +14,7 @@ use crate::buffer::Highlight;
 use crate::editor::{Editor, Mode};
 use crate::explorer::{Entry, Explorer};
 use crate::jump::Target;
+use crate::listchars::ListChars;
 use crate::markdown::{Face, Kind, faces};
 use crate::recent::Recent;
 use crate::syntax::{Rgb, SyntaxConfig, SyntaxKind, tokens};
@@ -41,6 +42,9 @@ const JUMP_BACKGROUND: Color = Color::Rgb(150, 26, 26);
 /// `hlsearch` tints the background so the syntax color of the matched text
 /// still shows through.
 const HIGHLIGHT_BACKGROUND: Color = Color::Rgb(96, 82, 24);
+/// `list` glyphs stand in for characters rather than being any, so they are
+/// drawn subdued and take their color from neither the syntax nor the text.
+const LISTCHAR_COLOR: Color = Color::Rgb(96, 104, 118);
 const CODE_COLOR: Color = Color::Rgb(230, 120, 110);
 const QUOTE_COLOR: Color = Color::Rgb(139, 148, 158);
 const LIST_COLOR: Color = Color::Rgb(214, 164, 62);
@@ -193,6 +197,9 @@ pub struct RenderOptions<'a> {
     pub highlight: &'a Highlight,
     /// Vim's `cursorline`: marks the row the cursor is on.
     pub cursorline: bool,
+    /// Vim's `list`: the glyphs to draw for invisible characters, or `None`
+    /// while `list` is off.
+    pub list: Option<&'a ListChars>,
     pub explorer: Option<&'a Explorer>,
     /// The Ctrl-R recent-file picker, which takes the pane when it is open.
     pub recent: Option<&'a Recent>,
@@ -353,6 +360,7 @@ fn draw_editor(
     let overlays = Overlays {
         styles: &CellStyles::build(&editor.buffer.data, options),
         highlighted: &options.highlight.matches(&editor.buffer.data),
+        list: options.list,
     };
 
     for screen_row in 0..usize::from(layout.editor_height) {
@@ -484,6 +492,8 @@ struct Overlays<'a> {
     styles: &'a CellStyles,
     /// Byte ranges `hlsearch` is tinting.
     highlighted: &'a [(usize, usize)],
+    /// The `list` glyphs, while `list` is on.
+    list: Option<&'a ListChars>,
 }
 
 fn draw_buffer_row(
@@ -501,6 +511,11 @@ fn draw_buffer_row(
     let row = editor.buffer.rows[row_index];
     let last_column = first_column.saturating_add(usize::from(layout.content_width));
     let mut display_column = 0usize;
+    // Where this row's run of trailing whitespace begins, so `trail` can be
+    // told from `space` without rescanning the row for every byte.
+    let trailing = overlays
+        .list
+        .map_or(row.end, |_| trailing_start(&editor.buffer.data, row));
 
     for byte_index in row.start..row.end {
         let byte = editor.buffer.data[byte_index];
@@ -516,12 +531,25 @@ fn draw_buffer_row(
             let x = layout
                 .content_x
                 .saturating_add(u16::try_from(column - first_column).unwrap_or(u16::MAX));
-            let symbol = if byte == b'\t' {
-                ' '
-            } else {
-                display_byte(byte)
+            let listed = overlays.list.and_then(|chars| {
+                list_glyph(
+                    chars,
+                    &editor.buffer.data,
+                    byte_index,
+                    byte,
+                    tab_column,
+                    trailing,
+                )
+            });
+            let symbol = match listed {
+                Some(glyph) => glyph,
+                None if byte == b'\t' => ' ',
+                None => display_byte(byte),
             };
             let mut style = overlays.styles.style(byte_index);
+            if listed.is_some() {
+                style = style.fg(LISTCHAR_COLOR);
+            }
             if overlays
                 .highlighted
                 .iter()
@@ -546,6 +574,15 @@ fn draw_buffer_row(
         let x = layout
             .content_x
             .saturating_add(u16::try_from(display_column - first_column).unwrap_or(u16::MAX));
+        // `eol` marks the line ending, so it is only drawn where there is
+        // one: the last row of a file without a final newline has none.
+        if let Some(eol) = overlays.list.and_then(|chars| chars.eol)
+            && editor.buffer.data.get(row.end) == Some(&b'\n')
+            && let Some(cell) = buffer.cell_mut((x, y))
+        {
+            cell.set_char(eol)
+                .set_style(Style::default().fg(LISTCHAR_COLOR));
+        }
         if is_selected(editor, row.end)
             && let Some(cell) = buffer.cell_mut((x, y))
         {
@@ -836,6 +873,43 @@ fn draw_jump_labels(
     }
 }
 
+/// Where a row's run of trailing whitespace begins.
+fn trailing_start(data: &[u8], row: crate::buffer::Row) -> usize {
+    let mut at = row.end;
+    while at > row.start && matches!(data[at - 1], b' ' | b'\t') {
+        at -= 1;
+    }
+    at
+}
+
+/// The `list` glyph for one display cell, or `None` when the byte is drawn as
+/// itself.
+fn list_glyph(
+    chars: &ListChars,
+    data: &[u8],
+    index: usize,
+    byte: u8,
+    cell: usize,
+    trailing: usize,
+) -> Option<char> {
+    match byte {
+        // A tab keeps its full width: the head goes in the first cell and the
+        // fill in the rest, so nothing moves when `list` is switched on.
+        b'\t' => chars
+            .tab
+            .map(|(head, fill)| if cell == 0 { head } else { fill }),
+        // UTF-8 spells a non-breaking space `C2 A0`. The marker goes on the
+        // first of the two bytes and the second is blanked, so it takes the
+        // width the bytes take without reading as two of them.
+        0xa0 if index > 0 && data.get(index - 1) == Some(&0xc2) => chars.nbsp.map(|_| ' '),
+        0xa0 => chars.nbsp,
+        0xc2 if data.get(index + 1) == Some(&0xa0) => chars.nbsp,
+        b' ' if index >= trailing => chars.trail.or(chars.space),
+        b' ' => chars.space,
+        _ => None,
+    }
+}
+
 /// The display column of `index` within its row, counting a tab as its full
 /// width the way the text itself is drawn.
 fn row_display_column(editor: &Editor, row_index: usize, index: usize) -> usize {
@@ -1081,6 +1155,7 @@ mod tests {
             jump: None,
             highlight: &EMPTY_HIGHLIGHT,
             cursorline: false,
+            list: None,
             explorer: None,
             recent: None,
             syntax: None,
@@ -1401,6 +1476,48 @@ mod tests {
                 .unwrap()
                 .modifier
                 .contains(Modifier::UNDERLINED)
+        );
+    }
+
+    #[test]
+    fn list_draws_the_invisible_characters_without_moving_anything() {
+        // `a`, tab, `b`, space, `c`, two trailing spaces, then a line that
+        // holds a UTF-8 non-breaking space.
+        let editor = Editor::new("a\tb c  \nx\u{a0}y".as_bytes().to_vec());
+        let chars = crate::listchars::parse(
+            "tab:\u{25b8}-,trail:\u{b7},eol:\u{21b2},nbsp:\u{23b5},space:\u{b7}".as_bytes(),
+        )
+        .unwrap();
+        let backend = TestBackend::new(24, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut render_options = options();
+        render_options.list = Some(&chars);
+
+        terminal
+            .draw(|frame| draw(frame, &editor, render_options, &mut Viewport::default()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        // A tab keeps its four columns: the head, then the fill.
+        assert!(line(buffer, 0).starts_with("   1 a\u{25b8}---b\u{b7}c\u{b7}\u{b7}\u{21b2}"));
+        // The non-breaking space is two bytes, so the marker takes the first
+        // cell and the second is blank rather than a second marker.
+        assert!(line(buffer, 1).starts_with("   2 x\u{23b5} y"));
+        // The final row has no line ending, so it gets no `eol`.
+        assert!(!line(buffer, 1).contains('\u{21b2}'));
+        // Glyphs are drawn subdued, and the text between them is not.
+        // Column 5 is the `a`; 6 through 9 are the tab it precedes.
+        assert_eq!(buffer.cell((6, 0)).unwrap().fg, LISTCHAR_COLOR);
+        assert_eq!(buffer.cell((9, 0)).unwrap().fg, LISTCHAR_COLOR);
+        assert_eq!(buffer.cell((5, 0)).unwrap().fg, Color::Reset);
+
+        // With `list` off the same buffer is drawn as it always was.
+        terminal
+            .draw(|frame| draw(frame, &editor, options(), &mut Viewport::default()))
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer().cell((6, 0)).unwrap().symbol(),
+            " "
         );
     }
 

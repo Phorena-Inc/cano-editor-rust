@@ -104,6 +104,7 @@ Command - For executing commands
 |Normal| *              | Search the word under the cursor and highlight every match |
 |Normal| [space] i      | Leader mapping for `*`                          |
 |Normal| [space] o      | Leader mapping for `:nohl`                      |
+|Normal| [space] l      | Leader mapping for `:set list!`                 |
 |Normal/Visual| Arrow keys | Move like h/j/k/l                            |
 |Insert| Tab            | Insert the configured indentation               |
 
@@ -126,6 +127,96 @@ working. Most terminals still offer a native selection with Shift held; turning
 
 A click is not a key: it cannot answer the save prompt, complete an `:imap`, or
 pick an `s`/`t` jump label.
+
+## Showing invisible characters
+`:set list` draws the characters that otherwise show nothing, and `:set
+listchars=` decides what it draws:
+
+```vim
+:set listchars=tab:▸\ ,trail:·,eol:↲,nbsp:⎵,space:·
+:set list!
+```
+
+| Item | Marks |
+|------|-------|
+| `tab:xy` | A tab: `x` in its first column, `y` filling the rest |
+| `trail:x` | Whitespace at the end of a line |
+| `eol:x` | The line ending |
+| `nbsp:x` | A non-breaking space |
+| `space:x` | Any space that is not trailing |
+
+The default is the line above, so `list` shows something useful without being
+configured first:
+
+```vim
+listchars=tab:▸ ,trail:·,eol:↲,nbsp:⎵,space:·
+```
+
+(Vim leaves this at `eol:$`, which marks only line endings and with a character
+that also occurs in text; `:set listchars=eol:$` restores it.) A `listchars=`
+of your own replaces the whole set, and items you leave out are then not drawn
+at all. `:set listchars?` reports the current set.
+
+A backslash escapes the next character, which is how the space in `tab:▸\ `
+survives being split off as a separate argument. Glyphs are drawn subdued and
+**nothing moves** — a tab keeps its four columns — so the cursor, selections,
+mouse and jump labels behave exactly as they do with `list` off.
+
+`list` is off by default. `[space] l` toggles it, as does `:set list!`, and
+`setup({ list = true })` turns it on at startup.
+
+To change the glyphs from `~/.config/cano/init.lua`, run the command from
+there. A Lua `[[long string]]` keeps backslashes as written, so the line is the
+vim one verbatim:
+
+```lua
+local cano = setup({ list = true })
+
+cano.command([[set listchars=tab:»\ ,trail:~,eol:$]])
+```
+
+`cano.command` runs anything you could type at the `:` prompt — `set`, `imap`,
+`set-map`, `nohl` — so an option needs no configuration slot of its own. A
+leading `:` is accepted. Commands run after the `setup` table is applied, in
+the order given, and a mistake is reported rather than applied.
+
+Note the backslash before the space in `tab:▸\ `: `:set` splits its arguments
+on whitespace, so without it the value ends at `tab:▸` and the rest is read as
+another option. This is the same rule vim has. In an ordinary quoted Lua
+string the backslash must be doubled (`"...tab:▸\\ ,..."`), which is why the
+long-string form is easier.
+
+### `:set`
+The `listchars` line above needs vim's `:set`, so Cano understands it:
+
+| Form | Action |
+|------|--------|
+| `:set name` / `:set noname` | Turn an option on or off |
+| `:set name!` | Toggle it |
+| `:set name=value` | Assign it |
+| `:set name?` | Report its current value |
+
+Several options can be given at once (`:set cursorline rnu sw=2`), and vim's
+own names are accepted alongside Cano's where they differ — `relativenumber`
+and `rnu` for `relative`, `autoindent` for `auto_indent`, `shiftwidth` and
+`tabstop` for `indent`, `lcs` for `listchars`. `:set-var` is unchanged and
+still takes an expression.
+
+## Backups
+Every save first copies what is already on disk into a `.backups` directory
+beside the file, so `src/main.rs` is backed up to `src/.backups/`. The copy is
+of the version being **replaced** — if the buffer you just wrote was wrong, the
+backup has what was there before.
+
+Copies are named `<file>.<YYYYMMDD-HHMMSS>`, in UTC so they sort the way they
+read, with a `.1`, `.2` suffix if you save twice within the same second. The
+newest 10 per file are kept and older ones are dropped. A file that does not
+exist yet has nothing to back up, so first saves create nothing.
+
+It is on by default; `:set-var backup 0`, or `setup({ backup = false })`, turns
+it off. If a backup cannot be written the save still goes ahead and the reason
+is reported — the unsaved edit is the thing at risk, not the copy. Browse the
+copies with the file explorer (`Ctrl + n`, then open `.backups/`).
 
 ## Recent files
 `Ctrl + r` opens a list of the files you have opened before, most recent first.
@@ -453,6 +544,8 @@ indent # set indent
 undo-size # retained compatibility no-op
 cursorline # mark the line the cursor is on (also spelled cursor-line)
 mouse # let Cano handle the mouse
+backup # keep a copy of what each save overwrites
+list # draw the invisible characters named by listchars
 ```
 
 `cursorline` is vim's option of the same name, off by default as it is in vim.

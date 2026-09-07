@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 const SCROLL_LINES: isize = 3;
 
 use crate::buffer::Highlight;
-use crate::command::{Action, CommandState, ExternalEffect, key, lex, parse};
+use crate::command::{Action, CommandState, ConfigVariable, ExternalEffect, key, lex, parse};
 use crate::editor::{Editor, Leader, Mode, MoveDirection};
 use crate::explorer::{Explorer, Selection};
 use crate::history::UndoRecord;
 use crate::io::load_buffer;
 use crate::jump::{Kind, Target, targets};
+use crate::listchars;
 use crate::recent::Recent;
 use crate::render::Viewport;
 use crate::substitute::{self, Substitute};
@@ -328,6 +329,10 @@ impl App {
                 Input::Byte(b'o') => self.highlight = Highlight::default(),
                 Input::Byte(b'n') => self.toggle_pane(Pane::Explorer),
                 Input::Byte(b'r') => self.toggle_pane(Pane::Recent),
+                Input::Byte(b'l') => {
+                    let shown = i64::from(self.commands.list == 0);
+                    self.assign(ConfigVariable::List, shown);
+                }
                 _ => {}
             }
             return Vec::new();
@@ -745,6 +750,16 @@ impl App {
             self.clear_prompt();
             return Vec::new();
         }
+        // `:set` is vim's spelling and takes values a token lexer would tear
+        // apart -- `listchars=tab:>\ ,trail:.` has a space inside one
+        // argument -- so it is read straight off the command line too. The
+        // trailing space keeps `set-var` for the token language.
+        if let Some(options) = self.prompt.strip_prefix(b"set ") {
+            let options = options.to_vec();
+            self.set_options(&options);
+            self.clear_prompt();
+            return Vec::new();
+        }
         if let Some(command) = self.prompt.strip_prefix(b"!") {
             let effect = AppEffect::Shell(command.to_vec());
             self.clear_prompt();
@@ -842,6 +857,98 @@ impl App {
         } else {
             bytes_to_path(&self.commands.output)
         }
+    }
+
+    /// Runs one command line as if it had been typed at the `:` prompt.
+    ///
+    /// Startup configuration goes through here, so anything spelled as a
+    /// command -- `set`, `imap`, `set-map`, `nohl` -- can be written in
+    /// `init.lua` without each one needing a configuration slot of its own.
+    /// A leading `:` is accepted, because that is how the line reads in vim.
+    pub fn run_command(&mut self, line: &[u8]) -> Vec<AppEffect> {
+        self.clear_prompt();
+        self.prompt
+            .extend_from_slice(line.strip_prefix(b":").unwrap_or(line));
+        self.prompt_cursor = self.prompt.len();
+        let effects = self.execute_command();
+        self.clear_prompt();
+        effects
+    }
+
+    /// Applies a `:set` line, which may carry several options at once.
+    fn set_options(&mut self, spec: &[u8]) {
+        for option in split_options(spec) {
+            if let Err(error) = self.set_option(&option) {
+                self.set_message(error);
+                return;
+            }
+        }
+        self.editor.indent = self.commands.indent.max(0) as usize;
+    }
+
+    /// Applies one `[no]name[!][=value]` option, or reports one with `name?`.
+    fn set_option(&mut self, option: &[u8]) -> Result<(), String> {
+        if let Some(name) = option.strip_suffix(b"?") {
+            let shown = if matches!(name, b"listchars" | b"lcs") {
+                format!("listchars={}", self.commands.listchars)
+            } else {
+                let variable = ConfigVariable::parse(name).ok_or_else(|| unknown(option))?;
+                format!(
+                    "{}={}",
+                    String::from_utf8_lossy(name),
+                    self.commands.variable(variable)
+                )
+            };
+            self.set_message(shown);
+            return Ok(());
+        }
+        if let Some(split) = option.iter().position(|byte| *byte == b'=') {
+            let (name, value) = option.split_at(split);
+            let value = &value[1..];
+            if matches!(name, b"listchars" | b"lcs") {
+                self.commands.listchars =
+                    listchars::parse(value).map_err(|error| error.to_string())?;
+                return Ok(());
+            }
+            let variable = named(name)?;
+            let text = std::str::from_utf8(value).map_err(|_| unknown(name))?;
+            let number = text.parse::<i64>().map_err(|_| {
+                format!(
+                    "Invalid value for {}: {text}",
+                    String::from_utf8_lossy(name)
+                )
+            })?;
+            self.assign(variable, number);
+            return Ok(());
+        }
+
+        // `name!` toggles, `noname` clears, and a bare name sets.
+        let (name, toggle) = match option.strip_suffix(b"!") {
+            Some(name) => (name, true),
+            None => (option, false),
+        };
+        let (name, off) = match name.strip_prefix(b"no") {
+            // `nobackup` is the negation, but an option whose own name starts
+            // with `no` would be shadowed; the full name wins.
+            Some(rest) if ConfigVariable::parse(name).is_none() => (rest, true),
+            _ => (name, false),
+        };
+        // Report the option as it was typed: `nosuchoption` is not a request
+        // to unset something called `suchoption`.
+        let variable = ConfigVariable::parse(name).ok_or_else(|| unknown(option))?;
+        let value = if toggle {
+            i64::from(self.commands.variable(variable) == 0)
+        } else {
+            i64::from(!off)
+        };
+        self.assign(variable, value);
+        Ok(())
+    }
+
+    fn assign(&mut self, variable: ConfigVariable, value: i64) {
+        // `apply` is the one place a variable is written, so `:set` and
+        // `:set-var` cannot drift apart.
+        let _ = self.commands.apply(Action::SetVar { variable, value });
     }
 
     /// Runs a substitution, or opens the `c` confirmation for it.
@@ -1493,6 +1600,43 @@ impl App {
             Err(error) => self.set_message(error.to_string()),
         }
     }
+}
+
+fn unknown(name: &[u8]) -> String {
+    format!("Unknown option: {}", String::from_utf8_lossy(name))
+}
+
+fn named(name: &[u8]) -> Result<ConfigVariable, String> {
+    ConfigVariable::parse(name).ok_or_else(|| unknown(name))
+}
+
+/// Splits a `:set` line into its options.
+///
+/// A backslash escapes the character after it, which is how a `listchars`
+/// value gets to hold a space: `tab:>\ ` is one argument, not two.
+fn split_options(spec: &[u8]) -> Vec<Vec<u8>> {
+    let mut options: Vec<Vec<u8>> = vec![Vec::new()];
+    let mut escaped = false;
+    for byte in spec {
+        if escaped {
+            options
+                .last_mut()
+                .expect("one option is always open")
+                .push(*byte);
+            escaped = false;
+        } else if *byte == b'\\' {
+            escaped = true;
+        } else if byte.is_ascii_whitespace() {
+            options.push(Vec::new());
+        } else {
+            options
+                .last_mut()
+                .expect("one option is always open")
+                .push(*byte);
+        }
+    }
+    options.retain(|option| !option.is_empty());
+    options
 }
 
 /// Markdown display starts on for the file types it was written for.
@@ -2725,6 +2869,125 @@ b"
         assert_eq!(
             help.commands.message.as_deref(),
             Some("Buffer is read-only")
+        );
+    }
+
+    #[test]
+    fn set_reads_the_documented_listchars_line() {
+        let mut app = App::new(b"a\tb  \n".to_vec(), PathBuf::from("f"));
+        // The escaped space belongs to the tab fill, so the whole value is
+        // one argument even though it contains a space.
+        assert!(
+            ex(
+                &mut app,
+                "set listchars=tab:\u{25b8}\\ ,trail:\u{b7},eol:\u{21b2},nbsp:\u{23b5},space:\u{b7}"
+                    .as_bytes()
+            )
+            .is_empty()
+        );
+        let chars = app.commands.listchars;
+        assert_eq!(chars.tab, Some(('\u{25b8}', ' ')));
+        assert_eq!(chars.trail, Some('\u{b7}'));
+        assert_eq!(chars.eol, Some('\u{21b2}'));
+        assert_eq!(chars.nbsp, Some('\u{23b5}'));
+        assert_eq!(chars.space, Some('\u{b7}'));
+        // Setting the glyphs does not turn `list` on by itself.
+        assert_eq!(app.commands.list, 0);
+        assert!(app.saved);
+    }
+
+    #[test]
+    fn list_toggles_from_set_and_from_the_leader() {
+        let mut app = App::new(b"text".to_vec(), PathBuf::from("f"));
+        assert_eq!(app.commands.list, 0);
+
+        assert!(ex(&mut app, b"set list").is_empty());
+        assert_eq!(app.commands.list, 1);
+        assert!(ex(&mut app, b"set nolist").is_empty());
+        assert_eq!(app.commands.list, 0);
+        assert!(ex(&mut app, b"set list!").is_empty());
+        assert_eq!(app.commands.list, 1);
+
+        // `<leader>l` is the same toggle.
+        assert!(app.handle(Input::Byte(b' ')).is_empty());
+        assert!(app.handle(Input::Byte(b'l')).is_empty());
+        assert_eq!(app.commands.list, 0);
+        assert!(app.handle(Input::Byte(b' ')).is_empty());
+        assert!(app.handle(Input::Byte(b'l')).is_empty());
+        assert_eq!(app.commands.list, 1);
+        assert!(app.saved);
+    }
+
+    #[test]
+    fn set_reaches_the_other_options_and_says_what_it_cannot() {
+        let mut app = App::new(b"text".to_vec(), PathBuf::from("f"));
+
+        // Several options at once, vim's spellings included.
+        assert!(ex(&mut app, b"set cursorline rnu sw=2").is_empty());
+        assert_eq!(app.commands.cursorline, 1);
+        assert_eq!(app.commands.relative, 1);
+        assert_eq!(app.commands.indent, 2);
+        // An indent change reaches the editor, not just the option table.
+        assert_eq!(app.editor.indent, 2);
+
+        assert!(ex(&mut app, b"set nomouse").is_empty());
+        assert_eq!(app.commands.mouse, 0);
+        assert!(ex(&mut app, b"set mouse!").is_empty());
+        assert_eq!(app.commands.mouse, 1);
+
+        // Querying reports the value rather than changing it.
+        assert!(ex(&mut app, b"set sw?").is_empty());
+        assert_eq!(app.commands.message.as_deref(), Some("sw=2"));
+        assert_eq!(app.commands.indent, 2);
+
+        for (line, message) in [
+            (&b"set nosuchoption"[..], "Unknown option: nosuchoption"),
+            (b"set sw=lots", "Invalid value for sw: lots"),
+            (b"set listchars=bogus:x", "Unknown listchars item: bogus"),
+            (b"set listchars=eos:$", "Unknown listchars item: eos"),
+            (b"set listchars=eol:xy", "listchars eol takes one character"),
+        ] {
+            assert!(ex(&mut app, line).is_empty());
+            assert_eq!(app.commands.message.as_deref(), Some(message));
+        }
+
+        // `set-var` is a different command and still reaches the lexer.
+        assert!(ex(&mut app, b"set-var relative 0").is_empty());
+        assert_eq!(app.commands.relative, 0);
+    }
+
+    #[test]
+    fn run_command_is_the_colon_prompt_without_the_typing() {
+        let mut app = App::new(b"a\tb".to_vec(), PathBuf::from("f"));
+
+        // The escaped space is what keeps the tab fill in one argument, the
+        // same way it does in a vimrc.
+        assert!(
+            app.run_command("set listchars=tab:>\\ ,trail:.,eol:$".as_bytes())
+                .is_empty()
+        );
+        assert_eq!(app.commands.listchars.tab, Some(('>', ' ')));
+        assert_eq!(app.commands.listchars.trail, Some('.'));
+        assert_eq!(app.commands.listchars.eol, Some('$'));
+
+        // A leading colon is accepted, because that is how the line reads in
+        // vim and how it will be copied.
+        assert!(app.run_command(b":set list").is_empty());
+        assert_eq!(app.commands.list, 1);
+
+        // Any command works, not just `set`, and the prompt is left clean.
+        assert!(app.run_command(b"imap ;; <Esc>").is_empty());
+        assert_eq!(app.commands.insert_maps.len(), 1);
+        assert!(app.prompt.is_empty());
+        assert_eq!(app.editor.mode, Mode::Normal);
+
+        // Effects come back to the caller rather than being swallowed.
+        assert_eq!(app.run_command(b"w"), [AppEffect::Save(PathBuf::from("f"))]);
+        // A mistake is reported, not applied.
+        assert!(app.run_command(b"set nosuchoption").is_empty());
+        assert_eq!(
+            app.commands.message.as_deref(),
+            Some("Unknown option: nosuchoption")
         );
     }
 

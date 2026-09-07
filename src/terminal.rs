@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{self, Stdout, stdout};
 use std::time::{Duration, Instant};
 
@@ -103,20 +104,19 @@ pub fn translate_mouse(mouse: MouseEvent) -> Option<Mouse> {
     })
 }
 
-fn read_event() -> io::Result<Input> {
-    loop {
-        match event::read()? {
-            // Windows delivers both Press and Release key events; acting on
-            // releases would process every keystroke twice.
-            Event::Key(key) if key.kind == KeyEventKind::Release => continue,
-            Event::Key(key) => return Ok(translate_key(key)),
-            Event::Mouse(mouse) => match translate_mouse(mouse) {
-                Some(mouse) => return Ok(Input::Mouse(mouse)),
-                None => continue,
-            },
-            Event::Resize(_, _) => return Ok(Input::Resize),
-            _ => return Ok(Input::Unsupported),
+/// The UTF-8 bytes a key outside ASCII contributes to the buffer.
+///
+/// Cano's buffer is bytes, so such a key is delivered as the bytes that spell
+/// it rather than dropped: `translate_key` has only one byte to give and
+/// cannot carry a character that needs several.
+pub fn key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
+    match key.code {
+        KeyCode::Char(character)
+            if !character.is_ascii() && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            Some(character.to_string().into_bytes())
         }
+        _ => None,
     }
 }
 
@@ -124,6 +124,8 @@ pub struct TerminalSession {
     pub terminal: Terminal<CrosstermBackend<Stdout>>,
     last_size: (u16, u16),
     mouse: bool,
+    /// The remaining bytes of a multi-byte key, still to be delivered.
+    pending: VecDeque<u8>,
 }
 
 /// Restores the terminal before the default panic output runs.
@@ -183,6 +185,7 @@ impl TerminalSession {
             terminal,
             last_size: (0, 0),
             mouse: false,
+            pending: VecDeque::new(),
         };
         session.last_size = size()?;
         Ok(session)
@@ -213,12 +216,45 @@ impl TerminalSession {
     }
 
     fn poll_input(&mut self, timeout: Duration) -> io::Result<Option<Input>> {
+        // The rest of a multi-byte key comes out before anything new is read,
+        // so its bytes stay adjacent -- an `:imap` run or an insertion must
+        // not have another key land in the middle of one character.
+        if let Some(byte) = self.pending.pop_front() {
+            return Ok(Some(Input::Byte(byte)));
+        }
         if event::poll(timeout)? {
-            let input = read_event()?;
+            let input = self.next_input()?;
             let _ = self.size_changed()?;
             return Ok(Some(input));
         }
         Ok(self.size_changed()?.then_some(Input::Resize))
+    }
+
+    /// Reads one event, queueing the tail of a key that spells more than one
+    /// byte and returning its first.
+    fn next_input(&mut self) -> io::Result<Input> {
+        loop {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Release => continue,
+                Event::Key(key) => {
+                    let Some(bytes) = key_bytes(key) else {
+                        return Ok(translate_key(key));
+                    };
+                    let mut bytes = bytes.into_iter();
+                    let Some(first) = bytes.next() else {
+                        continue;
+                    };
+                    self.pending.extend(bytes);
+                    return Ok(Input::Byte(first));
+                }
+                Event::Mouse(mouse) => match translate_mouse(mouse) {
+                    Some(mouse) => return Ok(Input::Mouse(mouse)),
+                    None => continue,
+                },
+                Event::Resize(_, _) => return Ok(Input::Resize),
+                _ => return Ok(Input::Unsupported),
+            }
+        }
     }
 
     pub fn read_input(&mut self) -> io::Result<Input> {
@@ -291,9 +327,28 @@ mod tests {
             translate_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
             Input::Backspace
         );
+        // A key outside ASCII has no single byte to translate to; the session
+        // delivers the bytes that spell it instead.
         assert_eq!(
             translate_key(KeyEvent::new(KeyCode::Char('é'), KeyModifiers::NONE)),
             Input::Unsupported
+        );
+        assert_eq!(
+            key_bytes(KeyEvent::new(KeyCode::Char('é'), KeyModifiers::NONE)),
+            Some("é".as_bytes().to_vec())
+        );
+        assert_eq!(
+            key_bytes(KeyEvent::new(KeyCode::Char('\u{25b8}'), KeyModifiers::NONE)),
+            Some("\u{25b8}".as_bytes().to_vec())
+        );
+        // ASCII and chords still go through `translate_key`.
+        assert_eq!(
+            key_bytes(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            key_bytes(KeyEvent::new(KeyCode::Char('é'), KeyModifiers::CONTROL)),
+            None
         );
 
         let special_keys = [

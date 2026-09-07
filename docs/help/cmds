@@ -4,6 +4,9 @@ Commands
   set-map key "keys"      add a key mapping (expands in Normal mode)
   let name expression     append an integer variable
   echo value              display a string or variable
+  set [no]name[!][=v]     set, clear, toggle or assign an option
+  set name?               report an option's current value
+  set listchars=spec      glyphs for invisible characters (see :set list)
   imap keys rhs           map a key sequence typed in Insert mode
   nohl / nohlsearch       stop showing the search highlight
   :w                      save

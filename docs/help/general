@@ -38,6 +38,34 @@ Mouse
   selects an entry -- clicking the selected one opens it, while their
   scrollbar only moves the selection.
 
+Invisible characters
+  :set list draws them. The default set names every kind:
+  tab:> ,trail:.,eol:<,nbsp:_,space:. in ASCII terms, and arrows and middots
+  as shipped; :set listchars? reports it. :set listchars=... replaces the
+  whole set, and items left out are then not drawn. Items are tab, trail,
+  eol, nbsp and space. A backslash escapes the next character, so a space can
+  be a glyph. Nothing moves when list is on -- a tab keeps its width. list is
+  off by default; [space] l toggles it.
+
+Options
+  Anything spelled as a command can also be run from init.lua with
+  cano.command, which is how options without a Boolean slot are configured:
+  cano.command([[set listchars=tab:> ,trail:.,eol:$]]). A leading : is
+  accepted, commands run in order after the setup table, and a Lua long
+  string keeps the backslash that :set needs to hold a space in a value.
+
+  :set name / :set noname turn an option on or off, :set name! toggles,
+  :set name=value assigns and :set name? reports. Several may be given at
+  once, and vim's names are accepted where they differ from Cano's
+  (relativenumber, autoindent, shiftwidth, tabstop, lcs).
+
+Backups
+  Each save first copies the version on disk into a .backups directory beside
+  the file, named <file>.<YYYYMMDD-HHMMSS> in UTC. The newest 10 per file are
+  kept. A file that does not exist yet has nothing to copy. On by default;
+  :set-var backup 0 turns it off. A backup that cannot be written is reported
+  but does not stop the save. Browse them with the explorer.
+
 Recent files
   Ctrl-R lists the files opened before, most recent first. j/k and the arrows
   move, Enter opens, Escape closes. It shares the pane with the explorer. The

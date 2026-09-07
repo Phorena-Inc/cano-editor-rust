@@ -8,6 +8,8 @@
 use std::error::Error;
 use std::fmt;
 
+use crate::listchars::ListChars;
+
 /// A half-open byte span in the original command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
@@ -145,6 +147,8 @@ const CONFIGS: &[&[u8]] = &[
     b"undo_size",
     b"cursorline",
     b"mouse",
+    b"backup",
+    b"list",
 ];
 
 fn is_config(bytes: &[u8]) -> bool {
@@ -245,18 +249,24 @@ pub enum ConfigVariable {
     UndoSize,
     CursorLine,
     Mouse,
+    Backup,
+    List,
 }
 
 impl ConfigVariable {
-    fn parse(bytes: &[u8]) -> Option<Self> {
+    /// Resolves an option name, accepting vim's spelling alongside Cano's
+    /// where the two differ, so a `:set` line copied out of a vimrc works.
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
         match bytes {
-            b"syntax" => Some(Self::Syntax),
-            b"relative" => Some(Self::Relative),
-            b"auto_indent" | b"auto-indent" => Some(Self::AutoIndent),
-            b"indent" => Some(Self::Indent),
+            b"syntax" | b"syn" => Some(Self::Syntax),
+            b"relative" | b"relativenumber" | b"rnu" => Some(Self::Relative),
+            b"auto_indent" | b"auto-indent" | b"autoindent" | b"ai" => Some(Self::AutoIndent),
+            b"indent" | b"shiftwidth" | b"sw" | b"tabstop" | b"ts" => Some(Self::Indent),
             b"undo_size" | b"undo-size" => Some(Self::UndoSize),
-            b"cursorline" | b"cursor-line" => Some(Self::CursorLine),
+            b"cursorline" | b"cursor-line" | b"cul" => Some(Self::CursorLine),
             b"mouse" => Some(Self::Mouse),
+            b"backup" | b"bk" => Some(Self::Backup),
+            b"list" => Some(Self::List),
             _ => None,
         }
     }
@@ -638,6 +648,13 @@ pub struct CommandState {
     /// Terminal mouse reporting.  On by default; turning it off hands the
     /// mouse back to the terminal, whose own selection it otherwise takes.
     pub mouse: i64,
+    /// Keep a copy of what a save is about to overwrite.  On by default,
+    /// because the copy is only ever wanted after it is too late to ask for.
+    pub backup: i64,
+    /// Vim's `list`: draw the invisible characters named by `listchars`.
+    pub list: i64,
+    /// Vim's `listchars`, which decides what `list` draws.
+    pub listchars: ListChars,
     pub output: Vec<u8>,
     pub maps: Vec<KeyMap>,
     /// Insert-mode mappings, in the order they were declared.
@@ -663,12 +680,30 @@ impl CommandState {
             undo_size: 32,
             cursorline: 0,
             mouse: 1,
+            backup: 1,
+            list: 0,
+            listchars: ListChars::default(),
             output,
             maps: Vec::new(),
             insert_maps: Vec::new(),
             variables: Vec::new(),
             message: None,
             quit: false,
+        }
+    }
+
+    /// The current value of one option, which `:set name!` toggles.
+    pub fn variable(&self, variable: ConfigVariable) -> i64 {
+        match variable {
+            ConfigVariable::Syntax => self.syntax,
+            ConfigVariable::Relative => self.relative,
+            ConfigVariable::AutoIndent => self.auto_indent,
+            ConfigVariable::Indent => self.indent,
+            ConfigVariable::UndoSize => self.undo_size,
+            ConfigVariable::CursorLine => self.cursorline,
+            ConfigVariable::Mouse => self.mouse,
+            ConfigVariable::Backup => self.backup,
+            ConfigVariable::List => self.list,
         }
     }
 
@@ -709,6 +744,8 @@ impl CommandState {
                 ConfigVariable::UndoSize => self.undo_size = value,
                 ConfigVariable::CursorLine => self.cursorline = value,
                 ConfigVariable::Mouse => self.mouse = value,
+                ConfigVariable::Backup => self.backup = value,
+                ConfigVariable::List => self.list = value,
             },
             Action::SetOutput(output) => self.output = output,
             Action::SetMap { key, mut expansion } => {

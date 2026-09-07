@@ -24,6 +24,7 @@ Normal
   *             search the word under the cursor, highlight every match
   space i       leader mapping for *
   space o       leader mapping for :nohl
+  space l       leader mapping for :set list!
 
 Mouse
   click         move the cursor (gutter goes to the line start)

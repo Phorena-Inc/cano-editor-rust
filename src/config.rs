@@ -36,6 +36,12 @@ pub struct LuaConfig {
     pub undo_size: Option<i64>,
     pub cursorline: Option<i64>,
     pub mouse: Option<i64>,
+    pub backup: Option<i64>,
+    pub list: Option<i64>,
+    /// Command lines the configuration asked to run at startup, in the order
+    /// it asked. Anything spelled as a `:` command can be configured this way
+    /// without needing a slot of its own.
+    pub commands: Vec<Vec<u8>>,
     pub exit: Option<ExitRequest>,
 }
 
@@ -126,6 +132,12 @@ fn evaluate_named(source: &[u8], name: &str) -> Result<LuaConfig, ConfigError> {
             if let Some(value) = boolean_slot(&table, "mouse")? {
                 config.mouse = Some(value);
             }
+            if let Some(value) = boolean_slot(&table, "backup")? {
+                config.backup = Some(value);
+            }
+            if let Some(value) = boolean_slot(&table, "list")? {
+                config.list = Some(value);
+            }
             Ok::<_, mlua::Error>(())
         })??;
 
@@ -153,6 +165,15 @@ fn evaluate_named(source: &[u8], name: &str) -> Result<LuaConfig, ConfigError> {
             },
         )?;
         api.set("exit", exit)?;
+
+        let command_state = Arc::clone(&setup_state);
+        let command = lua.create_function(move |_, line: mlua::LuaString| -> mlua::Result<()> {
+            // Commands are byte strings like everything else Cano parses, so
+            // a `listchars` glyph or a non-UTF-8 path survives the trip.
+            let line = line.as_bytes().to_vec();
+            with_config(&command_state, |config| config.commands.push(line))
+        })?;
+        api.set("command", command)?;
         Ok(api)
     })?;
     lua.globals().set("setup", setup)?;
@@ -218,7 +239,8 @@ mod tests {
                     indent = 4,
                     undo_size = "32",
                     cursorline = true,
-                    mouse = false
+                    mouse = false,
+                    backup = false
                 })
             "#,
         )
@@ -230,6 +252,35 @@ mod tests {
         assert_eq!(config.undo_size, None);
         assert_eq!(config.cursorline, Some(1));
         assert_eq!(config.mouse, Some(0));
+        assert_eq!(config.backup, Some(0));
+    }
+
+    #[test]
+    fn commands_are_collected_in_the_order_they_were_asked_for() {
+        let config = evaluate(
+            br#"
+                local cano = setup({ list = true })
+                cano.command("set listchars=eol:$")
+                cano.command([[set listchars=tab:>\ ,trail:.]])
+                cano.command("imap ;; <Esc>")
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.list, Some(1));
+        assert_eq!(
+            config.commands,
+            [
+                b"set listchars=eol:$".to_vec(),
+                br"set listchars=tab:>\ ,trail:.".to_vec(),
+                b"imap ;; <Esc>".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_configuration_that_asks_for_nothing_runs_no_commands() {
+        assert!(evaluate(b"setup({})").unwrap().commands.is_empty());
     }
 
     #[test]
