@@ -122,6 +122,7 @@ name = "cano-fresh"
 version = "0.26.9071"
 dependencies = [
  "crossterm",
+ "libc",
  "mlua",
  "ratatui",
 ]

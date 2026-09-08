@@ -16,6 +16,7 @@ Normal
   r             replace with the next typed key (Escape cancels)
   Ctrl-N        toggle file explorer (Escape closes it)
   Ctrl-R        toggle the recent-file list (Escape closes it)
+  Ctrl-Z        suspend to the shell; fg returns
   space n       leader mapping for Ctrl-N
   space r       leader mapping for Ctrl-R
   Ctrl-M        toggle markdown display (Enter is the same key)

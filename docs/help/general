@@ -21,6 +21,7 @@ Global keys
   Ctrl-R   toggle the recent-file list in Normal mode (Escape closes it)
   Ctrl-M   toggle markdown display in Normal mode (so does Enter)
   Ctrl-C   acts as Escape in every mode
+  Ctrl-Z   suspend to the shell in Normal mode; fg returns (not on Windows)
 
 Markdown display
   Formats the buffer in place: headings, emphasis, code, links, lists,

@@ -20,6 +20,8 @@ use crate::terminal::{Input, Mouse, MouseKind};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AppEffect {
     Save(PathBuf),
+    /// Stop the editor and hand the terminal back to the shell, until `fg`.
+    Suspend,
     Shell(Vec<u8>),
     Quit,
 }
@@ -443,6 +445,9 @@ impl App {
                 return vec![AppEffect::Save(self.output_path()), AppEffect::Quit];
             }
             Input::Control(15) => self.editor.open_line_normal(),
+            // Raw mode means Ctrl-Z arrives as a key rather than stopping the
+            // process, so the stop has to be asked for explicitly.
+            Input::Control(26) => return vec![AppEffect::Suspend],
             Input::Control(3) | Input::Escape => {
                 self.count.clear();
                 self.prompt.clear();
@@ -1978,6 +1983,26 @@ mod tests {
         assert!(app.handle(Input::Escape).is_empty());
         assert!(app.explorer.is_none());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn control_z_asks_to_be_suspended_without_touching_the_buffer() {
+        let mut app = App::new(b"text".to_vec(), PathBuf::from("f"));
+        assert_eq!(app.handle(Input::Control(26)), [AppEffect::Suspend]);
+        assert_eq!(app.editor.buffer.data, b"text");
+        assert!(app.saved);
+        assert_eq!(app.editor.mode, Mode::Normal);
+
+        // Unsaved work is no reason to refuse: suspending is not leaving, and
+        // the buffer is still here on the way back.
+        make_dirty(&mut app);
+        assert_eq!(app.handle(Input::Control(26)), [AppEffect::Suspend]);
+        assert!(!app.saved);
+
+        // Insert mode types rather than suspends, as it does in vim.
+        assert!(app.handle(Input::Byte(b'i')).is_empty());
+        assert!(app.handle(Input::Control(26)).is_empty());
+        assert_eq!(app.editor.mode, Mode::Insert);
     }
 
     #[test]

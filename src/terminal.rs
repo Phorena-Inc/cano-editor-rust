@@ -13,6 +13,7 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 
 use crate::editor::Mode;
 
@@ -134,19 +135,37 @@ pub struct TerminalSession {
 /// runs on that path; without this hook a panic leaves the user's shell in
 /// raw mode on the alternate screen, and the panic message is either
 /// invisible or erased along with that screen.
+/// Takes the terminal: raw mode, the alternate screen and a block cursor.
+fn enter_terminal() -> io::Result<()> {
+    enable_raw_mode()?;
+    if let Err(error) = execute!(stdout(), EnterAlternateScreen, SetCursorStyle::SteadyBlock) {
+        release_terminal();
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Gives the terminal back, exactly as it was taken.
+///
+/// Every path out goes through here -- the panic hook, `Drop`, a failed
+/// start, and Ctrl-Z -- so none of them can drift apart from the others.
+fn release_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        stdout(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        SetCursorStyle::DefaultUserShape,
+        Show
+    );
+}
+
 fn install_panic_hook() {
     static HOOK: std::sync::Once = std::sync::Once::new();
     HOOK.call_once(|| {
         let default = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            let _ = disable_raw_mode();
-            let _ = execute!(
-                stdout(),
-                DisableMouseCapture,
-                LeaveAlternateScreen,
-                SetCursorStyle::DefaultUserShape,
-                Show
-            );
+            release_terminal();
             default(info);
         }));
     });
@@ -155,29 +174,12 @@ fn install_panic_hook() {
 impl TerminalSession {
     pub fn start() -> io::Result<Self> {
         install_panic_hook();
-        enable_raw_mode()?;
-        let mut output = stdout();
-        if let Err(error) = execute!(output, EnterAlternateScreen, SetCursorStyle::SteadyBlock) {
-            let _ = disable_raw_mode();
-            let _ = execute!(
-                stdout(),
-                LeaveAlternateScreen,
-                SetCursorStyle::DefaultUserShape,
-                Show
-            );
-            return Err(error);
-        }
+        enter_terminal()?;
 
-        let terminal = match Terminal::new(CrosstermBackend::new(output)) {
+        let terminal = match Terminal::new(CrosstermBackend::new(stdout())) {
             Ok(terminal) => terminal,
             Err(error) => {
-                let _ = disable_raw_mode();
-                let _ = execute!(
-                    stdout(),
-                    LeaveAlternateScreen,
-                    SetCursorStyle::DefaultUserShape,
-                    Show
-                );
+                release_terminal();
                 return Err(error);
             }
         };
@@ -189,6 +191,37 @@ impl TerminalSession {
         };
         session.last_size = size()?;
         Ok(session)
+    }
+
+    /// Stops the editor and hands the terminal back to the shell, the way
+    /// Ctrl-Z does everywhere else.
+    ///
+    /// Raw mode turns off the terminal's own signal generation, so Ctrl-Z
+    /// arrives as an ordinary key and the stop has to be asked for. The
+    /// terminal is given back first, so the shell that takes over finds it as
+    /// it left it, and taken again when `fg` resumes this call.
+    pub fn suspend(&mut self) -> io::Result<()> {
+        release_terminal();
+        // Mouse reporting went with the terminal; the main loop reinstates it
+        // from the `mouse` option on its next pass.
+        self.mouse = false;
+
+        stop_process();
+
+        enter_terminal()?;
+        // The screen belonged to the shell in the meantime, and may have been
+        // resized while this process was stopped, so nothing drawn before can
+        // be assumed to still be there.
+        //
+        // `Terminal::clear` would be the obvious way to say so, but it first
+        // asks the terminal where the cursor is and waits for the reply.  A
+        // terminal that is slow to answer, or does not, would take the editor
+        // down on the way back from a suspend.  Declaring an impossible area
+        // instead makes the next draw notice the size does not match, resize
+        // for real, and repaint everything -- with nothing to wait for.
+        self.terminal.resize(Rect::ZERO)?;
+        self.last_size = size()?;
+        Ok(())
     }
 
     /// Turns terminal mouse reporting on or off to match the `mouse` option.
@@ -294,18 +327,26 @@ impl TerminalSession {
     }
 }
 
+/// Stops this process, and returns when something resumes it.
+///
+/// `SIGTSTP` is what a terminal raises for Ctrl-Z, and its default action is
+/// to stop the process; the shell reports it as stopped and `fg` continues it
+/// from here. The standard library has no way to raise a signal.
+#[cfg(unix)]
+fn stop_process() {
+    // Safety: `raise` takes a signal number and touches nothing else.
+    unsafe {
+        libc::raise(libc::SIGTSTP);
+    }
+}
+
+/// Windows has no job control to suspend into, so Ctrl-Z simply redraws.
+#[cfg(not(unix))]
+fn stop_process() {}
+
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        if self.mouse {
-            let _ = execute!(self.terminal.backend_mut(), DisableMouseCapture);
-        }
-        let _ = execute!(
-            self.terminal.backend_mut(),
-            LeaveAlternateScreen,
-            SetCursorStyle::DefaultUserShape,
-            Show
-        );
+        release_terminal();
     }
 }
 

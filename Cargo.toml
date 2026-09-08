@@ -20,6 +20,12 @@ crossterm = "0.29.0"
 mlua = { version = "0.12.0", features = ["lua54", "vendored"] }
 ratatui = "0.30.2"
 
+# Already in the tree through crossterm, so naming it directly adds no crate
+# to the build.  It is only needed to stop this process for Ctrl-Z, which the
+# standard library has no way to ask for.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 opt-level = "z"     # Optimize for size; "z" also turns off loop vectorization
 strip = true        # Automatically strip symbols and debuginfo from the binary

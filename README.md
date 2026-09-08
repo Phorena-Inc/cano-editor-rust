@@ -57,6 +57,7 @@ Command - For executing commands
 |Mode  | Keybind        | Action                                          |
 |------|----------------|-------------------------------------------------|
 |Global| Ctrl + Q       | Quit from any mode (refuses if there are unsaved changes) |
+|Normal| Ctrl + Z       | Suspend to the shell; `fg` returns                |
 |Global| Esc / Ctrl + C | Enter Normal Mode                               |
 |Normal| h              | Move cursor left                                |
 |Normal| j              | Move cursor down                                |
@@ -232,6 +233,19 @@ own names are accepted alongside Cano's where they differ — `relativenumber`
 and `rnu` for `relative`, `autoindent` for `auto_indent`, `shiftwidth` and
 `tabstop` for `indent`, `lcs` for `listchars`. `:set-var` is unchanged and
 still takes an expression.
+
+## Suspending
+`Ctrl + Z` stops the editor and hands the terminal back to the shell, exactly
+as it does elsewhere; `fg` returns to the buffer where you left it. Unsaved
+changes are no obstacle — suspending is not leaving.
+
+Raw mode switches off the terminal's own signal generation, so `Ctrl + Z`
+arrives as an ordinary keystroke rather than stopping the process. Cano gives
+the terminal back, raises `SIGTSTP` on itself, and takes the terminal again
+when the shell resumes it. As in vim it is a Normal-mode key; in Insert mode it
+types.
+
+Not available on Windows, which has no job control to suspend into.
 
 ## Backups
 Every save first copies what is already on disk into a `.backups` directory

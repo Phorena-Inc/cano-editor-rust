@@ -217,6 +217,11 @@ fn run() -> Result<u8, String> {
         };
 
         let effects = app.handle(input);
+        // Suspending needs the terminal, which the effect applier does not
+        // have, and it has to happen before anything is drawn again.
+        if effects.contains(&AppEffect::Suspend) {
+            terminal.suspend().map_err(|error| error.to_string())?;
+        }
         let quit = apply_effects(&mut app, effects)?;
         // A pane held back by the save prompt opens only now that the write
         // has actually been applied.
@@ -337,6 +342,8 @@ fn apply_effects(app: &mut App, effects: Vec<AppEffect>) -> Result<bool, String>
             },
             AppEffect::Quit if !save_failed => quit = true,
             AppEffect::Quit => {}
+            // Handled by the caller, which is where the terminal lives.
+            AppEffect::Suspend => {}
         }
     }
     Ok(quit)
