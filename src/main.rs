@@ -32,6 +32,15 @@ fn run() -> Result<u8, String> {
         CliError::UnexpectedFlag => "Unexpected flag".to_owned(),
     })?;
 
+    // Answered before the configuration is touched, so `--version` still
+    // reports something with a broken init.lua or no home directory to put
+    // one in.  It also wins over `--help`: a script that passes both wants a
+    // line of text back, not an editor session waiting on a keystroke.
+    if cli.version {
+        println!("cano {}", env!("CARGO_PKG_VERSION"));
+        return Ok(0);
+    }
+
     let showing_help = cli.help_page.is_some();
     let filename = if showing_help {
         // The runtime environment wins so an installed binary can be pointed

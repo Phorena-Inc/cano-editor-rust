@@ -11,6 +11,7 @@ pub struct Cli {
     pub filename: Option<String>,
     pub config: Option<String>,
     pub help_page: Option<String>,
+    pub version: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,7 +35,9 @@ impl Error for CliError {}
 ///
 /// Two prefix matches are intentional compatibility behavior: every argument
 /// beginning with `--help` requests the general page, and every argument
-/// beginning with `--config` is parsed as the configuration option. Options
+/// beginning with `--config` is parsed as the configuration option. The short
+/// spellings `-h` and `-v` and the long `--version` match exactly instead --
+/// the prefix quirk is compatibility baggage, not a rule to extend. Options
 /// may occur on either side of positional arguments; only the first positional
 /// argument becomes the filename.
 pub fn parse(args: &[String]) -> Result<Cli, CliError> {
@@ -44,8 +47,11 @@ pub fn parse(args: &[String]) -> Result<Cli, CliError> {
 
     while index < args.len() {
         let argument = &args[index];
-        if argument.starts_with("--help") {
+        if argument.starts_with("--help") || argument == "-h" {
             cli.help_page = Some("general".to_owned());
+            index += 1;
+        } else if argument == "--version" || argument == "-v" {
+            cli.version = true;
             index += 1;
         } else if argument.starts_with("--config") {
             if let Some((_, value)) = argument.split_once('=') {
@@ -171,13 +177,63 @@ mod tests {
 
     #[test]
     fn unknown_dash_arguments_are_rejected() {
-        for spelling in ["--version", "-h", "-"] {
+        for spelling in ["-x", "--nope", "-hv", "-"] {
             assert_eq!(
                 parse(&argv(&["cano", spelling])),
                 Err(CliError::UnexpectedFlag),
                 "{spelling}"
             );
         }
+    }
+
+    #[test]
+    fn short_help_is_the_long_spelling() {
+        let short = parse(&argv(&["cano", "-h"])).unwrap();
+        let long = parse(&argv(&["cano", "--help"])).unwrap();
+        assert_eq!(short, long);
+        assert_eq!(short.help_page.as_deref(), Some("general"));
+    }
+
+    #[test]
+    fn both_version_spellings_set_the_flag() {
+        for spelling in ["-v", "--version"] {
+            let parsed = parse(&argv(&["cano", spelling])).unwrap();
+            assert!(parsed.version, "{spelling}");
+            assert_eq!(parsed.filename, None, "{spelling}");
+            assert_eq!(parsed.help_page, None, "{spelling}");
+        }
+    }
+
+    #[test]
+    fn version_takes_no_value_and_sits_beside_other_arguments() {
+        let parsed = parse(&argv(&["cano", "--version", "notes.txt"])).unwrap();
+        assert!(parsed.version);
+        assert_eq!(parsed.filename.as_deref(), Some("notes.txt"));
+
+        let trailing = parse(&argv(&["cano", "notes.txt", "-v"])).unwrap();
+        assert_eq!(parsed, trailing);
+    }
+
+    #[test]
+    fn the_new_short_and_long_flags_match_exactly() {
+        // `--help` and `--config` prefix-match for legacy compatibility.  The
+        // flags added since do not, so a longer spelling is still an error
+        // rather than a silent alias.
+        for spelling in ["--versions", "--version=1", "-vv"] {
+            assert_eq!(
+                parse(&argv(&["cano", spelling])),
+                Err(CliError::UnexpectedFlag),
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn version_wins_when_help_is_also_requested() {
+        // Both are recorded; startup resolves the precedence.
+        let parsed = parse(&argv(&["cano", "--help", "--version"])).unwrap();
+        assert!(parsed.version);
+        assert_eq!(parsed.help_page.as_deref(), Some("general"));
     }
 
     #[test]

@@ -36,6 +36,9 @@ location, pass it explicitly:
 ./target/release/cano --config path/to/init.lua path/to/file
 ```
 
+`-h`/`--help` opens the bundled help pages in the editor, and `-v`/`--version`
+prints the version and exits.
+
 `make` remains available as a compatibility wrapper and copies the release binary to `build/cano`.
 
 Run the full validation suite with:

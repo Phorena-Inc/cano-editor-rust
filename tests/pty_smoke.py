@@ -76,14 +76,15 @@ def wait_file(path, expected, timeout=3.0):
 
 
 class PtySession:
-    def __init__(self, binary, home, work, target):
+    def __init__(self, binary, home, work, *arguments, env=None):
         self.pid, self.master = os.forkpty()
         self.status = None
         if self.pid == 0:
             os.environ.clear()
             os.environ.update({"HOME": home, "TERM": "xterm-256color", "PATH": "/usr/bin:/bin"})
+            os.environ.update(env or {})
             os.chdir(work)
-            os.execv(binary, [binary, target])
+            os.execv(binary, [binary, *arguments])
         resize(self.master, 24, 80)
 
     def send(self, keys):
@@ -181,6 +182,23 @@ def main():
             session.wait_exit()
             wait_file(target, b"fresh again " + ORIGINAL)
 
+        # `-h` is an alias for `--help`: both open the bundled general page.
+        # The pages are only on disk when the smoke test runs from a checkout,
+        # so an installed binary skips this.
+        help_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "help"
+        )
+        if os.path.isdir(help_dir):
+            for spelling in ("-h", "--help"):
+                with PtySession(
+                    binary, home, work, spelling, env={"CANO_HELP_DIR": help_dir}
+                ) as session:
+                    # The usage block names every flag, so this also catches
+                    # docs/help/general drifting from the parser.
+                    read_until(session.master, (b"general", b"Usage", b"--version"))
+                    command(session, b"q")
+                    session.wait_exit()
+
         discard = os.path.join(work, "discard.txt")
         write_target(discard)
         with PtySession(binary, home, work, discard) as session:
@@ -191,7 +209,7 @@ def main():
             session.wait_exit()
             wait_file(discard, ORIGINAL)
 
-    print("PASS: resize, :q refusal, :w, :wq, :q!")
+    print("PASS: resize, :q refusal, :w, :wq, :q!, -h/--help help page")
 
 
 if __name__ == "__main__":

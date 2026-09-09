@@ -2,7 +2,8 @@ Cano — byte-oriented modal terminal editor
 
 Usage
   cano [--config init.lua] [file]
-  cano --help
+  cano -h, --help
+  cano -v, --version
 
   A file that does not exist yet opens as an empty buffer and is created on
   the first save.
