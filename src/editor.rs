@@ -1,4 +1,4 @@
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, Row};
 use crate::history::{History, HistoryError, UndoKind, UndoRecord};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -692,13 +692,19 @@ impl Editor {
         let last = self.buffer.row_for_index(end).unwrap_or(first);
         for row in first..=last {
             for _ in 0..self.indent.max(1) {
-                let at = self.buffer.rows[row].start;
+                // Only spaces and tabs are indentation.  `is_ascii_whitespace`
+                // also covers CR and LF, and on a blank row the first byte is
+                // the row's own terminator: eating it would join the row to
+                // the next one and drop a row out from under this loop.
+                let Some(&Row { start: at, .. }) = self.buffer.rows.get(row) else {
+                    return;
+                };
                 let Some(byte) = self
                     .buffer
                     .data
                     .get(at)
                     .copied()
-                    .filter(u8::is_ascii_whitespace)
+                    .filter(|byte| matches!(byte, b' ' | b'\t'))
                 else {
                     continue;
                 };
@@ -933,6 +939,45 @@ mod tests {
         assert!(editor.undo().unwrap());
         assert!(editor.undo().unwrap());
         assert_eq!(editor.buffer.data, b"a\nb");
+        assert!(editor.buffer.invariants_hold());
+    }
+
+    #[test]
+    fn unindent_leaves_blank_rows_and_their_terminators_alone() {
+        // A blank row's first byte is its own newline, so an unindent that
+        // treats every ASCII whitespace byte as indentation joins the row to
+        // the next one -- and shrinks `rows` while the loop is still indexing
+        // it.
+        let mut single = Editor::new(b"a\n\nb".to_vec());
+        single.buffer.cursor = 2;
+        single.normal_key(b'V');
+        single.visual_key(b'<');
+        assert_eq!(single.buffer.data, b"a\n\nb");
+        assert!(single.buffer.invariants_hold());
+
+        let mut multiple = Editor::new(b"\ta\n\n\tb\n".to_vec());
+        multiple.normal_key(b'V');
+        multiple.visual_key(b'j');
+        multiple.visual_key(b'j');
+        multiple.visual_key(b'j');
+        multiple.visual_key(b'<');
+        assert_eq!(multiple.buffer.data, b"a\n\nb\n");
+        assert!(multiple.buffer.invariants_hold());
+    }
+
+    #[test]
+    fn unindent_keeps_crlf_line_endings_intact() {
+        // With a multi-space indent the inner loop gets several passes at the
+        // same row, so a CRLF blank row can lose the CR on one pass and the LF
+        // on the next.
+        let mut editor = Editor::new(b"    a\r\n\r\n    b\r\n".to_vec());
+        editor.indent = 4;
+        editor.normal_key(b'V');
+        editor.visual_key(b'j');
+        editor.visual_key(b'j');
+        editor.visual_key(b'j');
+        editor.visual_key(b'<');
+        assert_eq!(editor.buffer.data, b"a\r\n\r\nb\r\n");
         assert!(editor.buffer.invariants_hold());
     }
 
