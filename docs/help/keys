@@ -48,3 +48,4 @@ Visual
   d/x y         delete or yank
   > <           indent or unindent selected rows
   =             autoformat the selected lines
+  <c-e> space e toggle line comments over the selected lines

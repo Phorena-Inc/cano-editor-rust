@@ -6,6 +6,7 @@ const SCROLL_LINES: isize = 3;
 use crate::autoformat::{self, Steps};
 use crate::buffer::Highlight;
 use crate::command::{Action, CommandState, ConfigVariable, ExternalEffect, key, lex, parse};
+use crate::comment;
 use crate::editor::{Editor, Leader, Mode, MoveDirection};
 use crate::explorer::{Explorer, Selection};
 use crate::history::UndoRecord;
@@ -15,6 +16,7 @@ use crate::listchars;
 use crate::recent::Recent;
 use crate::render::Viewport;
 use crate::substitute::{self, Substitute};
+use crate::syntax::Language;
 use crate::terminal::{Input, Mouse, MouseKind};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -656,9 +658,27 @@ impl App {
     }
 
     fn visual_input(&mut self, input: Input) -> Vec<AppEffect> {
+        // The space leader is armed in Visual mode too, and takes exactly the
+        // next key there the way it does in Normal mode.
+        if self.leader_pending {
+            self.leader_pending = false;
+            if input == Input::Byte(b'e') {
+                self.toggle_comment_selection();
+            }
+            return Vec::new();
+        }
+
         match input {
             Input::Escape | Input::Control(3) => {
                 self.editor.visual_key(27);
+            }
+            // Comment toggle, on both the leader spelling and a bare chord so
+            // it is reachable without arming the leader first.
+            Input::Control(5) => {
+                self.toggle_comment_selection();
+            }
+            Input::Byte(b' ') => {
+                self.leader_pending = true;
             }
             // EasyMotion's `s` is a motion, so in Visual mode it extends the
             // selection to the label instead of moving a bare cursor.
@@ -982,6 +1002,66 @@ impl App {
     pub fn autoformat(&mut self) {
         let region = (0, self.editor.buffer.data.len());
         self.autoformat_region(region);
+    }
+
+    /// Toggles comments over the selection and leaves Visual mode, the way
+    /// `>`, `<` and `=` do -- the selection is consumed by the operator.
+    fn toggle_comment_selection(&mut self) {
+        let Some(region) = self.editor.visual_rows() else {
+            return;
+        };
+        self.editor.visual_key(27);
+        self.toggle_comment_region(region);
+    }
+
+    /// Comments the lines `region` touches, or uncomments them when every
+    /// one of them is already commented.
+    ///
+    /// The marker comes from the file name, so a buffer of a language Cano
+    /// does not know says so rather than guessing one.
+    fn toggle_comment_region(&mut self, region: (usize, usize)) {
+        if self.readonly {
+            self.set_message("Buffer is read-only");
+            return;
+        }
+        let Some(language) = Language::for_path(&self.filename) else {
+            self.set_message("No comment syntax for this file type");
+            return;
+        };
+        let before = &self.editor.buffer.data;
+        let Some((after, direction)) = comment::toggle(before, region, comment::token(language))
+        else {
+            self.set_message("Nothing to comment");
+            return;
+        };
+        let lines = autoformat::changed_lines(before, &after);
+
+        // One record for the whole toggle: composing it from a record per
+        // line would make undoing a commented block a keystroke per line.
+        let (start, old_end, new_end) = changed_span(before, &after);
+        let original = before[start..old_end].to_vec();
+        // The cursor is put back on the line it was on, since the byte it was
+        // on has moved by the width of the marker.
+        let row = self.editor.buffer.cursor_row().unwrap_or(0);
+        if self
+            .editor
+            .buffer
+            .replace_region(start, old_end, &after[start..new_end])
+            .is_some()
+        {
+            self.editor
+                .history
+                .push_undo(UndoRecord::replace_region(start, new_end, original));
+        }
+        let line = self
+            .editor
+            .buffer
+            .rows
+            .get(row)
+            .or_else(|| self.editor.buffer.rows.last());
+        self.editor.buffer.cursor = line.map_or(0, |row| row.start);
+        let many = if lines == 1 { "" } else { "s" };
+        self.set_message(format!("{} {lines} line{many}", direction.verb()));
     }
 
     /// Formats only the lines `region` touches.
@@ -3231,6 +3311,118 @@ b"
         assert!(ex(&mut tabbed, b"set sw=4 noautoformat_autoindent").is_empty());
         assert!(ex(&mut tabbed, b"autoformat").is_empty());
         assert_eq!(tabbed.editor.buffer.data, b"    one\n");
+    }
+
+    #[test]
+    fn both_comment_spellings_toggle_a_visual_selection() {
+        // Ctrl-E and the `<space>e` leader are the same operator, so each has
+        // to leave the buffer where the other found it.
+        for spelling in [
+            vec![Input::Control(5)],
+            vec![Input::Byte(b' '), Input::Byte(b'e')],
+        ] {
+            let mut app = App::new(b"one\ntwo\nthree\n".to_vec(), PathBuf::from("f.rs"));
+            assert!(app.handle(Input::Byte(b'V')).is_empty());
+            assert!(app.handle(Input::Byte(b'j')).is_empty());
+            for input in &spelling {
+                assert!(app.handle(*input).is_empty());
+            }
+            assert_eq!(app.editor.buffer.data, b"// one\n// two\nthree\n");
+            // The operator consumes the selection, the way `>` and `=` do.
+            assert_eq!(app.editor.mode, Mode::Normal);
+            assert_eq!(app.commands.message.as_deref(), Some("Commented 2 lines"));
+
+            // The cursor stays on the line it was on, the way it does after
+            // `>` and `=`, so re-selecting the same block starts with a `k`.
+            assert_eq!(app.editor.buffer.cursor_row(), Some(1));
+            assert!(app.handle(Input::Byte(b'k')).is_empty());
+
+            // And back out again.
+            assert!(app.handle(Input::Byte(b'V')).is_empty());
+            assert!(app.handle(Input::Byte(b'j')).is_empty());
+            for input in &spelling {
+                assert!(app.handle(*input).is_empty());
+            }
+            assert_eq!(app.editor.buffer.data, b"one\ntwo\nthree\n");
+            assert_eq!(app.commands.message.as_deref(), Some("Uncommented 2 lines"));
+            assert!(app.editor.buffer.invariants_hold());
+        }
+    }
+
+    #[test]
+    fn a_comment_toggle_undoes_in_one_step() {
+        let mut app = App::new(b"a\nb\nc\n".to_vec(), PathBuf::from("f.py"));
+        assert!(app.handle(Input::Byte(b'V')).is_empty());
+        assert!(app.handle(Input::Byte(b'j')).is_empty());
+        assert!(app.handle(Input::Byte(b'j')).is_empty());
+        assert!(app.handle(Input::Control(5)).is_empty());
+        assert_eq!(app.editor.buffer.data, b"# a\n# b\n# c\n");
+
+        // Three lines changed, but the toggle was one command.
+        assert!(app.editor.undo().unwrap());
+        assert_eq!(app.editor.buffer.data, b"a\nb\nc\n");
+        assert!(app.editor.buffer.invariants_hold());
+    }
+
+    #[test]
+    fn the_comment_marker_follows_the_file_type() {
+        for (name, commented) in [
+            ("f.rs", &b"// x\n"[..]),
+            ("f.py", &b"# x\n"[..]),
+            ("f.lua", &b"-- x\n"[..]),
+            (".vimrc", &b"\" x\n"[..]),
+            ("f.sh", &b"# x\n"[..]),
+        ] {
+            let mut app = App::new(b"x\n".to_vec(), PathBuf::from(name));
+            assert!(app.handle(Input::Byte(b'V')).is_empty());
+            assert!(app.handle(Input::Control(5)).is_empty());
+            assert_eq!(app.editor.buffer.data, commented, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_comment_toggle_declines_what_it_cannot_do() {
+        // An unknown file type has no marker to use.
+        let mut plain = App::new(b"x\n".to_vec(), PathBuf::from("notes.txt"));
+        assert!(plain.handle(Input::Byte(b'V')).is_empty());
+        assert!(plain.handle(Input::Control(5)).is_empty());
+        assert_eq!(plain.editor.buffer.data, b"x\n");
+        assert_eq!(
+            plain.commands.message.as_deref(),
+            Some("No comment syntax for this file type")
+        );
+
+        // A help page is read-only.
+        let mut help = App::new(b"x\n".to_vec(), PathBuf::from("f.rs"));
+        help.readonly = true;
+        assert!(help.handle(Input::Byte(b'V')).is_empty());
+        assert!(help.handle(Input::Control(5)).is_empty());
+        assert_eq!(help.editor.buffer.data, b"x\n");
+        assert_eq!(
+            help.commands.message.as_deref(),
+            Some("Buffer is read-only")
+        );
+
+        // A selection with nothing on it has nothing to comment.
+        let mut blank = App::new(b"\n\n".to_vec(), PathBuf::from("f.rs"));
+        assert!(blank.handle(Input::Byte(b'V')).is_empty());
+        assert!(blank.handle(Input::Control(5)).is_empty());
+        assert_eq!(blank.editor.buffer.data, b"\n\n");
+        assert_eq!(
+            blank.commands.message.as_deref(),
+            Some("Nothing to comment")
+        );
+    }
+
+    #[test]
+    fn an_unbound_leader_key_cancels_without_editing() {
+        let mut app = App::new(b"one\n".to_vec(), PathBuf::from("f.rs"));
+        assert!(app.handle(Input::Byte(b'V')).is_empty());
+        assert!(app.handle(Input::Byte(b' ')).is_empty());
+        assert!(app.handle(Input::Byte(b'z')).is_empty());
+        assert_eq!(app.editor.buffer.data, b"one\n");
+        // The leader ate the key, so the selection is still standing.
+        assert_eq!(app.editor.mode, Mode::Visual);
     }
 
     #[test]

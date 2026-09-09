@@ -6,6 +6,7 @@ pub mod backup;
 pub mod buffer;
 pub mod cli;
 pub mod command;
+pub mod comment;
 pub mod config;
 pub mod editor;
 pub mod explorer;

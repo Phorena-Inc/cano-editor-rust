@@ -110,6 +110,8 @@ Command - For executing commands
 |Normal| [space] o      | Leader mapping for `:nohl`                      |
 |Normal| [space] l      | Leader mapping for `:set list!`                 |
 |Normal| [space] f      | Leader mapping for `:autoformat`                |
+|Visual| Ctrl + e       | Toggle line comments over the selected lines    |
+|Visual| [space] e      | Leader spelling of Ctrl + e                     |
 |Normal/Visual| Arrow keys | Move like h/j/k/l                            |
 |Insert| Tab            | Insert the configured indentation               |
 
@@ -387,6 +389,24 @@ The motions `h j k l 0 $ w b e g G %` and the arrow keys extend the selection.
 | y              | Yank the selection                              |
 | >              | Indent current selection                        |
 | <              | Unindent current selection                      |
+| =              | Autoformat the selected lines                   |
+| Ctrl + e       | Toggle line comments over the selected lines    |
+| [space] e      | Leader spelling of Ctrl + e                     |
+
+`Ctrl + e` (or `[space] e`) comments the lines the selection touches, and
+uncomments them instead when every one of them is already commented — one key
+each way, like `gc` in
+[commentary.vim](https://github.com/tpope/vim-commentary). The marker comes
+from the file name: `//` for C, C++ and Rust, `#` for Python and shell, `--`
+for Lua, `"` for vimscript. A file whose type Cano does not recognise says so
+rather than guessing.
+
+Markers line up in one column, chosen from the shallowest line in the
+selection, so a block keeps its shape. Blank lines are skipped — a marker on
+an empty line is noise, and counting them would stop a block that ends on one
+from ever being recognised as fully commented. Uncommenting takes back the one
+space the toggle added and leaves any others alone. The whole toggle is a
+single undo step, however many lines it touched.
 
 ## Search
 Search mode takes a string and finds it in the file.

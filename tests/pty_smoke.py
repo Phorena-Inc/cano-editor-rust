@@ -201,6 +201,23 @@ def main():
                     command(session, b"q")
                     session.wait_exit()
 
+        # The comment toggle on both spellings, round-tripped: the second
+        # pass has to put the buffer back exactly as the first found it.
+        source = os.path.join(work, "block.rs")
+        for chord in (b"\x05", b" e"):
+            with open(source, "wb") as handle:
+                handle.write(b"fn main() {\n    body();\n}\n")
+            with PtySession(binary, home, work, source) as session:
+                # Unchanged cells are not redrawn, so needles cannot span a space.
+                read_until(session.master, (b"block.rs", b"body();"))
+                session.send(b"Vj" + chord)
+                read_until(session.master, b"Commented")
+                session.send(b"kVj" + chord)
+                read_until(session.master, b"Uncommented")
+                command(session, b"wq")
+                session.wait_exit()
+                wait_file(source, b"fn main() {\n    body();\n}\n")
+
         discard = os.path.join(work, "discard.txt")
         write_target(discard)
         with PtySession(binary, home, work, discard) as session:
@@ -211,7 +228,7 @@ def main():
             session.wait_exit()
             wait_file(discard, ORIGINAL)
 
-    print("PASS: resize, :q refusal, :w, :wq, :q!, -h/--help help page")
+    print("PASS: resize, :q refusal, :w, :wq, :q!, -h/--help help page, comment toggle")
 
 
 if __name__ == "__main__":
