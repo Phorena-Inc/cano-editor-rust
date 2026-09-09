@@ -1125,8 +1125,26 @@ fn write_characters(
     for (offset, character) in characters.take(usize::from(width)).enumerate() {
         let x = x.saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
         if let Some(cell) = buffer.cell_mut((x, y)) {
-            cell.set_char(character).set_style(style);
+            cell.set_char(display_char(character)).set_style(style);
         }
+    }
+}
+
+/// Substitutes a placeholder for anything the terminal would read as a command
+/// rather than a glyph.
+///
+/// The text drawn here is not the editor's own: file names, explorer and
+/// recent-file entries carry whatever bytes the filesystem holds.  The backend
+/// prints a cell's symbol verbatim, so an ESC surviving to a cell hands the
+/// terminal an escape sequence -- one crafted name could recolour the screen,
+/// or drive OSC 52 to write the clipboard.  `display_byte` already stands the
+/// same guard over buffer text; this is the same substitution for the paths
+/// that arrive as `char`s.
+fn display_char(character: char) -> char {
+    if character.is_control() {
+        '\u{fffd}'
+    } else {
+        character
     }
 }
 
@@ -1541,6 +1559,62 @@ mod tests {
         assert!(line(backend.buffer(), 4).starts_with("42"));
         assert_eq!(backend.buffer().cell((13, 2)).unwrap().symbol(), "█");
         assert_eq!(backend.cursor_position(), Position::new(6, 2));
+    }
+
+    #[test]
+    fn control_characters_in_names_never_reach_a_cell() {
+        // A name is whatever the filesystem holds.  The backend prints a
+        // cell's symbol verbatim, so ESC/OSC/BEL/CR/LF reaching a cell would
+        // be handed to the terminal as commands rather than drawn.
+        let editor = Editor::new(Vec::new());
+        let explorer = Explorer {
+            directory: PathBuf::from("."),
+            entries: vec![Entry {
+                name: OsString::from("a\u{1b}]52;c;QQ==\u{7}b"),
+                path: PathBuf::from("a"),
+                directory: false,
+            }],
+            cursor: 0,
+        };
+        let backend = TestBackend::new(40, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut render_options = options();
+        render_options.explorer = Some(&explorer);
+        render_options.filename = "n\u{1b}[31mame\r\n";
+        render_options.message = Some("do\u{8}ne");
+
+        terminal
+            .draw(|frame| draw(frame, &editor, render_options, &mut Viewport::default()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert!(line(buffer, 0).starts_with("     a\u{fffd}]52;c;QQ==\u{fffd}b"));
+        assert!(line(buffer, 2).starts_with("NORMAL n\u{fffd}[31mame\u{fffd}\u{fffd} (1,1) Saved"));
+        assert!(line(buffer, 3).starts_with("do\u{fffd}ne"));
+        for y in 0..buffer.area.height {
+            assert!(
+                !line(buffer, y).contains(char::is_control),
+                "control character rendered on row {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn control_characters_typed_into_the_prompt_are_not_drawn() {
+        let mut editor = Editor::new(Vec::new());
+        editor.mode = Mode::Command;
+        let backend = TestBackend::new(24, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut render_options = options();
+        render_options.prompt = "w\u{1b}[2Jrite";
+        render_options.prompt_cursor = 2;
+
+        terminal
+            .draw(|frame| draw(frame, &editor, render_options, &mut Viewport::default()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert!(line(buffer, 2).starts_with(":w\u{fffd}[2Jrite"));
     }
 
     #[test]
