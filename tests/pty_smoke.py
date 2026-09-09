@@ -189,10 +189,12 @@ def main():
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "help"
         )
         if os.path.isdir(help_dir):
-            for spelling in ("-h", "--help"):
-                with PtySession(
-                    binary, home, work, spelling, env={"CANO_HELP_DIR": help_dir}
-                ) as session:
+            # The session runs in a temp directory, so the unset case only
+            # finds the pages by way of the binary's own location.  It used to
+            # look for a bare `docs/help` and fail everywhere but a checkout
+            # root.  The set case proves the override still wins.
+            for spelling, env in (("-h", None), ("--help", {"CANO_HELP_DIR": help_dir})):
+                with PtySession(binary, home, work, spelling, env=env) as session:
                     # The usage block names every flag, so this also catches
                     # docs/help/general drifting from the parser.
                     read_until(session.master, (b"general", b"Usage", b"--version"))

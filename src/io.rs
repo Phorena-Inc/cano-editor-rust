@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,47 @@ pub fn save_buffer(path: &Path, bytes: &[u8]) -> io::Result<()> {
 pub fn help_page(help_dir: &Path, page: &str) -> Option<PathBuf> {
     let path = help_dir.join(page);
     path.is_file().then_some(path)
+}
+
+/// Directories that may hold help pages, in search order.
+///
+/// Only the first two are configured -- `runtime` from the environment and
+/// `compiled` from the build.  The rest are derived from where the binary
+/// actually is, because a bare `docs/help` only resolves when the process
+/// happens to be run from a checkout root: `cargo` leaves the binary in
+/// `target/<profile>/`, `make` copies it to `build/`, and an installed binary
+/// sits in `<prefix>/bin` beside `<prefix>/share/cano/help`.
+///
+/// The bare relative path stays last rather than being dropped: it is what
+/// shipped, and it still answers for anyone running from a checkout root.
+pub fn help_directories(
+    runtime: Option<&OsStr>,
+    compiled: Option<&str>,
+    executable: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+
+    // An empty setting names no directory.  Taking it literally would join
+    // the page onto nothing and search the current directory, so it counts as
+    // unset instead.
+    for configured in [runtime.map(PathBuf::from), compiled.map(PathBuf::from)] {
+        if let Some(directory) = configured.filter(|path| !path.as_os_str().is_empty()) {
+            directories.push(directory);
+        }
+    }
+
+    if let Some(prefix) = executable.and_then(Path::parent).and_then(Path::parent) {
+        // `build/cano` from `make`, then `<prefix>/bin/cano` once installed.
+        directories.push(prefix.join("docs/help"));
+        directories.push(prefix.join("share/cano/help"));
+        if let Some(root) = prefix.parent() {
+            // `target/<profile>/cano` from a plain `cargo build`.
+            directories.push(root.join("docs/help"));
+        }
+    }
+
+    directories.push(PathBuf::from("docs/help"));
+    directories
 }
 
 #[cfg(test)]
@@ -137,6 +179,58 @@ mod tests {
                 .unwrap()
                 .file_type()
                 .is_symlink()
+        );
+    }
+
+    #[test]
+    fn help_directories_search_configured_paths_before_derived_ones() {
+        let directories = help_directories(
+            Some(OsStr::new("/run/help")),
+            Some("/build/help"),
+            Some(Path::new("/opt/cano/bin/cano")),
+        );
+        assert_eq!(directories[0], PathBuf::from("/run/help"));
+        assert_eq!(directories[1], PathBuf::from("/build/help"));
+        assert_eq!(directories.last().unwrap(), &PathBuf::from("docs/help"));
+    }
+
+    #[test]
+    fn help_directories_cover_both_layouts_the_build_produces() {
+        // `cargo` leaves the binary two levels below the checkout root, and
+        // `make` copies it one level below.  Neither can rely on the process
+        // being run from the root, so both are derived from the binary.
+        let cargo = help_directories(None, None, Some(Path::new("/w/cano/target/release/cano")));
+        assert!(
+            cargo.contains(&PathBuf::from("/w/cano/docs/help")),
+            "{cargo:?}"
+        );
+
+        let make = help_directories(None, None, Some(Path::new("/w/cano/build/cano")));
+        assert!(
+            make.contains(&PathBuf::from("/w/cano/docs/help")),
+            "{make:?}"
+        );
+
+        let installed = help_directories(None, None, Some(Path::new("/usr/bin/cano")));
+        assert!(
+            installed.contains(&PathBuf::from("/usr/share/cano/help")),
+            "{installed:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_setting_is_not_a_directory() {
+        // Kept out because joining a page onto it would search the current
+        // directory, which is exactly what the derived paths exist to avoid.
+        let directories = help_directories(Some(OsStr::new("")), Some(""), None);
+        assert_eq!(directories, vec![PathBuf::from("docs/help")]);
+    }
+
+    #[test]
+    fn help_directories_still_answer_without_a_known_executable() {
+        assert_eq!(
+            help_directories(None, None, None),
+            vec![PathBuf::from("docs/help")]
         );
     }
 

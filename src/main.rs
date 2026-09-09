@@ -6,7 +6,7 @@ use cano_fresh::app::{App, AppEffect, Jump};
 use cano_fresh::backup;
 use cano_fresh::cli::{CliError, parse};
 use cano_fresh::config::{load as load_config, load_or_default};
-use cano_fresh::io::{help_page, load_buffer, save_buffer};
+use cano_fresh::io::{help_directories, help_page, load_buffer, save_buffer};
 use cano_fresh::process::run_shell;
 use cano_fresh::recent::Recent;
 use cano_fresh::render::{RenderOptions, draw};
@@ -44,16 +44,31 @@ fn run() -> Result<u8, String> {
     let showing_help = cli.help_page.is_some();
     let filename = if showing_help {
         // The runtime environment wins so an installed binary can be pointed
-        // at relocated help pages; the compile-time value and the in-repo
-        // fallback cover installed and development builds.
-        let directory = std::env::var_os("CANO_HELP_DIR")
-            .map(PathBuf::from)
-            .or_else(|| option_env!("CANO_HELP_DIR").map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("docs/help"));
-        help_page(&directory, "general").ok_or_else(|| {
-            "Failed to open help page. Check for typos or if you installed cano properly."
-                .to_owned()
-        })?
+        // at relocated help pages; the remaining candidates cover installed
+        // and development builds wherever they are run from.
+        let runtime = std::env::var_os("CANO_HELP_DIR");
+        let executable = std::env::current_exe().ok();
+        let directories = help_directories(
+            runtime.as_deref(),
+            option_env!("CANO_HELP_DIR"),
+            executable.as_deref(),
+        );
+        directories
+            .iter()
+            .find_map(|directory| help_page(directory, "general"))
+            .ok_or_else(|| {
+                // Naming the directories searched turns "check for typos" into
+                // something the reader can act on: set CANO_HELP_DIR, or put
+                // the pages where one of these points.
+                let searched = directories
+                    .iter()
+                    .map(|directory| format!("\n  {}", directory.display()))
+                    .collect::<String>();
+                format!(
+                    "Failed to open help page. Check for typos or if you installed cano \
+                     properly. Searched:{searched}"
+                )
+            })?
     } else {
         PathBuf::from(cli.filename.as_deref().unwrap_or("out.txt"))
     };
