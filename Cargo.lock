@@ -119,7 +119,7 @@ checksum = "d6aedf8ae72766347502cf3cb4f41cf5e9cc37d28bee90f1fdaaae15f9cf9424"
 
 [[package]]
 name = "cano-fresh"
-version = "0.26.908"
+version = "0.26.909"
 dependencies = [
  "crossterm",
  "libc",
