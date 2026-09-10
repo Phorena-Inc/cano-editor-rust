@@ -1,4 +1,4 @@
-//! The most-recently-opened file list behind Ctrl-R.
+//! The most-recently-opened file list behind Ctrl-P.
 //!
 //! The list is persisted beside the effective configuration file, in the same
 //! place `.cyntax` palettes are looked up, as one path per line.  Paths are

@@ -203,8 +203,11 @@ pub struct RenderOptions<'a> {
     /// while `list` is off.
     pub list: Option<&'a ListChars>,
     pub explorer: Option<&'a Explorer>,
-    /// The Ctrl-R recent-file picker, which takes the pane when it is open.
+    /// The Ctrl-P recent-file picker, which takes the pane when it is open.
     pub recent: Option<&'a Recent>,
+    /// The Ctrl-F prompt-history picker, and the entry it has selected.  It
+    /// takes the pane the same way the other two do.
+    pub history: Option<(&'a [Vec<u8>], usize)>,
     pub syntax: Option<&'a SyntaxConfig>,
     /// Renders the buffer as formatted markdown instead of source code.
     pub markdown: bool,
@@ -268,11 +271,12 @@ pub fn draw(
 
     // A full-pane list has no buffer lines to number, so the gutter collapses
     // to its minimum width behind it.
-    let line_count = if options.explorer.is_none() && options.recent.is_none() {
-        editor.buffer.rows.len()
-    } else {
-        0
-    };
+    let line_count =
+        if options.explorer.is_none() && options.recent.is_none() && options.history.is_none() {
+            editor.buffer.rows.len()
+        } else {
+            0
+        };
     let layout = ScreenLayout::new(area, line_count);
     scroll.content_x = layout.content_x;
     scroll.content_width = layout.content_width;
@@ -284,7 +288,19 @@ pub fn draw(
         let buffer = frame.buffer_mut();
         clear_area(buffer, area);
 
-        let cursor = if let Some(recent) = options.recent {
+        let cursor = if let Some((entries, selected)) = options.history {
+            let width = usize::from(layout.content_width);
+            first_item = viewport_start(selected, layout.editor_height, entries.len());
+            draw_list(
+                buffer,
+                layout,
+                entries,
+                first_item,
+                selected,
+                Style::default().fg(Color::Yellow),
+                |entry| elide_start(&String::from_utf8_lossy(entry), width),
+            )
+        } else if let Some(recent) = options.recent {
             let width = usize::from(layout.content_width);
             first_item = viewport_start(recent.cursor, layout.editor_height, recent.paths.len());
             draw_list(
@@ -316,7 +332,15 @@ pub fn draw(
         };
 
         draw_status(buffer, layout, editor, &options);
-        draw_prompt(buffer, layout, editor, &options).or(cursor)
+        let prompt = draw_prompt(buffer, layout, editor, &options);
+        // The list shows which entry is selected by putting the terminal
+        // cursor on it, so while the history picker is up it outranks the
+        // prompt it was opened from; everywhere else the prompt wins.
+        if options.history.is_some() {
+            cursor.or(prompt)
+        } else {
+            prompt.or(cursor)
+        }
     };
 
     scroll.first_item = first_item;
@@ -559,7 +583,7 @@ fn draw_buffer_row(
             {
                 style = style.bg(HIGHLIGHT_BACKGROUND);
             }
-            if is_selected(editor, byte_index) {
+            if is_selected(editor, row_index, byte_index) {
                 style = style.add_modifier(Modifier::REVERSED);
             }
             if let Some(cell) = buffer.cell_mut((x, y)) {
@@ -585,7 +609,7 @@ fn draw_buffer_row(
             cell.set_char(eol)
                 .set_style(Style::default().fg(LISTCHAR_COLOR));
         }
-        if is_selected(editor, row.end)
+        if is_selected(editor, row_index, row.end)
             && let Some(cell) = buffer.cell_mut((x, y))
         {
             cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
@@ -601,9 +625,26 @@ fn display_byte(byte: u8) -> char {
     }
 }
 
-fn is_selected(editor: &Editor, index: usize) -> bool {
+/// Whether one byte of `row_index` is inside the visual selection.
+///
+/// The row is passed in rather than looked up because the caller is already
+/// walking one row at a time, and a blockwise selection has to know which
+/// column a byte sits in to decide.
+fn is_selected(editor: &Editor, row_index: usize, index: usize) -> bool {
     if editor.mode != Mode::Visual {
         return false;
+    }
+    if let Some((first, last, left, right)) = editor.block_bounds() {
+        let Some(row) = editor.buffer.rows.get(row_index) else {
+            return false;
+        };
+        // The rectangle covers text, not the blank past the end of a short
+        // line, so the cell standing in for the newline is never part of it.
+        if index >= row.end || !(first..=last).contains(&row_index) {
+            return false;
+        }
+        let column = index.saturating_sub(row.start);
+        return (left..=right).contains(&column);
     }
     let start = editor.visual.start.min(editor.visual.end);
     let end = editor.visual.start.max(editor.visual.end);
@@ -1158,7 +1199,7 @@ mod tests {
     use ratatui::layout::Position;
 
     use super::*;
-    use crate::editor::VisualSelection;
+    use crate::editor::{VisualKind, VisualSelection};
     use crate::explorer::Entry;
 
     static EMPTY_HIGHLIGHT: Highlight = Highlight {
@@ -1168,6 +1209,7 @@ mod tests {
 
     fn options<'a>() -> RenderOptions<'a> {
         RenderOptions {
+            history: None,
             relative_numbers: false,
             prompt: "",
             prompt_cursor: 0,
@@ -1274,7 +1316,7 @@ mod tests {
             start: 1,
             end: 2,
             anchor: 1,
-            linewise: false,
+            kind: VisualKind::Charwise,
         };
         let backend = TestBackend::new(16, 4);
         let mut terminal = Terminal::new(backend).unwrap();

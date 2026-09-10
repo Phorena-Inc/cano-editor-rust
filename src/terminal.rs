@@ -193,6 +193,22 @@ impl TerminalSession {
         Ok(session)
     }
 
+    /// Throws away what the terminal is showing so the next frame is painted
+    /// from nothing, for vim's Ctrl-L.
+    ///
+    /// `Terminal::clear` would be the obvious call, but it snapshots the
+    /// cursor first by asking the terminal where it is and waiting for the
+    /// reply on the same input the editor reads its keys from.  A terminal
+    /// that answers late puts that reply in front of the next keystroke, and
+    /// one that never answers -- some multiplexers, or input that is not a
+    /// terminal at all -- hangs the editor on a key that is meant to be a
+    /// no-op.  Resizing to the size already in force clears the screen and
+    /// resets the back buffer without asking the terminal anything.
+    pub fn redraw(&mut self) -> io::Result<()> {
+        let size = self.terminal.size()?;
+        self.terminal.resize(size.into())
+    }
+
     /// Stops the editor and hands the terminal back to the shell, the way
     /// Ctrl-Z does everywhere else.
     ///

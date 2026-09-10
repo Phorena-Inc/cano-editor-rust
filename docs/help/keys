@@ -10,15 +10,15 @@ Normal
   x dd yy p     delete, delete line, yank line, paste
   d motion      delete over the next motion
   v V           character/line Visual mode
-  u U           undo/redo
+  u U           undo/redo (Ctrl-R also redoes)
   / n N         search, next match, previous match
   :             Command mode
   r             replace with the next typed key (Escape cancels)
   Ctrl-N        toggle file explorer (Escape closes it)
-  Ctrl-R        toggle the recent-file list (Escape closes it)
+  Ctrl-P        toggle the recent-file list (Escape closes it)
   Ctrl-Z        suspend to the shell; fg returns
   space n       leader mapping for Ctrl-N
-  space r       leader mapping for Ctrl-R
+  space r       leader mapping for Ctrl-P
   Ctrl-M        toggle markdown display (Enter is the same key)
   s char        EasyMotion jump to any char on screen (both directions)
   t char        EasyMotion jump just before the next char (forward only)
@@ -27,6 +27,14 @@ Normal
   space o       leader mapping for :nohl
   space l       leader mapping for :set list!
   space f       leader mapping for :autoformat
+  Ctrl-F Ctrl-B forward/back one screen (a count multiplies all six)
+  Ctrl-D Ctrl-U forward/back half a screen
+  Ctrl-E Ctrl-Y scroll one line, leaving the cursor where it is
+  Ctrl-A Ctrl-X add one to / take one off the number at or after the cursor
+  Ctrl-G        report the file, its length and the position in it
+  Ctrl-L        redraw the screen and clear the message line
+  Ctrl-V        blockwise Visual mode
+  Ctrl-W        vim's window prefix; Cano has no splits and says so
 
 Mouse
   click         move the cursor (gutter goes to the line start)
@@ -40,7 +48,13 @@ Insert
   arrows        move and split insertion history
   Tab           insert the configured indentation
   Backspace     delete byte before cursor
+  Ctrl-H        the same as Backspace
   Enter         newline plus brace-depth indentation
+  Ctrl-W        delete the word before the cursor
+  Ctrl-U        delete back to the first non-blank; again for the indent
+  Ctrl-T Ctrl-D indent / unindent the current line one shiftwidth
+  Ctrl-N Ctrl-P complete the word being typed from the buffer, either way
+  Ctrl-O        run one Normal-mode command, then carry on typing
 
 Visual
   motions       extend selection (h j k l 0 $ w b e g G % and arrows)
@@ -49,3 +63,9 @@ Visual
   > <           indent or unindent selected rows
   =             autoformat the selected lines
   <c-e> space e toggle line comments over the selected lines
+  Ctrl-V        turn the selection into a rectangle, or leave Visual mode
+
+Command and Search
+  up/down       walk the history for that prompt
+  Ctrl-F        open that history as a list (j/k, Enter runs, Escape closes)
+  Ctrl-C        abandon the line

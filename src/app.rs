@@ -3,11 +3,18 @@ use std::path::{Path, PathBuf};
 /// Buffer rows one wheel notch moves, matching the usual terminal default.
 const SCROLL_LINES: isize = 3;
 
+/// The window height the paging keys assume before the first frame has said
+/// what the real one is.
+const ASSUMED_ROWS: usize = 24;
+
+/// How many lines of `:` and `/` history are kept.
+const HISTORY_CAPACITY: usize = 50;
+
 use crate::autoformat::{self, Steps};
 use crate::buffer::Highlight;
 use crate::command::{Action, CommandState, ConfigVariable, ExternalEffect, key, lex, parse};
 use crate::comment;
-use crate::editor::{Editor, Leader, Mode, MoveDirection};
+use crate::editor::{Editor, InsertEntry, Leader, Mode, MoveDirection, VisualKind};
 use crate::explorer::{Explorer, Selection};
 use crate::history::UndoRecord;
 use crate::io::load_buffer;
@@ -25,7 +32,25 @@ pub enum AppEffect {
     /// Stop the editor and hand the terminal back to the shell, until `fg`.
     Suspend,
     Shell(Vec<u8>),
+    /// Throw away what the terminal is showing and paint it again, for
+    /// vim's Ctrl-L: only the caller holds the terminal.
+    Redraw,
     Quit,
+}
+
+/// An in-flight `i_CTRL-N` / `i_CTRL-P` completion.
+///
+/// The candidates are collected once, when the cycle starts, so repeating
+/// the key walks a stable list rather than re-reading a buffer that each
+/// step has just changed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Completion {
+    /// The keyword that was typed, which the cycle comes back to after its
+    /// last candidate so what was actually written is never out of reach.
+    prefix: Vec<u8>,
+    matches: Vec<Vec<u8>>,
+    /// Which candidate is in the buffer, or `None` while the bare prefix is.
+    index: Option<usize>,
 }
 
 /// The one undo record a confirmed run accumulates.
@@ -93,7 +118,7 @@ pub struct App {
     pub prompt_cursor: usize,
     pub filename: PathBuf,
     pub explorer: Option<Explorer>,
-    /// The most-recently-opened files, and whether Ctrl-R is showing them.
+    /// The most-recently-opened files, and whether Ctrl-P is showing them.
     pub recent: Recent,
     pub recent_open: bool,
     /// Where the recent list is persisted, when there is somewhere to put it.
@@ -118,7 +143,27 @@ pub struct App {
     pub confirming: Option<Confirming>,
     /// Keys typed in Insert mode that may still complete an `:imap`.
     insert_pending: Vec<u8>,
-    /// The pane Ctrl-N or Ctrl-R asked for while the buffer was unsaved; the
+    /// The `i_CTRL-N` completion being cycled, if one is.
+    completion: Option<Completion>,
+    /// True once `i_CTRL-O` has armed one Normal-mode command, until that
+    /// command has run.
+    insert_normal: bool,
+    /// True once Ctrl-W has been pressed in Normal mode; the next key is the
+    /// window command it prefixes.
+    window_pending: bool,
+    /// Lines executed from the `:` prompt, oldest first.
+    pub command_history: Vec<Vec<u8>>,
+    /// Patterns searched for from the `/` prompt, oldest first.
+    pub search_history: Vec<Vec<u8>>,
+    /// How far back the arrow keys have walked the history for the prompt
+    /// that is up, or `None` while the prompt holds what was typed.
+    history_browse: Option<usize>,
+    /// Which prompt's history the Ctrl-F picker is showing, if it is open.
+    pub history_open: Option<Mode>,
+    /// The entries that picker lists, newest first, and where its cursor is.
+    pub history_list: Vec<Vec<u8>>,
+    pub history_cursor: usize,
+    /// The pane Ctrl-N or Ctrl-P asked for while the buffer was unsaved; the
     /// prompt is waiting for an answer.
     pub save_prompt: Option<Pane>,
     /// The pane to open once a save the prompt asked for has been written.
@@ -169,6 +214,15 @@ impl App {
             scrollbar_drag: false,
             confirming: None,
             insert_pending: Vec::new(),
+            completion: None,
+            insert_normal: false,
+            window_pending: false,
+            command_history: Vec::new(),
+            search_history: Vec::new(),
+            history_browse: None,
+            history_open: None,
+            history_list: Vec::new(),
+            history_cursor: 0,
             save_prompt: None,
             pending_pane: None,
             viewport: Viewport::default(),
@@ -199,7 +253,41 @@ impl App {
         effects
     }
 
+    /// Runs one key, then hands the keyboard back to Insert mode when the
+    /// single Normal-mode command `i_CTRL-O` armed has finished.
+    ///
+    /// The arming is read before the key runs, so the Ctrl-O that set it is
+    /// not itself mistaken for the command it was waiting for.
     fn handle_mapped(&mut self, input: Input, depth: usize) -> Vec<AppEffect> {
+        let armed = self.insert_normal;
+        let effects = self.dispatch(input, depth);
+        if armed && !self.collecting_command() {
+            self.insert_normal = false;
+            // A command that chose a mode or opened a pane of its own keeps
+            // what it chose; only one that left the cursor sitting in the
+            // buffer goes back to where it came from.
+            if self.editor.mode == Mode::Normal
+                && self.explorer.is_none()
+                && !self.recent_open
+                && self.save_prompt.is_none()
+            {
+                self.editor.enter_insert(InsertEntry::Cursor);
+            }
+        }
+        effects
+    }
+
+    /// Whether a Normal-mode command is still waiting for keys to finish it.
+    fn collecting_command(&self) -> bool {
+        self.editor.leader != Leader::None
+            || !self.count.is_empty()
+            || self.pending_replace
+            || self.leader_pending
+            || self.window_pending
+            || self.jump.is_some()
+    }
+
+    fn dispatch(&mut self, input: Input, depth: usize) -> Vec<AppEffect> {
         if self.pending_replace {
             self.pending_replace = false;
             // Escape, arrows, and other non-character keys cancel the pending
@@ -244,6 +332,12 @@ impl App {
             return self.save_prompt_input(input, pane);
         }
 
+        // The prompt-history picker owns the keyboard the same way the file
+        // panes do: it is a list standing in front of the buffer.
+        if self.history_open.is_some() {
+            return self.history_input(input);
+        }
+
         // A pending `s`/`t` motion owns the keyboard until it lands or is
         // cancelled, in Normal and Visual mode alike.  It sits ahead of key
         // mapping because a mapping firing here would move the cursor out
@@ -274,13 +368,25 @@ impl App {
     }
 
     fn normal_input(&mut self, input: Input) -> Vec<AppEffect> {
+        // Ctrl-W prefixes vim's window commands.  Cano has one window, so
+        // the prefix exists to swallow the key that follows it and say so,
+        // rather than let `Ctrl-W v` fall through and start Visual mode.
+        if self.window_pending {
+            self.window_pending = false;
+            if !matches!(input, Input::Escape | Input::Control(3)) {
+                self.set_message("Cano has one window; splits are not supported");
+            }
+            return Vec::new();
+        }
         if input == Input::Control(14) {
             self.toggle_pane(Pane::Explorer);
             self.editor.leader = Leader::None;
             return Vec::new();
         }
 
-        if input == Input::Control(18) {
+        // Vim's Ctrl-R is redo, so the recent-file picker sits on Ctrl-P,
+        // where every other editor's "open something I had open" lives.
+        if input == Input::Control(16) {
             self.toggle_pane(Pane::Recent);
             self.editor.leader = Leader::None;
             return Vec::new();
@@ -359,12 +465,7 @@ impl App {
                 return Vec::new();
             }
             if !self.count.is_empty() {
-                let repetitions = self.count.iter().fold(0usize, |value, digit| {
-                    value
-                        .saturating_mul(10)
-                        .saturating_add(usize::from(digit - b'0'))
-                });
-                self.count.clear();
+                let repetitions = self.take_count();
                 if byte == b'd' {
                     self.editor.delete_rows(repetitions);
                     return Vec::new();
@@ -385,6 +486,15 @@ impl App {
                 return Vec::new();
             }
         }
+
+        // A count typed in front of a Control command belongs to it the same
+        // way it belongs to a plain key: `5<C-a>` adds five, `3<C-e>` scrolls
+        // three lines.
+        let count = if matches!(input, Input::Control(_)) {
+            self.take_count()
+        } else {
+            1
+        };
 
         match input {
             Input::Byte(b':') => self.enter_prompt(Mode::Command),
@@ -450,6 +560,37 @@ impl App {
             // Raw mode means Ctrl-Z arrives as a key rather than stopping the
             // process, so the stop has to be asked for explicitly.
             Input::Control(26) => return vec![AppEffect::Suspend],
+            // Vim's scrolling and paging keys.
+            Input::Control(code) if self.scroll_command(code, count) => {
+                self.editor.leader = Leader::None;
+            }
+            Input::Control(18) => {
+                for _ in 0..count {
+                    self.redo_with_report();
+                }
+                self.editor.leader = Leader::None;
+            }
+            Input::Control(1) => self.step_number(count, true),
+            Input::Control(24) => self.step_number(count, false),
+            Input::Control(7) => {
+                self.report_file_status();
+                self.editor.leader = Leader::None;
+            }
+            Input::Control(12) => {
+                self.editor.leader = Leader::None;
+                // Vim's Ctrl-L takes the message line down with the rest of
+                // what was on the screen.
+                self.commands.message = None;
+                return vec![AppEffect::Redraw];
+            }
+            Input::Control(22) => {
+                self.editor.leader = Leader::None;
+                self.editor.start_visual(VisualKind::Blockwise);
+            }
+            Input::Control(23) => {
+                self.editor.leader = Leader::None;
+                self.window_pending = true;
+            }
             Input::Control(3) | Input::Escape => {
                 self.count.clear();
                 self.prompt.clear();
@@ -458,6 +599,20 @@ impl App {
             _ => self.editor.leader = Leader::None,
         }
         Vec::new()
+    }
+
+    /// Consumes a count typed before a command, defaulting to one.
+    fn take_count(&mut self) -> usize {
+        if self.count.is_empty() {
+            return 1;
+        }
+        let repetitions = self.count.iter().fold(0usize, |value, digit| {
+            value
+                .saturating_mul(10)
+                .saturating_add(usize::from(digit - b'0'))
+        });
+        self.count.clear();
+        repetitions.max(1)
     }
 
     fn dispatch_repeated(&mut self, byte: u8) {
@@ -620,15 +775,48 @@ impl App {
         if !matches!(input, Input::Byte(_)) {
             self.insert_pending.clear();
         }
+        // Only Ctrl-N and Ctrl-P continue a completion.  Anything else has
+        // settled on a word, so the next Ctrl-N starts from what is now
+        // written rather than from a prefix that has since moved on.
+        if !matches!(input, Input::Control(14 | 16)) {
+            self.completion = None;
+        }
         match input {
             Input::Escape | Input::Control(3) => {
                 self.editor.leave_insert();
             }
-            Input::Backspace => {
+            // Ctrl-H is what a terminal without keyboard disambiguation
+            // sends for Backspace, and vim gives them the same meaning.
+            Input::Backspace | Input::Control(8) => {
                 self.editor.insert_backspace();
             }
             Input::Enter => {
                 self.editor.insert_newline();
+            }
+            Input::Control(23) => {
+                self.editor.insert_delete_word();
+            }
+            Input::Control(21) => {
+                self.editor.insert_delete_to_line_start();
+            }
+            Input::Control(20) => {
+                self.editor.insert_shift(true);
+            }
+            Input::Control(4) => {
+                self.editor.insert_shift(false);
+            }
+            Input::Control(14) => self.complete(true),
+            Input::Control(16) => self.complete(false),
+            // Vim's `i_CTRL-O`: one Normal-mode command, then straight back
+            // to typing.  Leaving Insert mode here closes out the insertion
+            // in flight, so the command runs against a settled buffer.
+            Input::Control(15) => {
+                self.editor.leave_insert();
+                self.insert_normal = true;
+                // Normal mode is showing but only for one command, which is
+                // worth saying: vim writes the same thing on its own status
+                // line for as long as the arming lasts.
+                self.set_message("-- (insert) --");
             }
             Input::Byte(b'\t') => {
                 self.insert_pending.clear();
@@ -671,6 +859,17 @@ impl App {
         match input {
             Input::Escape | Input::Control(3) => {
                 self.editor.visual_key(27);
+            }
+            // Vim's `Ctrl-V` switches an existing selection to a rectangle,
+            // and leaves Visual mode when the selection is already one, the
+            // same way pressing `v` again does.
+            Input::Control(22) => {
+                if self.editor.visual.kind.is_blockwise() {
+                    self.editor.visual_key(27);
+                } else {
+                    self.editor.visual.kind = VisualKind::Blockwise;
+                    self.editor.refresh_visual();
+                }
             }
             // Comment toggle, on both the leader spelling and a bare chord so
             // it is reachable without arming the leader first.
@@ -724,6 +923,10 @@ impl App {
             Input::Right => {
                 self.prompt_cursor = (self.prompt_cursor + 1).min(self.prompt.len());
             }
+            Input::Up => self.browse_history(true),
+            Input::Down => self.browse_history(false),
+            // Vim's `Ctrl-F` on the command line opens the history window.
+            Input::Control(6) => self.open_history_pane(),
             Input::Byte(byte) => self.prompt_insert(byte),
             Input::Enter => return self.execute_command(),
             _ => {}
@@ -742,8 +945,13 @@ impl App {
             Input::Right => {
                 self.prompt_cursor = (self.prompt_cursor + 1).min(self.prompt.len());
             }
+            Input::Up => self.browse_history(true),
+            Input::Down => self.browse_history(false),
+            Input::Control(6) => self.open_history_pane(),
             Input::Byte(byte) => self.prompt_insert(byte),
             Input::Enter => {
+                let searched = self.prompt.clone();
+                self.record_history(Mode::Search, &searched);
                 let mut destination = self.editor.buffer.search_wrapped(&self.prompt);
                 let mut needle = self.prompt.clone();
                 if let Some(replacement) = self.prompt.strip_prefix(b"s/") {
@@ -773,6 +981,8 @@ impl App {
     }
 
     fn execute_command(&mut self) -> Vec<AppEffect> {
+        let line = self.prompt.clone();
+        self.record_history(Mode::Command, &line);
         self.editor.mode = Mode::Normal;
         // A substitution is delimiter-structured rather than
         // whitespace-structured, so it is recognized before the token lexer
@@ -885,6 +1095,200 @@ impl App {
     fn prompt_insert(&mut self, byte: u8) {
         self.prompt.insert(self.prompt_cursor, byte);
         self.prompt_cursor += 1;
+        // What is on the prompt is no longer the history entry it was
+        // recalled from, so the arrows start again from the near end.
+        self.history_browse = None;
+    }
+
+    /// Vim's `i_CTRL-N` and `i_CTRL-P`: completes the keyword in front of the
+    /// cursor from the words already in the buffer.
+    ///
+    /// Repeating the key walks the candidates, and walking off either end
+    /// puts the typed prefix back, so the cycle always offers a way back to
+    /// what was actually written.
+    fn complete(&mut self, forward: bool) {
+        let session = match self.completion.take() {
+            Some(session) => session,
+            None => {
+                let cursor = self.editor.buffer.cursor;
+                let prefix = self.editor.buffer.keyword_before(cursor).to_vec();
+                if prefix.is_empty() {
+                    self.set_message("No word before the cursor");
+                    return;
+                }
+                let matches = self.editor.buffer.completions(&prefix, cursor);
+                if matches.is_empty() {
+                    self.set_message("Pattern not found");
+                    return;
+                }
+                Completion {
+                    prefix,
+                    matches,
+                    index: None,
+                }
+            }
+        };
+
+        let total = session.matches.len();
+        let index = if forward {
+            match session.index {
+                None => Some(0),
+                Some(index) if index.saturating_add(1) < total => Some(index + 1),
+                Some(_) => None,
+            }
+        } else {
+            match session.index {
+                None => total.checked_sub(1),
+                Some(0) => None,
+                Some(index) => Some(index - 1),
+            }
+        };
+        let chosen = index
+            .and_then(|index| session.matches.get(index))
+            .unwrap_or(&session.prefix)
+            .clone();
+
+        // What is in front of the cursor is either the typed prefix or the
+        // candidate put there last time round, so it is read back from the
+        // buffer rather than assumed.
+        let written = self
+            .editor
+            .buffer
+            .keyword_before(self.editor.buffer.cursor)
+            .len();
+        for _ in 0..written {
+            self.editor.insert_backspace();
+        }
+        for byte in &chosen {
+            self.editor.insert_byte(*byte);
+        }
+
+        match index {
+            Some(_) if total == 1 => self.set_message("The only match"),
+            Some(index) => self.set_message(format!("match {} of {total}", index + 1)),
+            None => self.set_message("Back at original"),
+        }
+        self.completion = Some(Completion { index, ..session });
+    }
+
+    /// The history for one of the two prompts, oldest first.
+    fn history_for(&self, mode: Mode) -> &Vec<Vec<u8>> {
+        if mode == Mode::Search {
+            &self.search_history
+        } else {
+            &self.command_history
+        }
+    }
+
+    /// Records a line the prompt just ran.
+    ///
+    /// A repeat moves to the end rather than being stored twice, so walking
+    /// back through the history never treads the same line twice in a row.
+    fn record_history(&mut self, mode: Mode, entry: &[u8]) {
+        if entry.is_empty() {
+            return;
+        }
+        let list = if mode == Mode::Search {
+            &mut self.search_history
+        } else {
+            &mut self.command_history
+        };
+        list.retain(|existing| existing != entry);
+        list.push(entry.to_vec());
+        let excess = list.len().saturating_sub(HISTORY_CAPACITY);
+        list.drain(..excess);
+        self.history_browse = None;
+    }
+
+    /// Walks the history of the prompt that is up.
+    ///
+    /// `Up` reaches back towards the oldest entry; `Down` comes forward
+    /// again and returns to an empty prompt past the newest one.
+    fn browse_history(&mut self, back: bool) {
+        let entries = self.history_for(self.editor.mode).clone();
+        if entries.is_empty() {
+            return;
+        }
+        let index = match (self.history_browse, back) {
+            (None, true) => entries.len() - 1,
+            (None, false) => return,
+            (Some(index), true) => index.saturating_sub(1),
+            (Some(index), false) if index.saturating_add(1) < entries.len() => index + 1,
+            (Some(_), false) => {
+                self.history_browse = None;
+                self.clear_prompt();
+                return;
+            }
+        };
+        self.history_browse = Some(index);
+        self.prompt.clone_from(&entries[index]);
+        self.prompt_cursor = self.prompt.len();
+    }
+
+    /// Vim's `q:` history window, in the shape of picker cano already has.
+    ///
+    /// Entries are listed newest first, so the one most likely wanted is
+    /// under the cursor as the list opens.
+    fn open_history_pane(&mut self) {
+        let entries: Vec<Vec<u8>> = self
+            .history_for(self.editor.mode)
+            .iter()
+            .rev()
+            .cloned()
+            .collect();
+        if entries.is_empty() {
+            self.set_message(if self.editor.mode == Mode::Search {
+                "No search history"
+            } else {
+                "No command history"
+            });
+            return;
+        }
+        self.history_open = Some(self.editor.mode);
+        self.history_list = entries;
+        self.history_cursor = 0;
+    }
+
+    /// Keys for the Ctrl-F history picker.
+    fn history_input(&mut self, input: Input) -> Vec<AppEffect> {
+        match input {
+            Input::Byte(b'j') | Input::Down => {
+                if self.history_cursor.saturating_add(1) < self.history_list.len() {
+                    self.history_cursor += 1;
+                }
+            }
+            Input::Byte(b'k') | Input::Up => {
+                self.history_cursor = self.history_cursor.saturating_sub(1);
+            }
+            Input::Enter => return self.run_history_entry(),
+            Input::Escape | Input::Control(3) => self.close_history_pane(),
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    /// Vim's history window runs the line you press Enter on, and so does
+    /// this: the entry goes back onto the prompt and is executed from there.
+    fn run_history_entry(&mut self) -> Vec<AppEffect> {
+        let entry = self.history_list.get(self.history_cursor).cloned();
+        let mode = self.history_open;
+        self.close_history_pane();
+        let Some(entry) = entry else {
+            return Vec::new();
+        };
+        self.prompt = entry;
+        self.prompt_cursor = self.prompt.len();
+        if mode == Some(Mode::Search) {
+            self.search_input(Input::Enter)
+        } else {
+            self.execute_command()
+        }
+    }
+
+    fn close_history_pane(&mut self) {
+        self.history_open = None;
+        self.history_list.clear();
+        self.history_cursor = 0;
     }
 
     fn prompt_backspace(&mut self) {
@@ -1421,6 +1825,10 @@ impl App {
         if self.commands.mouse == 0 {
             return;
         }
+        if self.history_open.is_some() {
+            self.history_mouse(mouse);
+            return;
+        }
         if self.explorer.is_some() || self.recent_open {
             self.pane_mouse(mouse);
             return;
@@ -1444,7 +1852,7 @@ impl App {
                 // The first drag after a press turns the press into the
                 // anchor of a new selection; later ones just extend it.
                 if self.drag_anchor.take().is_some() && self.editor.mode == Mode::Normal {
-                    self.editor.start_visual(false);
+                    self.editor.start_visual(VisualKind::Charwise);
                 }
                 self.editor.buffer.cursor = byte;
                 self.editor.refresh_visual();
@@ -1456,6 +1864,33 @@ impl App {
             MouseKind::ScrollDown => {
                 self.scrollbar_drag = false;
                 self.scroll_lines(SCROLL_LINES);
+            }
+        }
+    }
+
+    /// The mouse in the Ctrl-F history picker.
+    ///
+    /// It only ever moves the selection.  Running an entry is what Enter is
+    /// for: a command run from here can ask for a save or a quit, and the
+    /// mouse path has nowhere to hand those effects on to.
+    fn history_mouse(&mut self, mouse: Mouse) {
+        let total = self.history_list.len();
+        match mouse.kind {
+            MouseKind::Press | MouseKind::Drag => {
+                if let Some(index) = self.viewport.item_at(total, mouse.row) {
+                    self.history_cursor = index;
+                }
+            }
+            MouseKind::ScrollUp => {
+                self.history_cursor = self
+                    .history_cursor
+                    .saturating_sub(SCROLL_LINES.unsigned_abs());
+            }
+            MouseKind::ScrollDown => {
+                self.history_cursor = self
+                    .history_cursor
+                    .saturating_add(SCROLL_LINES.unsigned_abs())
+                    .min(total.saturating_sub(1));
             }
         }
     }
@@ -1571,11 +2006,104 @@ impl App {
         let current = self.editor.buffer.cursor_row().unwrap_or(0);
         let wanted = current.clamp(first.min(last), last);
         if wanted != current {
-            let column = self.editor.buffer.cursor_column().unwrap_or(0);
-            let row = self.editor.buffer.rows[wanted];
-            self.editor.buffer.cursor = row.start.saturating_add(column).min(row.end);
-            self.editor.refresh_visual();
+            self.place_cursor_on_row(wanted);
         }
+    }
+
+    /// Moves the cursor to `row`, keeping the column it was already in.
+    fn place_cursor_on_row(&mut self, row: usize) {
+        let rows = self.editor.buffer.rows.len();
+        if rows == 0 {
+            return;
+        }
+        let column = self.editor.buffer.cursor_column().unwrap_or(0);
+        let bounds = self.editor.buffer.rows[row.min(rows - 1)];
+        self.editor.buffer.cursor = bounds.start.saturating_add(column).min(bounds.end);
+        self.editor.refresh_visual();
+    }
+
+    /// How many buffer rows the window last had room for.
+    ///
+    /// Before the first frame there is no answer, and a page has to be some
+    /// size, so an ordinary terminal is assumed until the renderer reports.
+    fn window_rows(&self) -> usize {
+        if self.viewport.rows == 0 {
+            ASSUMED_ROWS
+        } else {
+            self.viewport.rows
+        }
+    }
+
+    /// Vim's Ctrl-F, Ctrl-B, Ctrl-D, Ctrl-U, Ctrl-E and Ctrl-Y, reporting
+    /// whether the key was one of them.
+    fn scroll_command(&mut self, code: u8, count: usize) -> bool {
+        let rows = self.window_rows();
+        // Vim leaves two lines of the old screen behind when it pages, so
+        // the reader has something to find their place against.
+        let page = rows.saturating_sub(2).max(1);
+        let half = (rows / 2).max(1);
+        let step =
+            |amount: usize| isize::try_from(amount.saturating_mul(count)).unwrap_or(isize::MAX);
+        match code {
+            // Paging takes the cursor along, so it keeps its place on screen.
+            6 => self.scroll_with_cursor(step(page)),
+            2 => self.scroll_with_cursor(-step(page)),
+            4 => self.scroll_with_cursor(step(half)),
+            21 => self.scroll_with_cursor(-step(half)),
+            // Scrolling moves the view under a cursor that stays where it is
+            // until the view would push it off the screen.
+            5 => self.scroll_lines(step(1)),
+            25 => self.scroll_lines(-step(1)),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Moves the view and the cursor by the same amount, which is what makes
+    /// vim's paging keys feel like turning a page.
+    fn scroll_with_cursor(&mut self, delta: isize) {
+        let rows = self.editor.buffer.rows.len();
+        if rows == 0 {
+            return;
+        }
+        let current = self.editor.buffer.cursor_row().unwrap_or(0);
+        let wanted = if delta < 0 {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current.saturating_add(delta.unsigned_abs()).min(rows - 1)
+        };
+        self.viewport.scroll_by(delta, rows);
+        self.place_cursor_on_row(wanted);
+        self.pull_cursor_into_view();
+    }
+
+    /// Vim's Ctrl-A and Ctrl-X.  A count multiplies the step, so `5<C-x>`
+    /// takes five off the number under the cursor.
+    fn step_number(&mut self, count: usize, up: bool) {
+        self.editor.leader = Leader::None;
+        let magnitude = i64::try_from(count).unwrap_or(i64::MAX);
+        let delta = if up { magnitude } else { -magnitude };
+        if !self.editor.adjust_number(delta) {
+            self.set_message("No number under the cursor");
+        }
+    }
+
+    /// Vim's Ctrl-G: which file this is, how long it is, and how far down it
+    /// the cursor has got.
+    fn report_file_status(&mut self) {
+        let rows = self.editor.buffer.rows.len();
+        let row = self.editor.buffer.cursor_row().unwrap_or(0);
+        let percent = row
+            .saturating_add(1)
+            .saturating_mul(100)
+            .checked_div(rows)
+            .unwrap_or(0);
+        let name = self.filename.display();
+        let modified = if self.saved { "" } else { " [Modified]" };
+        let readonly = if self.readonly { " [RO]" } else { "" };
+        self.set_message(format!(
+            "\"{name}\"{modified}{readonly} {rows} lines --{percent}%--"
+        ));
     }
 
     /// The pending-input hint for the prompt line: the count being typed, or
@@ -1640,7 +2168,7 @@ impl App {
         self.recent_open = false;
     }
 
-    /// Answers the unsaved-buffer prompt raised by Ctrl-N or Ctrl-R.
+    /// Answers the unsaved-buffer prompt raised by Ctrl-N or Ctrl-P.
     fn save_prompt_input(&mut self, input: Input, pane: Pane) -> Vec<AppEffect> {
         self.save_prompt = None;
         match input {
@@ -1875,6 +2403,309 @@ mod tests {
             assert!(app.handle(Input::Byte(byte)).is_empty());
         }
         app.handle(Input::Enter)
+    }
+
+    /// A buffer of numbered lines, tall enough for the paging keys to have
+    /// somewhere to go.
+    fn tall(rows: usize) -> App {
+        let text = (0..rows)
+            .map(|row| format!("line{row}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut app = App::new(text.into_bytes(), PathBuf::from("file"));
+        app.viewport = Viewport {
+            rows: 10,
+            ..Viewport::default()
+        };
+        app
+    }
+
+    fn cursor_row(app: &App) -> usize {
+        app.editor.buffer.cursor_row().unwrap_or(0)
+    }
+
+    #[test]
+    fn control_r_redoes_now_that_it_is_no_longer_the_recent_picker() {
+        let mut app = App::new(b"abcd".to_vec(), PathBuf::from("file"));
+        app.editor.buffer.cursor = 1;
+        assert!(app.handle(Input::Byte(b'x')).is_empty());
+        assert_eq!(app.editor.buffer.data, b"acd");
+
+        assert!(app.handle(Input::Byte(b'u')).is_empty());
+        assert_eq!(app.editor.buffer.data, b"abcd");
+
+        assert!(app.handle(Input::Control(18)).is_empty());
+        assert_eq!(app.editor.buffer.data, b"acd");
+        assert!(!app.recent_open);
+    }
+
+    #[test]
+    fn paging_keys_move_the_view_and_the_cursor_together() {
+        let mut app = tall(40);
+
+        // Ctrl-F keeps two lines of the old screen, so a ten-row window
+        // advances by eight.
+        assert!(app.handle(Input::Control(6)).is_empty());
+        assert_eq!((app.viewport.row, cursor_row(&app)), (8, 8));
+
+        // Ctrl-D is half a window.
+        assert!(app.handle(Input::Control(4)).is_empty());
+        assert_eq!((app.viewport.row, cursor_row(&app)), (13, 13));
+
+        assert!(app.handle(Input::Control(21)).is_empty());
+        assert_eq!((app.viewport.row, cursor_row(&app)), (8, 8));
+
+        assert!(app.handle(Input::Control(2)).is_empty());
+        assert_eq!((app.viewport.row, cursor_row(&app)), (0, 0));
+    }
+
+    #[test]
+    fn control_e_and_control_y_move_the_view_under_a_cursor_that_stays_put() {
+        let mut app = tall(40);
+        app.editor.buffer.cursor = app.editor.buffer.rows[5].start;
+
+        // The cursor is still on screen, so only the view moves.
+        assert!(app.handle(Input::Control(5)).is_empty());
+        assert_eq!((app.viewport.row, cursor_row(&app)), (1, 5));
+
+        // A count scrolls that many lines, and the cursor is pushed along
+        // only once the view would leave it behind.
+        for byte in b"6" {
+            assert!(app.handle(Input::Byte(*byte)).is_empty());
+        }
+        assert!(app.handle(Input::Control(5)).is_empty());
+        assert_eq!((app.viewport.row, cursor_row(&app)), (7, 7));
+
+        assert!(app.handle(Input::Control(25)).is_empty());
+        assert_eq!((app.viewport.row, cursor_row(&app)), (6, 7));
+    }
+
+    #[test]
+    fn control_a_and_control_x_step_the_number_under_the_cursor() {
+        let mut app = App::new(b"x = 41".to_vec(), PathBuf::from("file"));
+        assert!(app.handle(Input::Control(1)).is_empty());
+        assert_eq!(app.editor.buffer.data, b"x = 42");
+
+        for byte in b"5" {
+            assert!(app.handle(Input::Byte(*byte)).is_empty());
+        }
+        assert!(app.handle(Input::Control(24)).is_empty());
+        assert_eq!(app.editor.buffer.data, b"x = 37");
+
+        let mut wordy = App::new(b"nothing".to_vec(), PathBuf::from("file"));
+        assert!(wordy.handle(Input::Control(1)).is_empty());
+        assert_eq!(
+            wordy.commands.message.as_deref(),
+            Some("No number under the cursor")
+        );
+    }
+
+    #[test]
+    fn control_g_reports_the_file_and_control_l_asks_for_a_redraw() {
+        let mut app = App::new(b"a\nb\nc".to_vec(), PathBuf::from("file"));
+        assert!(app.handle(Input::Control(7)).is_empty());
+        assert_eq!(
+            app.commands.message.as_deref(),
+            Some("\"file\" 3 lines --33%--")
+        );
+
+        assert_eq!(app.handle(Input::Control(12)), [AppEffect::Redraw]);
+        assert_eq!(app.commands.message, None);
+
+        make_dirty(&mut app);
+        assert!(app.handle(Input::Control(7)).is_empty());
+        assert!(
+            app.commands
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("[Modified]"))
+        );
+    }
+
+    #[test]
+    fn control_v_selects_a_rectangle_and_switches_an_existing_selection() {
+        let mut app = App::new(b"abcd\nefgh".to_vec(), PathBuf::from("file"));
+        assert!(app.handle(Input::Control(22)).is_empty());
+        assert_eq!(app.editor.mode, Mode::Visual);
+        assert!(app.editor.visual.kind.is_blockwise());
+
+        // A second Ctrl-V leaves Visual mode, the way a second `v` does.
+        assert!(app.handle(Input::Control(22)).is_empty());
+        assert_eq!(app.editor.mode, Mode::Normal);
+
+        // `v` first, then Ctrl-V, turns a charwise selection into a block.
+        assert!(app.handle(Input::Byte(b'v')).is_empty());
+        assert!(app.handle(Input::Control(22)).is_empty());
+        assert!(app.editor.visual.kind.is_blockwise());
+        assert!(app.handle(Input::Byte(b'j')).is_empty());
+        assert!(app.handle(Input::Byte(b'l')).is_empty());
+        assert!(app.handle(Input::Byte(b'd')).is_empty());
+        assert_eq!(app.editor.buffer.data, b"cd\ngh");
+    }
+
+    #[test]
+    fn control_w_swallows_the_window_command_it_prefixes() {
+        let mut app = App::new(b"abcd".to_vec(), PathBuf::from("file"));
+        assert!(app.handle(Input::Control(23)).is_empty());
+        // Without the prefix this `v` would start Visual mode.
+        assert!(app.handle(Input::Byte(b'v')).is_empty());
+        assert_eq!(app.editor.mode, Mode::Normal);
+        assert_eq!(
+            app.commands.message.as_deref(),
+            Some("Cano has one window; splits are not supported")
+        );
+
+        // Escape cancels the prefix without complaining about it.
+        app.commands.message = None;
+        assert!(app.handle(Input::Control(23)).is_empty());
+        assert!(app.handle(Input::Escape).is_empty());
+        assert_eq!(app.commands.message, None);
+    }
+
+    #[test]
+    fn insert_mode_control_keys_edit_without_leaving_insert() {
+        let mut app = App::new(b"    one two".to_vec(), PathBuf::from("file"));
+        app.commands.indent = 2;
+        app.editor.indent = 2;
+        assert!(app.handle(Input::Byte(b'A')).is_empty());
+
+        assert!(app.handle(Input::Control(23)).is_empty());
+        assert_eq!(app.editor.buffer.data, b"    one ");
+
+        assert!(app.handle(Input::Control(8)).is_empty());
+        assert_eq!(app.editor.buffer.data, b"    one");
+
+        assert!(app.handle(Input::Control(20)).is_empty());
+        assert_eq!(app.editor.buffer.data, b"      one");
+
+        assert!(app.handle(Input::Control(4)).is_empty());
+        assert_eq!(app.editor.buffer.data, b"    one");
+
+        assert!(app.handle(Input::Control(21)).is_empty());
+        assert_eq!(app.editor.buffer.data, b"    ");
+        assert_eq!(app.editor.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn control_n_and_control_p_cycle_completions_and_come_back_to_what_was_typed() {
+        let mut app = App::new(b"value verify\n".to_vec(), PathBuf::from("file"));
+        app.editor.buffer.cursor = app.editor.buffer.data.len();
+        assert!(app.handle(Input::Byte(b'i')).is_empty());
+        assert!(app.handle(Input::Byte(b'v')).is_empty());
+
+        assert!(app.handle(Input::Control(14)).is_empty());
+        assert_eq!(app.editor.buffer.data, b"value verify\nvalue");
+        assert_eq!(app.commands.message.as_deref(), Some("match 1 of 2"));
+
+        assert!(app.handle(Input::Control(14)).is_empty());
+        assert_eq!(app.editor.buffer.data, b"value verify\nverify");
+
+        // Past the last candidate the cycle hands back the typed prefix.
+        assert!(app.handle(Input::Control(14)).is_empty());
+        assert_eq!(app.editor.buffer.data, b"value verify\nv");
+
+        // Ctrl-P walks the same list the other way.
+        assert!(app.handle(Input::Control(16)).is_empty());
+        assert_eq!(app.editor.buffer.data, b"value verify\nverify");
+
+        // Typing ends the cycle, so the next Ctrl-N starts over.
+        assert!(app.handle(Input::Escape).is_empty());
+        assert!(app.editor.buffer.data.ends_with(b"verify"));
+    }
+
+    #[test]
+    fn completion_reports_when_there_is_nothing_to_offer() {
+        let mut app = App::new(b"alpha".to_vec(), PathBuf::from("file"));
+        assert!(app.handle(Input::Byte(b'A')).is_empty());
+        assert!(app.handle(Input::Control(14)).is_empty());
+        assert_eq!(app.commands.message.as_deref(), Some("Pattern not found"));
+        assert_eq!(app.editor.buffer.data, b"alpha");
+    }
+
+    #[test]
+    fn control_o_runs_one_normal_command_and_returns_to_insert() {
+        let mut app = App::new(b"one\ntwo".to_vec(), PathBuf::from("file"));
+        assert!(app.handle(Input::Byte(b'i')).is_empty());
+        assert!(app.handle(Input::Control(15)).is_empty());
+        assert_eq!(app.editor.mode, Mode::Normal);
+
+        assert!(app.handle(Input::Byte(b'$')).is_empty());
+        assert_eq!(app.editor.mode, Mode::Insert);
+        assert_eq!(app.editor.buffer.cursor, 3);
+
+        // A command spelled with more than one key keeps the arming until it
+        // has actually run.
+        assert!(app.handle(Input::Control(15)).is_empty());
+        assert!(app.handle(Input::Byte(b'd')).is_empty());
+        assert_eq!(app.editor.mode, Mode::Normal);
+        assert!(app.handle(Input::Byte(b'd')).is_empty());
+        assert_eq!(app.editor.buffer.data, b"two");
+        assert_eq!(app.editor.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn the_prompt_remembers_what_has_been_run_and_the_arrows_walk_it() {
+        let mut app = App::new(b"text".to_vec(), PathBuf::from("file"));
+        assert!(ex(&mut app, b"one").is_empty());
+        assert!(ex(&mut app, b"two").is_empty());
+        assert_eq!(app.command_history, vec![b"one".to_vec(), b"two".to_vec()]);
+
+        assert!(app.handle(Input::Byte(b':')).is_empty());
+        assert!(app.handle(Input::Up).is_empty());
+        assert_eq!(app.prompt, b"two");
+        assert!(app.handle(Input::Up).is_empty());
+        assert_eq!(app.prompt, b"one");
+        assert!(app.handle(Input::Down).is_empty());
+        assert_eq!(app.prompt, b"two");
+        // Past the newest entry the prompt is empty again, ready to type in.
+        assert!(app.handle(Input::Down).is_empty());
+        assert_eq!(app.prompt, b"");
+        assert!(app.handle(Input::Escape).is_empty());
+    }
+
+    #[test]
+    fn control_f_lists_the_history_and_enter_runs_the_entry_under_the_cursor() {
+        let mut app = App::new(b"text".to_vec(), PathBuf::from("file"));
+        assert!(ex(&mut app, b"one").is_empty());
+        assert!(ex(&mut app, b"two").is_empty());
+
+        assert!(app.handle(Input::Byte(b':')).is_empty());
+        assert!(app.handle(Input::Control(6)).is_empty());
+        // Newest first, so the likeliest entry is already selected.
+        assert_eq!(app.history_open, Some(Mode::Command));
+        assert_eq!(app.history_list, vec![b"two".to_vec(), b"one".to_vec()]);
+
+        assert!(app.handle(Input::Byte(b'j')).is_empty());
+        assert_eq!(app.history_cursor, 1);
+        assert!(app.handle(Input::Enter).is_empty());
+
+        assert_eq!(app.history_open, None);
+        assert_eq!(app.editor.mode, Mode::Normal);
+        // Running it again moves it to the front of the history.
+        assert_eq!(app.command_history, vec![b"two".to_vec(), b"one".to_vec()]);
+
+        // Escape closes the picker without running anything.
+        assert!(app.handle(Input::Byte(b':')).is_empty());
+        assert!(app.handle(Input::Control(6)).is_empty());
+        assert!(app.handle(Input::Escape).is_empty());
+        assert_eq!(app.history_open, None);
+    }
+
+    #[test]
+    fn searches_keep_their_own_history() {
+        let mut app = App::new(b"alpha beta".to_vec(), PathBuf::from("file"));
+        assert!(app.handle(Input::Byte(b'/')).is_empty());
+        for byte in b"beta" {
+            assert!(app.handle(Input::Byte(*byte)).is_empty());
+        }
+        assert!(app.handle(Input::Enter).is_empty());
+        assert_eq!(app.search_history, vec![b"beta".to_vec()]);
+        assert!(app.command_history.is_empty());
+
+        assert!(app.handle(Input::Byte(b'/')).is_empty());
+        assert!(app.handle(Input::Up).is_empty());
+        assert_eq!(app.prompt, b"beta");
+        assert!(app.handle(Input::Escape).is_empty());
     }
 
     fn make_dirty(app: &mut App) {
@@ -2490,7 +3321,7 @@ b"
     }
 
     #[test]
-    fn control_r_picks_a_recent_file_and_records_what_it_opens() {
+    fn control_p_picks_a_recent_file_and_records_what_it_opens() {
         let root = std::env::temp_dir().join(format!(
             "cano-fresh-app-recent-{}-{}",
             std::process::id(),
@@ -2507,13 +3338,13 @@ b"
 
         let mut app = App::new(b"start".to_vec(), PathBuf::from("start.txt"));
         // Nothing to show yet, so the picker reports instead of opening blank.
-        assert!(app.handle(Input::Control(18)).is_empty());
+        assert!(app.handle(Input::Control(16)).is_empty());
         assert!(!app.recent_open);
         assert_eq!(app.commands.message.as_deref(), Some("No recent files"));
 
         app.record_recent(&older);
         app.record_recent(&newer);
-        assert!(app.handle(Input::Control(18)).is_empty());
+        assert!(app.handle(Input::Control(16)).is_empty());
         assert!(app.recent_open);
         assert_eq!(app.recent.cursor, 0);
 
@@ -2557,7 +3388,7 @@ b"
         app.readonly = true;
         app.record_recent(&file);
 
-        assert!(app.handle(Input::Control(18)).is_empty());
+        assert!(app.handle(Input::Control(16)).is_empty());
         assert!(app.handle(Input::Enter).is_empty());
 
         assert_eq!(app.editor.buffer.data, b"body");
@@ -2676,7 +3507,7 @@ b"
         assert!(app.handle(Input::Control(14)).is_empty());
         assert!(app.explorer.is_none());
 
-        // `<leader>n` is Ctrl-N, and `<leader>r` is Ctrl-R.
+        // `<leader>n` is Ctrl-N, and `<leader>r` is Ctrl-P.
         assert!(app.handle(Input::Byte(b' ')).is_empty());
         assert!(app.handle(Input::Byte(b'n')).is_empty());
         assert!(app.explorer.is_some());
@@ -2829,7 +3660,7 @@ b"
             std::fs::write(&path, b"body").unwrap();
             app.record_recent(&path);
         }
-        assert!(app.handle(Input::Control(18)).is_empty());
+        assert!(app.handle(Input::Control(16)).is_empty());
         app.viewport = Viewport {
             rows: 5,
             content_x: 5,
@@ -2873,7 +3704,7 @@ b"
         let mut app = App::new(b"start".to_vec(), PathBuf::from("start.txt"));
         app.record_recent(&first);
         app.record_recent(&second);
-        assert!(app.handle(Input::Control(18)).is_empty());
+        assert!(app.handle(Input::Control(16)).is_empty());
         shown(&mut app, 5);
 
         // One click selects without opening.
@@ -3449,7 +4280,7 @@ b"
     }
 
     #[test]
-    fn control_r_toggles_and_shares_the_pane_with_the_explorer() {
+    fn control_p_toggles_and_shares_the_pane_with_the_explorer() {
         let root = std::env::temp_dir().join(format!(
             "cano-fresh-app-panes-{}-{}",
             std::process::id(),
@@ -3465,18 +4296,18 @@ b"
         let mut app = App::new(b"start".to_vec(), PathBuf::from("start.txt"));
         app.record_recent(&file);
 
-        assert!(app.handle(Input::Control(18)).is_empty());
+        assert!(app.handle(Input::Control(16)).is_empty());
         assert!(app.recent_open);
-        // Ctrl-R again closes it, and Escape does too.
-        assert!(app.handle(Input::Control(18)).is_empty());
+        // Ctrl-P again closes it, and Escape does too.
+        assert!(app.handle(Input::Control(16)).is_empty());
         assert!(!app.recent_open);
-        assert!(app.handle(Input::Control(18)).is_empty());
+        assert!(app.handle(Input::Control(16)).is_empty());
         assert!(app.handle(Input::Escape).is_empty());
         assert!(!app.recent_open);
 
         // Only one full-pane list can be up at a time.
         app.open_explorer(&root).unwrap();
-        assert!(app.handle(Input::Control(18)).is_empty());
+        assert!(app.handle(Input::Control(16)).is_empty());
         assert!(app.recent_open);
         assert!(app.explorer.is_none());
         assert!(app.handle(Input::Control(14)).is_empty());
@@ -3505,7 +4336,7 @@ b"
         std::fs::remove_file(&file).unwrap();
 
         // Pruning happens as the picker opens, so the only entry disappears.
-        assert!(app.handle(Input::Control(18)).is_empty());
+        assert!(app.handle(Input::Control(16)).is_empty());
         assert!(!app.recent_open);
         assert!(app.recent.is_empty());
         assert_eq!(app.commands.message.as_deref(), Some("No recent files"));

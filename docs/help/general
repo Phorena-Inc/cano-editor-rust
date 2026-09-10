@@ -19,7 +19,8 @@ Global keys
   Ctrl-Q   quit from any mode (refuses if there are unsaved changes)
   Ctrl-S   save and quit (Normal and Insert modes)
   Ctrl-N   toggle explorer in Normal mode (Escape closes it)
-  Ctrl-R   toggle the recent-file list in Normal mode (Escape closes it)
+  Ctrl-P   toggle the recent-file list in Normal mode (Escape closes it)
+  Ctrl-R   redo in Normal mode (U does the same)
   Ctrl-M   toggle markdown display in Normal mode (so does Enter)
   Ctrl-C   acts as Escape in every mode
   Ctrl-Z   suspend to the shell in Normal mode; fg returns (not on Windows)
@@ -82,12 +83,51 @@ Backups
   but does not stop the save. Browse them with the explorer.
 
 Recent files
-  Ctrl-R lists the files opened before, most recent first. j/k and the arrows
+  Ctrl-P lists the files opened before, most recent first. j/k and the arrows
   move, Enter opens, Escape closes. It shares the pane with the explorer. The
   list is kept beside the configuration file (~/.config/cano/recent by
   default), holds 50 entries, and skips files that no longer exist. Both keys
   ask before leaving an unsaved buffer: y writes then opens, n opens and keeps
   the changes, Escape stays put. [space] n and [space] r do the same.
+
+Scrolling and paging
+  Ctrl-F and Ctrl-B move a screen, Ctrl-D and Ctrl-U half a screen, Ctrl-E
+  and Ctrl-Y one line with the cursor left where it is. A count multiplies
+  all six. Paging keeps two lines of the old screen to find your place
+  against, and the cursor is only carried along when the view would leave
+  it behind. They are Normal-mode keys, unlike in vim: Ctrl-E already
+  toggles line comments over a Visual selection, and one key cannot mean
+  both.
+
+Numbers
+  Ctrl-A adds one to the number at or after the cursor and Ctrl-X takes one
+  off; a count changes the step. Decimal and 0x hexadecimal are read. Zero
+  padding survives, a leading - belongs to the number, hex keeps its width
+  and the case of its digits, and the cursor lands on the last digit.
+
+Blockwise Visual
+  Ctrl-V selects a rectangle instead of a run of bytes; in Visual mode it
+  turns the selection already made into one. d and x cut the rectangle in a
+  single undo step and y copies it, both keeping the shape of short lines as
+  the blank they are. The clipboard has no shape of its own, so p puts the
+  rows back as lines rather than as a column. > < and = act on every row the
+  rectangle touches.
+
+Completion
+  In Insert mode Ctrl-N and Ctrl-P complete the keyword in front of the
+  cursor from the words already in the buffer, nearest first and wrapping at
+  the end of the file. Repeating the key walks the list; walking off either
+  end puts back what was typed. The status line counts your place.
+
+Prompt history
+  The : and / prompts each remember the last 50 lines they ran. Up and down
+  walk that history, and Ctrl-F opens it as a list -- newest first, j/k to
+  move, Enter to run the entry, Escape to close. A line run again moves to
+  the front rather than being stored twice. The history is per session.
+
+Windows
+  Ctrl-W is vim's window prefix. Cano has one window and no splits, so the
+  prefix takes the key that follows it and says so instead of letting it act.
 
 Jump motions
   s and t are vim-easymotion's find motions. Each asks for one character,

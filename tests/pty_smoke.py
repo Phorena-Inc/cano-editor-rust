@@ -137,6 +137,79 @@ def command(session, name):
     session.send(b":" + name + b"\r")
 
 
+VIM_KEYS = b"alpha 41 beta\nabcd\nefgh\nijkl\nvalue verify\n"
+
+
+def vim_keys(binary, home, work):
+    """The Control-key commands, driven through a real terminal.
+
+    Most of them are covered by the unit tests, which drive the same
+    handlers directly.  What only a terminal can show is whether a key that
+    reaches outside the buffer behaves: Ctrl-L repaints the screen, and the
+    obvious way to do that asks the terminal where its cursor is and waits
+    on the same input the editor reads keys from.
+    """
+    target = os.path.join(work, "keys.txt")
+
+    def session_with(keys, expect):
+        with open(target, "wb") as handle:
+            handle.write(VIM_KEYS)
+        with PtySession(binary, home, work, target) as session:
+            read_until(session.master, (b"keys.txt", b"alpha"))
+            for chunk in keys:
+                drain(session.master, 0.05)
+                session.send(chunk)
+                time.sleep(0.1)
+            session.send(b":wq\r")
+            session.wait_exit()
+        wait_file(target, expect)
+
+    # Ctrl-A adds one; a count multiplies what Ctrl-X takes off.
+    session_with(
+        [b"\x01", b"3", b"\x18"],
+        b"alpha 39 beta\nabcd\nefgh\nijkl\nvalue verify\n",
+    )
+    # Ctrl-R redoes what u took back.
+    session_with(
+        [b"x", b"u", b"\x12"],
+        b"lpha 41 beta\nabcd\nefgh\nijkl\nvalue verify\n",
+    )
+    # Ctrl-V cuts a rectangle out of the three short rows.
+    session_with(
+        [b"j", b"l", b"\x16", b"jj", b"l", b"d"],
+        b"alpha 41 beta\nad\neh\nil\nvalue verify\n",
+    )
+    # Insert mode: Ctrl-W takes back a word, Ctrl-N completes one, and
+    # Ctrl-O runs a single Normal-mode command without leaving Insert.
+    session_with(
+        [b"A", b"\x17", b"\x1b"],
+        b"alpha 41 \nabcd\nefgh\nijkl\nvalue verify\n",
+    )
+    session_with(
+        [b"jjjj", b"A", b" ver", b"\x0e", b"\x1b"],
+        b"alpha 41 beta\nabcd\nefgh\nijkl\nvalue verify verify\n",
+    )
+    session_with(
+        [b"i", b"\x0f", b"$", b"!", b"\x1b"],
+        b"alpha 41 beta!\nabcd\nefgh\nijkl\nvalue verify\n",
+    )
+
+    # Ctrl-L has to repaint without asking the terminal anything: a query
+    # that goes unanswered would hang the editor here rather than redraw.
+    with open(target, "wb") as handle:
+        handle.write(VIM_KEYS)
+    with PtySession(binary, home, work, target) as session:
+        read_until(session.master, (b"keys.txt", b"alpha"))
+        session.send(b"\x07")
+        read_until(session.master, b"lines --")
+        session.send(b"\x0c")
+        # Cells that are blank are skipped rather than written, so the
+        # spaces between words never reach the terminal: match on words.
+        read_until(session.master, (b"alpha", b"verify"))
+        session.send(b"\x11")
+        session.wait_exit()
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit("usage: pty_smoke.py /path/to/cano")
@@ -228,7 +301,12 @@ def main():
             session.wait_exit()
             wait_file(discard, ORIGINAL)
 
-    print("PASS: resize, :q refusal, :w, :wq, :q!, -h/--help help page, comment toggle")
+        vim_keys(binary, home, work)
+
+    print(
+        "PASS: resize, :q refusal, :w, :wq, :q!, -h/--help help page,"
+        " comment toggle, vim Control keys"
+    )
 
 
 if __name__ == "__main__":

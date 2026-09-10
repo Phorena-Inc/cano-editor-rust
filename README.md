@@ -88,7 +88,7 @@ Command - For executing commands
 |Normal| yy             | Yank current line                               |
 |Normal| p              | Paste                                           |
 |Normal| u              | Undo                                            |
-|Normal| U              | Redo                                            |
+|Normal| U / Ctrl + r   | Redo                                            |
 |Normal| /              | Enter Search mode                               |
 |Normal| n              | Jump to next search                             |
 |Normal| N              | Jump to previous search                         |
@@ -99,9 +99,9 @@ Command - For executing commands
 |Normal| (n) + d        | Delete n lines                                  |
 |Normal| (n) + g / G    | Go to line n                                    |
 |Normal| Ctrl + n       | Toggle file explorer (Esc closes it)            |
-|Normal| Ctrl + r       | Toggle the recent-file list (Esc closes it)     |
+|Normal| Ctrl + p       | Toggle the recent-file list (Esc closes it)     |
 |Normal| [space] n      | Leader mapping for Ctrl + n                     |
-|Normal| [space] r      | Leader mapping for Ctrl + r                     |
+|Normal| [space] r      | Leader mapping for Ctrl + p                     |
 |Normal| Ctrl + m       | Toggle markdown display (Enter is the same key) |
 |Normal/Visual| s{char} | EasyMotion: jump to any {char} on screen, forward or back |
 |Normal| t{char}        | EasyMotion: jump just before the next {char} (forward only) |
@@ -114,6 +114,92 @@ Command - For executing commands
 |Visual| [space] e      | Leader spelling of Ctrl + e                     |
 |Normal/Visual| Arrow keys | Move like h/j/k/l                            |
 |Insert| Tab            | Insert the configured indentation               |
+
+### Scrolling and paging
+A count works on all six: `3` then `Ctrl + e` scrolls three lines.
+
+|Mode  | Keybind        | Action                                          |
+|------|----------------|-------------------------------------------------|
+|Normal| Ctrl + f       | Forward one screen                              |
+|Normal| Ctrl + b       | Back one screen                                 |
+|Normal| Ctrl + d       | Forward half a screen                           |
+|Normal| Ctrl + u       | Back half a screen                              |
+|Normal| Ctrl + e       | Scroll one line down, leaving the cursor where it is |
+|Normal| Ctrl + y       | Scroll one line up, leaving the cursor where it is |
+
+`Ctrl + f` and `Ctrl + b` keep two lines of the old screen, so there is always
+something to find your place against. All six bring the cursor along only as
+far as they must: it moves when the view would otherwise leave it behind.
+
+They are Normal-mode keys here, unlike in vim, where they are motions in
+Visual mode too. `Ctrl + e` already toggles line comments over a selection,
+and one key cannot mean both — so rather than make Visual mode the one place
+`Ctrl + e` does something else, scrolling stays out of it entirely.
+
+### Editing and information
+|Mode  | Keybind        | Action                                          |
+|------|----------------|-------------------------------------------------|
+|Normal| Ctrl + a       | Add one to the number at or after the cursor    |
+|Normal| Ctrl + x       | Take one off it (`5` then `Ctrl + x` takes five) |
+|Normal| Ctrl + g       | Report the file, its length, and how far down it the cursor is |
+|Normal| Ctrl + l       | Redraw the screen and clear the message line    |
+|Normal| Ctrl + v       | Enter blockwise Visual mode                     |
+|Visual| Ctrl + v       | Turn the selection into a rectangle, or leave Visual mode if it already is |
+
+`Ctrl + v` selects a rectangle rather than a run of bytes. `d` and `x` cut it
+in a single undo step and `y` copies it, both keeping the shape of a line too
+short to reach the block as the blank it is. Cano's clipboard has no shape of
+its own, so `p` puts those rows back as lines rather than as a column. `>`,
+`<` and `=` act on every row the rectangle touches.
+
+`Ctrl + a` and `Ctrl + x` read decimal and `0x` hexadecimal — vim's default
+`nrformats` without its binary and octal forms. Zero padding survives (`007`
+counts up to `008`), a leading `-` is part of the number (`-1` counts up to
+`0`), hex keeps its width and the case of its digits, and the cursor lands on
+the last digit of the answer.
+
+### Insert mode
+|Mode  | Keybind        | Action                                          |
+|------|----------------|-------------------------------------------------|
+|Insert| Ctrl + h       | Delete the character before the cursor           |
+|Insert| Ctrl + w       | Delete the word before the cursor                |
+|Insert| Ctrl + u       | Delete back to the first non-blank; again for the indent |
+|Insert| Ctrl + t       | Indent the current line one shiftwidth           |
+|Insert| Ctrl + d       | Unindent the current line one shiftwidth         |
+|Insert| Ctrl + n       | Complete the word being typed from the buffer, forwards |
+|Insert| Ctrl + p       | The same, backwards                              |
+|Insert| Ctrl + o       | Run one Normal-mode command, then carry on typing |
+
+`Ctrl + n` and `Ctrl + p` take the keyword in front of the cursor and offer
+every distinct word in the buffer that extends it, nearest first and wrapping
+at the end of the file. Pressing the key again walks the list, and walking off
+either end puts back what you actually typed, so nothing is ever out of reach.
+The status line counts your place: `match 2 of 5`.
+
+`Ctrl + o` arms exactly one command, not one keystroke: `Ctrl + o` `d` `d`
+deletes the line and drops you back where you were typing. A command that
+chooses a mode of its own — `:`, `/`, `i` — keeps it instead.
+
+### Command line and search
+|Mode  | Keybind        | Action                                          |
+|------|----------------|-------------------------------------------------|
+|Command/Search| Up / Down | Walk the history for that prompt              |
+|Command/Search| Ctrl + f | Open the history as a list                    |
+|Command/Search| Ctrl + c | Abandon the line                              |
+
+Each prompt keeps its own history of the last 50 lines it ran, and a line run
+again moves to the front rather than being stored twice. `Ctrl + f` opens them
+newest first: `j`/`k` and the arrow keys move, Enter runs the entry under the
+cursor, and Esc closes the list. The mouse only moves the selection there —
+Enter is what runs a line, because a command run from the list can ask for a
+save or a quit.
+
+The history is per session; it is not written to disk.
+
+### Windows
+`Ctrl + w` is vim's window prefix. Cano has one window and no splits, so the
+prefix swallows the key that follows it and says so rather than let `Ctrl + w`
+`v` fall through and start Visual mode. Esc cancels it silently.
 
 ## Mouse
 The mouse is on by default and can be turned off with `:set-var mouse 0`, or
@@ -269,10 +355,13 @@ is reported — the unsaved edit is the thing at risk, not the copy. Browse the
 copies with the file explorer (`Ctrl + n`, then open `.backups/`).
 
 ## Recent files
-`Ctrl + r` opens a list of the files you have opened before, most recent first.
+`Ctrl + p` opens a list of the files you have opened before, most recent first.
 `j`/`k` and the arrow keys move through it, Enter opens the selection, and Esc
-or a second `Ctrl + r` closes it. It shares the pane with the file explorer, so
+or a second `Ctrl + p` closes it. It shares the pane with the file explorer, so
 opening one closes the other.
+
+It used to be `Ctrl + r`, which is vim's redo; the picker moved to `Ctrl + p`,
+where every other editor puts "open something I had open".
 
 If the buffer has unsaved changes, both keys ask `Save changes? (y/n, Esc
 cancels)` before leaving it: `y` writes the file and then opens the pane, `n`

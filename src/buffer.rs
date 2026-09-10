@@ -5,6 +5,15 @@
 //! newline belongs to the preceding row for cursor movement, while
 //! `start..end` is the visible row body.
 
+/// Whether a byte can be part of a word, for the keys that work on words.
+///
+/// Vim's default `iskeyword` for these is letters, digits and underscore.
+/// Every byte of a multi-byte character is counted in too, so a word written
+/// outside ASCII is still one word rather than a run of separators.
+pub fn is_keyword(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric() || byte >= 0x80
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Row {
     pub start: usize,
@@ -202,6 +211,58 @@ impl Buffer {
             end += 1;
         }
         Some((start, end))
+    }
+
+    /// Distinct keywords in the buffer that begin with `prefix`, in the
+    /// order vim's `i_CTRL-N` offers them.
+    ///
+    /// Vim searches forward from the cursor to the end of the file and then
+    /// wraps to the top, so the nearest word below is the first suggestion
+    /// and the ones above follow it.  The partial word being completed is
+    /// skipped: a word is never a completion of itself.
+    pub fn completions(&self, prefix: &[u8], cursor: usize) -> Vec<Vec<u8>> {
+        let mut ahead: Vec<Vec<u8>> = Vec::new();
+        let mut behind: Vec<Vec<u8>> = Vec::new();
+        let mut index = 0usize;
+        while index < self.data.len() {
+            if !is_keyword(self.data[index]) {
+                index += 1;
+                continue;
+            }
+            let start = index;
+            while index < self.data.len() && is_keyword(self.data[index]) {
+                index += 1;
+            }
+            // The run the cursor is standing in is the word being typed.
+            if (start..=index).contains(&cursor) {
+                continue;
+            }
+            let word = &self.data[start..index];
+            if word.len() <= prefix.len() || !word.starts_with(prefix) {
+                continue;
+            }
+            let list = if start >= cursor {
+                &mut ahead
+            } else {
+                &mut behind
+            };
+            if !list.iter().any(|existing| existing == word) {
+                list.push(word.to_vec());
+            }
+        }
+        behind.retain(|word| !ahead.contains(word));
+        ahead.append(&mut behind);
+        ahead
+    }
+
+    /// The keyword bytes immediately before `index`, which is the prefix a
+    /// completion has to extend.
+    pub fn keyword_before(&self, index: usize) -> &[u8] {
+        let mut start = index.min(self.data.len());
+        while start > 0 && is_keyword(self.data[start - 1]) {
+            start -= 1;
+        }
+        &self.data[start..index.min(self.data.len())]
     }
 
     pub fn cursor_row(&self) -> Option<usize> {

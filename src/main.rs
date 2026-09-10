@@ -210,6 +210,9 @@ fn run() -> Result<u8, String> {
                         list: (app.commands.list != 0).then_some(&app.commands.listchars),
                         explorer: app.explorer.as_ref(),
                         recent: app.recent_open.then_some(&app.recent),
+                        history: app
+                            .history_open
+                            .map(|_| (app.history_list.as_slice(), app.history_cursor)),
                         syntax,
                         markdown: app.markdown,
                         message: app.commands.message.as_deref(),
@@ -245,6 +248,14 @@ fn run() -> Result<u8, String> {
         // have, and it has to happen before anything is drawn again.
         if effects.contains(&AppEffect::Suspend) {
             terminal.suspend().map_err(|error| error.to_string())?;
+        }
+        // Ctrl-L: throw away what the terminal is showing so the next frame
+        // is painted from nothing.  Ratatui otherwise sends only the cells
+        // that changed, which cannot repair a screen something else wrote
+        // over -- which is the whole reason to ask for a redraw.
+        if effects.contains(&AppEffect::Redraw) {
+            terminal.redraw().map_err(|error| error.to_string())?;
+            message_deadline = None;
         }
         let quit = apply_effects(&mut app, effects)?;
         // A pane held back by the save prompt opens only now that the write
@@ -366,8 +377,9 @@ fn apply_effects(app: &mut App, effects: Vec<AppEffect>) -> Result<bool, String>
             },
             AppEffect::Quit if !save_failed => quit = true,
             AppEffect::Quit => {}
-            // Handled by the caller, which is where the terminal lives.
-            AppEffect::Suspend => {}
+            // Both are handled by the caller, which is where the terminal
+            // lives.
+            AppEffect::Suspend | AppEffect::Redraw => {}
         }
     }
     Ok(quit)

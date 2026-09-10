@@ -1,4 +1,4 @@
-use crate::buffer::{Buffer, Row};
+use crate::buffer::{Buffer, is_keyword};
 use crate::history::{History, HistoryError, UndoKind, UndoRecord};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -35,15 +35,37 @@ pub enum Leader {
     Yank,
 }
 
+/// The shape of a visual selection: vim's `v`, `V` and `Ctrl-V`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VisualKind {
+    #[default]
+    Charwise,
+    Linewise,
+    /// A rectangle, addressed by the byte columns the anchor and the cursor
+    /// sit in rather than by one run of bytes.
+    Blockwise,
+}
+
+impl VisualKind {
+    pub fn is_linewise(self) -> bool {
+        matches!(self, Self::Linewise)
+    }
+
+    pub fn is_blockwise(self) -> bool {
+        matches!(self, Self::Blockwise)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct VisualSelection {
     pub start: usize,
     pub end: usize,
     /// Byte position where the selection was started.  Linewise updates
     /// derive `start`/`end` from the anchor row and the cursor row so the
-    /// selection always spans whole rows in either direction.
+    /// selection always spans whole rows in either direction, and a
+    /// blockwise rectangle is derived from it and the cursor the same way.
     pub anchor: usize,
-    pub linewise: bool,
+    pub kind: VisualKind,
 }
 
 #[derive(Clone, Debug)]
@@ -348,8 +370,8 @@ impl Editor {
             b'A' => self.enter_insert(InsertEntry::LineEnd),
             b'o' => self.open_line(true),
             b'O' => self.open_line(false),
-            b'v' => self.start_visual(false),
-            b'V' => self.start_visual(true),
+            b'v' => self.start_visual(VisualKind::Charwise),
+            b'V' => self.start_visual(VisualKind::Linewise),
             b'h' => self.buffer.move_left(),
             b'j' => self.buffer.move_down(),
             b'k' => self.buffer.move_up(),
@@ -525,24 +547,67 @@ impl Editor {
         }
     }
 
-    pub fn start_visual(&mut self, linewise: bool) {
-        if linewise {
+    pub fn start_visual(&mut self, kind: VisualKind) {
+        if kind.is_linewise() {
             let row = self.buffer.rows[self.buffer.cursor_row().unwrap_or(0)];
             self.visual = VisualSelection {
                 start: row.start,
                 end: row.end,
                 anchor: self.buffer.cursor,
-                linewise,
+                kind,
             };
         } else {
             self.visual = VisualSelection {
                 start: self.buffer.cursor,
                 end: self.buffer.cursor,
                 anchor: self.buffer.cursor,
-                linewise,
+                kind,
             };
         }
         self.mode = Mode::Visual;
+    }
+
+    /// The rows and byte columns a blockwise selection covers, inclusive at
+    /// both ends.
+    ///
+    /// Columns are byte offsets into their row rather than display columns,
+    /// so the rectangle the operators cut is exactly the one the highlight
+    /// draws even where a tab makes the two disagree on screen.
+    pub fn block_bounds(&self) -> Option<(usize, usize, usize, usize)> {
+        if !self.visual.kind.is_blockwise() {
+            return None;
+        }
+        let anchor_row = self.buffer.row_for_index(self.visual.anchor)?;
+        let cursor_row = self.buffer.row_for_index(self.visual.end)?;
+        let anchor_column = self
+            .visual
+            .anchor
+            .saturating_sub(self.buffer.rows[anchor_row].start);
+        let cursor_column = self
+            .visual
+            .end
+            .saturating_sub(self.buffer.rows[cursor_row].start);
+        Some((
+            anchor_row.min(cursor_row),
+            anchor_row.max(cursor_row),
+            anchor_column.min(cursor_column),
+            anchor_column.max(cursor_column),
+        ))
+    }
+
+    /// The byte range one row of a blockwise selection contributes.
+    ///
+    /// A row shorter than the rectangle contributes an empty range rather
+    /// than reaching into the next line.
+    fn block_row_range(&self, row: usize, left: usize, right: usize) -> (usize, usize) {
+        let bounds = self.buffer.rows[row];
+        let start = bounds.start.saturating_add(left).min(bounds.end);
+        let end = bounds
+            .start
+            .saturating_add(right)
+            .saturating_add(1)
+            .min(bounds.end);
+        (start, end)
     }
 
     fn visual_bounds(&self) -> (usize, usize) {
@@ -562,11 +627,19 @@ impl Editor {
                 self.mode = Mode::Normal;
                 self.visual = VisualSelection::default();
             }
+            b'd' | b'x' if self.visual.kind.is_blockwise() => {
+                self.delete_block();
+                self.mode = Mode::Normal;
+            }
+            b'y' if self.visual.kind.is_blockwise() => {
+                self.yank_block();
+                self.mode = Mode::Normal;
+            }
             b'd' | b'x' => {
                 let (start, end) = self.visual_bounds();
                 // Linewise deletion removes whole rows, so it consumes the
                 // trailing newline (or the preceding one on the final row).
-                let (start, end) = if self.visual.linewise {
+                let (start, end) = if self.visual.kind.is_linewise() {
                     if end < self.buffer.data.len() {
                         (start, end + 1)
                     } else {
@@ -651,7 +724,7 @@ impl Editor {
         if self.mode != Mode::Visual {
             return;
         }
-        if self.visual.linewise {
+        if self.visual.kind.is_linewise() {
             let anchor = self.buffer.row_for_index(self.visual.anchor).unwrap_or(0);
             let current = self.buffer.cursor_row().unwrap_or(0);
             let (first, last) = if anchor <= current {
@@ -666,55 +739,266 @@ impl Editor {
         }
     }
 
-    fn indent_visual(&mut self) {
-        let (start, end) = self.visual_bounds();
-        let first = self.buffer.row_for_index(start).unwrap_or(0);
-        let last = self.buffer.row_for_index(end).unwrap_or(first);
-        let indentation = if self.indent == 0 {
+    /// One shiftwidth of indentation, as the bytes it is written with.
+    fn indentation(&self) -> Vec<u8> {
+        if self.indent == 0 {
             vec![b'\t']
         } else {
             vec![b' '; self.indent]
-        };
-        for row in first..=last {
+        }
+    }
+
+    /// Adds or removes one shiftwidth at the start of `row`, reporting how
+    /// many bytes the row grew, or shrank when the count is negative.
+    ///
+    /// The cursor is used as scratch space by the deletion path, so a caller
+    /// that cares where it ends up has to put it back.
+    fn shift_row(&mut self, row: usize, right: bool) -> isize {
+        if right {
+            let indentation = self.indentation();
             let at = self.buffer.rows[row].start;
-            if self.buffer.insert_selection(at, &indentation) {
-                self.history.push_undo(UndoRecord::delete_multiple_exact(
-                    at,
-                    at.saturating_add(indentation.len()),
-                ));
+            if !self.buffer.insert_selection(at, &indentation) {
+                return 0;
             }
+            self.history.push_undo(UndoRecord::delete_multiple_exact(
+                at,
+                at.saturating_add(indentation.len()),
+            ));
+            return isize::try_from(indentation.len()).unwrap_or(0);
+        }
+        let mut removed = 0usize;
+        for _ in 0..self.indent.max(1) {
+            // Only spaces and tabs are indentation.  `is_ascii_whitespace`
+            // also covers CR and LF, and on a blank row the first byte is
+            // the row's own terminator: eating it would join the row to the
+            // next one and drop a row out from under the caller's loop.
+            let Some(at) = self.buffer.rows.get(row).map(|bounds| bounds.start) else {
+                break;
+            };
+            let Some(byte) = self
+                .buffer
+                .data
+                .get(at)
+                .copied()
+                .filter(|byte| matches!(byte, b' ' | b'\t'))
+            else {
+                break;
+            };
+            self.buffer.cursor = at;
+            if !self.buffer.delete_byte() {
+                break;
+            }
+            self.history
+                .push_undo(UndoRecord::insert_chars_exact(at, vec![byte]));
+            removed = removed.saturating_add(1);
+        }
+        -isize::try_from(removed).unwrap_or(0)
+    }
+
+    /// The rows a visual selection touches, whatever its shape.
+    fn selected_rows(&self) -> (usize, usize) {
+        let (start, end) = self.visual_bounds();
+        let first = self.buffer.row_for_index(start).unwrap_or(0);
+        let last = self.buffer.row_for_index(end).unwrap_or(first);
+        (first, last)
+    }
+
+    fn indent_visual(&mut self) {
+        let (first, last) = self.selected_rows();
+        for row in first..=last {
+            self.shift_row(row, true);
         }
     }
 
     fn unindent_visual(&mut self) {
-        let (start, end) = self.visual_bounds();
-        let first = self.buffer.row_for_index(start).unwrap_or(0);
-        let last = self.buffer.row_for_index(end).unwrap_or(first);
+        let (first, last) = self.selected_rows();
         for row in first..=last {
-            for _ in 0..self.indent.max(1) {
-                // Only spaces and tabs are indentation.  `is_ascii_whitespace`
-                // also covers CR and LF, and on a blank row the first byte is
-                // the row's own terminator: eating it would join the row to
-                // the next one and drop a row out from under this loop.
-                let Some(&Row { start: at, .. }) = self.buffer.rows.get(row) else {
-                    return;
-                };
-                let Some(byte) = self
-                    .buffer
-                    .data
-                    .get(at)
-                    .copied()
-                    .filter(|byte| matches!(byte, b' ' | b'\t'))
-                else {
-                    continue;
-                };
-                self.buffer.cursor = at;
-                if self.buffer.delete_byte() {
-                    self.history
-                        .push_undo(UndoRecord::insert_chars_exact(at, vec![byte]));
-                }
+            self.shift_row(row, false);
+        }
+    }
+
+    /// Deletes the rectangle a blockwise selection covers.
+    ///
+    /// The rows are cut from the bottom up so the offsets of the rows still
+    /// to come do not move underneath the loop, and the whole rectangle goes
+    /// onto the undo stack as a single region rewrite: a block delete is one
+    /// command, and has to come back in one press of `u`.
+    fn delete_block(&mut self) {
+        let Some((first, last, left, right)) = self.block_bounds() else {
+            return;
+        };
+        let region_start = self.buffer.rows[first].start;
+        let region_end = self.buffer.rows[last].end;
+        let Some(original) = self
+            .buffer
+            .data
+            .get(region_start..region_end)
+            .map(<[u8]>::to_vec)
+        else {
+            return;
+        };
+        // One entry per row, including the rows too short to reach the
+        // rectangle: a block yank keeps its shape, blank lines and all.
+        let mut pieces = vec![Vec::new(); last.saturating_sub(first).saturating_add(1)];
+        for row in (first..=last).rev() {
+            let (start, end) = self.block_row_range(row, left, right);
+            if start >= end {
+                continue;
+            }
+            if let Some(deleted) = self.buffer.delete_selection(start, end) {
+                pieces[row - first] = deleted.undo;
             }
         }
+        self.clipboard = pieces.join(&b'\n');
+        let end = self.buffer.rows[last].end;
+        self.history
+            .push_undo(UndoRecord::replace_region(region_start, end, original));
+        let landing = self.buffer.rows[first];
+        self.buffer.cursor = landing.start.saturating_add(left).min(landing.end);
+    }
+
+    /// Copies the rectangle a blockwise selection covers, one row per line.
+    ///
+    /// Cano's clipboard is a flat run of bytes with no shape of its own, so
+    /// what comes back out of `p` is those lines rather than a column.
+    fn yank_block(&mut self) {
+        let Some((first, last, left, right)) = self.block_bounds() else {
+            return;
+        };
+        let mut pieces: Vec<Vec<u8>> = Vec::new();
+        for row in first..=last {
+            let (start, end) = self.block_row_range(row, left, right);
+            pieces.push(
+                self.buffer
+                    .data
+                    .get(start..end)
+                    .unwrap_or_default()
+                    .to_vec(),
+            );
+        }
+        self.clipboard = pieces.join(&b'\n');
+        let landing = self.buffer.rows[first];
+        self.buffer.cursor = landing.start.saturating_add(left).min(landing.end);
+    }
+
+    /// Vim's `i_CTRL-W`: removes the word before the cursor.
+    ///
+    /// Whitespace before the cursor goes first, then one run of keyword
+    /// bytes or one run of punctuation, which is how vim divides a line into
+    /// words for this key.
+    pub fn insert_delete_word(&mut self) -> bool {
+        if self.mode != Mode::Insert {
+            return false;
+        }
+        let row = self.buffer.rows[self.buffer.cursor_row().unwrap_or(0)];
+        let mut target = self.buffer.cursor.clamp(row.start, row.end);
+        while target > row.start && self.buffer.data[target - 1].is_ascii_whitespace() {
+            target -= 1;
+        }
+        if target > row.start {
+            let keyword = is_keyword(self.buffer.data[target - 1]);
+            while target > row.start {
+                let byte = self.buffer.data[target - 1];
+                if byte.is_ascii_whitespace() || is_keyword(byte) != keyword {
+                    break;
+                }
+                target -= 1;
+            }
+        }
+        self.delete_back_to(target)
+    }
+
+    /// Vim's `i_CTRL-U`: removes what is in front of the cursor on this line.
+    ///
+    /// The indent is kept unless the cursor was already sitting in it, which
+    /// is what vim does and what makes the key safe to lean on while typing
+    /// an indented line.
+    pub fn insert_delete_to_line_start(&mut self) -> bool {
+        if self.mode != Mode::Insert {
+            return false;
+        }
+        let row = self.buffer.rows[self.buffer.cursor_row().unwrap_or(0)];
+        let mut target = row.start;
+        while target < row.end && self.buffer.data[target].is_ascii_whitespace() {
+            target += 1;
+        }
+        if target >= self.buffer.cursor {
+            target = row.start;
+        }
+        self.delete_back_to(target)
+    }
+
+    /// Backspaces to `target`, so every byte removed is recorded the way a
+    /// typed backspace would have recorded it.
+    fn delete_back_to(&mut self, target: usize) -> bool {
+        let count = self.buffer.cursor.saturating_sub(target);
+        for _ in 0..count {
+            self.insert_backspace();
+        }
+        count > 0
+    }
+
+    /// Vim's `i_CTRL-T` and `i_CTRL-D`: shifts the current line one
+    /// shiftwidth, leaving the cursor on the text it was already on.
+    pub fn insert_shift(&mut self, right: bool) -> bool {
+        if self.mode != Mode::Insert {
+            return false;
+        }
+        let Some(row) = self.buffer.cursor_row() else {
+            return false;
+        };
+        let cursor = self.buffer.cursor;
+        // The edit lands at the start of the line rather than under the
+        // cursor, so the cursor-derived record in flight cannot describe it:
+        // close that record out, let the shift keep its own, and start a
+        // fresh one over the cursor's new resting place.
+        self.active_insert.end = cursor;
+        self.push_active_insert();
+        let delta = self.shift_row(row, right);
+        let moved = if delta < 0 {
+            cursor.saturating_sub(delta.unsigned_abs())
+        } else {
+            cursor.saturating_add(delta.unsigned_abs())
+        };
+        let bounds = self.buffer.rows[row.min(self.buffer.rows.len().saturating_sub(1))];
+        self.buffer.cursor = moved.clamp(bounds.start, bounds.end);
+        self.begin_insert_record();
+        delta != 0
+    }
+
+    /// Vim's `Ctrl-A` and `Ctrl-X`: adds `delta` to the number at or after
+    /// the cursor on the current line.
+    ///
+    /// Decimal and `0x` hexadecimal are read, which is vim's default
+    /// `nrformats` without its binary and octal forms.  Zero padding and the
+    /// case of hex digits survive the edit, and the cursor lands on the last
+    /// digit of the result, both as vim leaves them.
+    pub fn adjust_number(&mut self, delta: i64) -> bool {
+        let Some(row_index) = self.buffer.cursor_row() else {
+            return false;
+        };
+        let row = self.buffer.rows[row_index];
+        let column = self.buffer.cursor.saturating_sub(row.start);
+        let line = &self.buffer.data[row.start..row.end];
+        let Some(target) = numbers_on(line)
+            .into_iter()
+            .find(|number| number.end > column)
+        else {
+            return false;
+        };
+        let Some(text) = target.rewritten(line, delta) else {
+            return false;
+        };
+        let start = row.start.saturating_add(target.start);
+        let end = row.start.saturating_add(target.end);
+        let Some(original) = self.buffer.replace_region(start, end, &text) else {
+            return false;
+        };
+        let new_end = start.saturating_add(text.len());
+        self.history
+            .push_undo(UndoRecord::replace_region(start, new_end, original));
+        self.buffer.cursor = new_end.saturating_sub(1);
+        true
     }
 
     /// A failed application is reported instead of silently consuming the
@@ -726,6 +1010,130 @@ impl Editor {
     pub fn redo(&mut self) -> Result<bool, HistoryError> {
         self.history.redo(&mut self.buffer)
     }
+}
+
+/// One number found on a line, and how it was written.
+///
+/// The spelling is kept alongside the range because `Ctrl-A` has to give the
+/// answer back in the same notation it read: `007` counts up to `008`, and
+/// `0x00FF` to `0x0100`.
+struct Number {
+    /// Byte offset into the line of the first byte of the number, including
+    /// a minus sign or an `0x` prefix.
+    start: usize,
+    end: usize,
+    radix: u32,
+    negative: bool,
+    /// How many digits were written, without any sign or prefix, so the
+    /// answer can be padded back to the same width.
+    digits: usize,
+    /// Whether the hex digits were written in upper case.
+    uppercase: bool,
+}
+
+impl Number {
+    /// The bytes this number becomes once `delta` is added to it, or `None`
+    /// when it does not fit in an `i64` and there is no sane answer to give.
+    fn rewritten(&self, line: &[u8], delta: i64) -> Option<Vec<u8>> {
+        let text = line.get(self.start..self.end)?;
+        let body = if self.radix == 16 {
+            text.get(2..)?
+        } else {
+            text.get(usize::from(self.negative)..)?
+        };
+        let magnitude = i64::from_str_radix(&String::from_utf8_lossy(body), self.radix).ok()?;
+        let value = if self.negative {
+            magnitude.checked_neg()?
+        } else {
+            magnitude
+        };
+        let updated = value.checked_add(delta)?;
+        let width = self.digits;
+        if self.radix == 16 {
+            // Hex has no sign to carry, so counting below zero wraps the way
+            // vim's does rather than growing a minus sign the notation has no
+            // room for.
+            let magnitude = updated as u64;
+            let body = if self.uppercase {
+                format!("{magnitude:0width$X}")
+            } else {
+                format!("{magnitude:0width$x}")
+            };
+            return Some(format!("0x{body}").into_bytes());
+        }
+        let body = format!("{:0width$}", updated.unsigned_abs());
+        Some(if updated < 0 {
+            format!("-{body}").into_bytes()
+        } else {
+            body.into_bytes()
+        })
+    }
+}
+
+/// Every number on one line, in the order they appear.
+///
+/// Hexadecimal is claimed first so the letters in `0xff` are not mistaken for
+/// the end of a decimal run, and the decimal pass then steps over whatever a
+/// hex literal already owns.
+fn numbers_on(line: &[u8]) -> Vec<Number> {
+    let mut found: Vec<Number> = Vec::new();
+    let mut index = 0usize;
+    while index.saturating_add(2) < line.len() {
+        if line[index] != b'0'
+            || !matches!(line[index + 1], b'x' | b'X')
+            || !line[index + 2].is_ascii_hexdigit()
+        {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut end = index + 2;
+        while end < line.len() && line[end].is_ascii_hexdigit() {
+            end += 1;
+        }
+        found.push(Number {
+            start,
+            end,
+            radix: 16,
+            negative: false,
+            digits: end.saturating_sub(start).saturating_sub(2),
+            uppercase: line[start + 2..end].iter().any(u8::is_ascii_uppercase),
+        });
+        index = end;
+    }
+
+    let hex = found.len();
+    let mut index = 0usize;
+    while index < line.len() {
+        if let Some(claimed) = found[..hex]
+            .iter()
+            .find(|number| (number.start..number.end).contains(&index))
+        {
+            index = claimed.end;
+            continue;
+        }
+        if !line[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < line.len() && line[index].is_ascii_digit() {
+            index += 1;
+        }
+        // A minus sign in front belongs to the number: vim counts `-1` up to
+        // `0` rather than to `-2`.
+        let negative = start > 0 && line[start - 1] == b'-';
+        found.push(Number {
+            start: start.saturating_sub(usize::from(negative)),
+            end: index,
+            radix: 10,
+            negative,
+            digits: index.saturating_sub(start),
+            uppercase: false,
+        });
+    }
+    found.sort_by_key(|number| number.start);
+    found
 }
 
 /// The nesting depth at `end`, ignoring brackets inside string literals.
@@ -758,6 +1166,152 @@ pub fn brace_depth(data: &[u8], end: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_a_counts_the_number_under_or_after_the_cursor() {
+        let mut editor = Editor::new(b"value = 41;".to_vec());
+        editor.buffer.cursor = 0;
+        assert!(editor.adjust_number(1));
+        assert_eq!(editor.buffer.data, b"value = 42;");
+        // Vim leaves the cursor on the last digit of the answer.
+        assert_eq!(editor.buffer.cursor, 9);
+
+        assert!(editor.adjust_number(-10));
+        assert_eq!(editor.buffer.data, b"value = 32;");
+        assert!(editor.buffer.invariants_hold());
+    }
+
+    #[test]
+    fn control_a_keeps_zero_padding_negatives_and_hex_notation() {
+        let mut padded = Editor::new(b"007".to_vec());
+        assert!(padded.adjust_number(1));
+        assert_eq!(padded.buffer.data, b"008");
+
+        let mut negative = Editor::new(b"-1".to_vec());
+        assert!(negative.adjust_number(1));
+        assert_eq!(negative.buffer.data, b"0");
+
+        let mut widening = Editor::new(b"99".to_vec());
+        assert!(widening.adjust_number(1));
+        assert_eq!(widening.buffer.data, b"100");
+
+        let mut hex = Editor::new(b"0x00FF".to_vec());
+        assert!(hex.adjust_number(1));
+        assert_eq!(hex.buffer.data, b"0x0100");
+
+        // The cursor sitting on a letter of a hex literal is still inside
+        // that number rather than in front of the next one.
+        let mut inside = Editor::new(b"0xff and 7".to_vec());
+        inside.buffer.cursor = 3;
+        assert!(inside.adjust_number(1));
+        assert_eq!(inside.buffer.data, b"0x100 and 7");
+    }
+
+    #[test]
+    fn control_a_undoes_in_one_step_and_reports_a_line_without_a_number() {
+        let mut editor = Editor::new(b"x = 9".to_vec());
+        assert!(editor.adjust_number(1));
+        assert_eq!(editor.buffer.data, b"x = 10");
+        assert!(editor.undo().unwrap());
+        assert_eq!(editor.buffer.data, b"x = 9");
+
+        let mut wordy = Editor::new(b"no digits here".to_vec());
+        assert!(!wordy.adjust_number(1));
+        assert_eq!(wordy.buffer.data, b"no digits here");
+    }
+
+    #[test]
+    fn a_blockwise_selection_cuts_a_rectangle_and_undoes_in_one_step() {
+        let mut editor = Editor::new(b"abcd\nefgh\nijkl".to_vec());
+        editor.buffer.cursor = 1;
+        editor.start_visual(VisualKind::Blockwise);
+        // Down two rows and right one, which is columns 1..=2 of all three.
+        editor.visual_key(b'j');
+        editor.visual_key(b'j');
+        editor.visual_key(b'l');
+        assert_eq!(editor.block_bounds(), Some((0, 2, 1, 2)));
+
+        editor.visual_key(b'd');
+        assert_eq!(editor.buffer.data, b"ad\neh\nil");
+        assert_eq!(editor.clipboard, b"bc\nfg\njk");
+        assert!(editor.buffer.invariants_hold());
+
+        assert!(editor.undo().unwrap());
+        assert_eq!(editor.buffer.data, b"abcd\nefgh\nijkl");
+    }
+
+    #[test]
+    fn a_blockwise_selection_yanks_short_rows_as_the_blanks_they_are() {
+        let mut editor = Editor::new(b"abcd\nef\nijkl".to_vec());
+        editor.buffer.cursor = 2;
+        editor.start_visual(VisualKind::Blockwise);
+        editor.visual_key(b'j');
+        editor.visual_key(b'j');
+        editor.visual_key(b'y');
+        assert_eq!(editor.clipboard, b"c\n\nk");
+        assert_eq!(editor.buffer.data, b"abcd\nef\nijkl");
+        assert_eq!(editor.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn insert_control_w_and_control_u_take_back_a_word_and_a_line() {
+        let mut editor = Editor::new(b"    one two".to_vec());
+        editor.buffer.cursor = 11;
+        editor.enter_insert(InsertEntry::Cursor);
+        assert!(editor.insert_delete_word());
+        assert_eq!(editor.buffer.data, b"    one ");
+
+        // The indent survives while the cursor is still past it.
+        assert!(editor.insert_delete_to_line_start());
+        assert_eq!(editor.buffer.data, b"    ");
+        // Sitting in the indent now, so a second press takes that too.
+        assert!(editor.insert_delete_to_line_start());
+        assert_eq!(editor.buffer.data, b"");
+        assert!(editor.buffer.invariants_hold());
+    }
+
+    #[test]
+    fn insert_control_t_and_control_d_shift_the_line_under_the_cursor() {
+        let mut editor = Editor::new(b"value".to_vec());
+        editor.indent = 2;
+        editor.buffer.cursor = 3;
+        editor.enter_insert(InsertEntry::Cursor);
+
+        assert!(editor.insert_shift(true));
+        assert_eq!(editor.buffer.data, b"  value");
+        // The cursor rode along with the text it was sitting in.
+        assert_eq!(editor.buffer.cursor, 5);
+
+        assert!(editor.insert_shift(false));
+        assert_eq!(editor.buffer.data, b"value");
+        assert_eq!(editor.buffer.cursor, 3);
+        assert!(editor.buffer.invariants_hold());
+    }
+
+    #[test]
+    fn unindenting_an_empty_row_leaves_its_newline_alone() {
+        let mut editor = Editor::new(b"  a\n\n  b".to_vec());
+        editor.indent = 2;
+        editor.buffer.cursor = 0;
+        editor.start_visual(VisualKind::Linewise);
+        editor.visual_key(b'j');
+        editor.visual_key(b'j');
+        editor.visual_key(b'<');
+        assert_eq!(editor.buffer.data, b"a\n\nb");
+        assert!(editor.buffer.invariants_hold());
+    }
+
+    #[test]
+    fn completions_are_offered_forwards_from_the_cursor_and_never_the_word_itself() {
+        let buffer = Buffer::new(b"value verify\nva".to_vec());
+        // The cursor sits just past the `va` on the second line.
+        assert_eq!(buffer.keyword_before(15), b"va");
+        assert_eq!(buffer.completions(b"va", 15), vec![b"value".to_vec()]);
+        assert_eq!(
+            buffer.completions(b"v", 15),
+            vec![b"value".to_vec(), b"verify".to_vec()]
+        );
+    }
 
     #[test]
     fn insert_entries_autoclose_and_indentation_are_documented() {
