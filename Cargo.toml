@@ -1,6 +1,6 @@
 [package]
 name = "cano-fresh"
-version = "0.26.9091"
+version = "0.26.910"
 edition = "2024"
 exclude = ["build/", "result", "target/", "**/__pycache__/", "*.py[cod]"]
 license = "Apache-2.0"
