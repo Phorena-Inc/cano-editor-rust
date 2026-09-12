@@ -494,6 +494,12 @@ mod tests {
                 .language,
             Language::Lua
         );
+        assert_eq!(
+            highlighting(Path::new("a/data.json"), &config_path, true)
+                .unwrap()
+                .language,
+            Language::Json
+        );
 
         // An unknown extension, and syntax turned off, stay uncolored.
         assert!(highlighting(Path::new("a/b.go"), &config_path, true).is_none());

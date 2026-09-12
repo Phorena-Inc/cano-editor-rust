@@ -7,10 +7,11 @@
 //! the same switch, because the order matters — re-indenting rewrites the
 //! leading whitespace that retab would otherwise have converted first.
 //!
-//! Everything here is pure, and none of it changes how many lines a buffer
-//! has: only whitespace within a line is touched.
+//! Everything here is pure. The fallback only changes whitespace within a
+//! line; JSON pretty-printing may also add or remove lines.
 
 use crate::render::TAB_WIDTH;
+use serde_json::value::RawValue;
 
 /// Which steps `:autoformat` runs, each on by default as in the plugin.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,6 +51,94 @@ pub fn format(data: &[u8], region: (usize, usize), steps: Steps, indent: usize) 
     (result != data).then_some(result)
 }
 
+/// Validates and pretty-prints a complete JSON document.
+///
+/// The formatting pass works on the original lexemes after `serde_json`
+/// validates them. That preserves object order, duplicate keys, number
+/// spellings and string escapes rather than round-tripping through a value
+/// representation that could rewrite them.
+pub fn format_json(data: &[u8], indent: usize) -> Result<Option<Vec<u8>>, serde_json::Error> {
+    let _: Box<RawValue> = serde_json::from_slice(data)?;
+
+    let trailing_newline = data
+        .iter()
+        .rev()
+        .take_while(|byte| byte.is_ascii_whitespace())
+        .any(|byte| *byte == b'\n');
+    let mut out = Vec::with_capacity(data.len());
+    let mut containers = Vec::new();
+    let mut at = 0;
+    while at < data.len() {
+        match data[at] {
+            byte if byte.is_ascii_whitespace() => at += 1,
+            b'"' => {
+                let start = at;
+                at += 1;
+                let mut escaped = false;
+                while at < data.len() {
+                    let byte = data[at];
+                    at += 1;
+                    if escaped {
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == b'"' {
+                        break;
+                    }
+                }
+                out.extend_from_slice(&data[start..at]);
+            }
+            opening @ (b'{' | b'[') => {
+                out.push(opening);
+                let closing = if opening == b'{' { b'}' } else { b']' };
+                let empty = data[at + 1..]
+                    .iter()
+                    .find(|byte| !byte.is_ascii_whitespace())
+                    .is_some_and(|byte| *byte == closing);
+                containers.push(empty);
+                at += 1;
+                if !empty {
+                    push_json_line(&mut out, containers.len(), indent);
+                }
+            }
+            closing @ (b'}' | b']') => {
+                let empty = containers.pop().unwrap_or(true);
+                if !empty {
+                    push_json_line(&mut out, containers.len(), indent);
+                }
+                out.push(closing);
+                at += 1;
+            }
+            b',' => {
+                out.push(b',');
+                push_json_line(&mut out, containers.len(), indent);
+                at += 1;
+            }
+            b':' => {
+                out.extend_from_slice(b": ");
+                at += 1;
+            }
+            byte => {
+                out.push(byte);
+                at += 1;
+            }
+        }
+    }
+    if trailing_newline {
+        out.push(b'\n');
+    }
+    Ok((out != data).then_some(out))
+}
+
+fn push_json_line(out: &mut Vec<u8>, depth: usize, indent: usize) {
+    out.push(b'\n');
+    if indent == 0 {
+        out.extend(std::iter::repeat_n(b'\t', depth));
+    } else {
+        out.extend(std::iter::repeat_n(b' ', depth.saturating_mul(indent)));
+    }
+}
+
 /// Carries a byte region across a rewrite by counting lines rather than
 /// bytes, since a rewrite moves bytes but never moves a line.
 fn moved(before: &[u8], after: &[u8], region: (usize, usize)) -> (usize, usize) {
@@ -77,13 +166,17 @@ fn moved(before: &[u8], after: &[u8], region: (usize, usize)) -> (usize, usize) 
 
 /// How many lines differ between two versions of a buffer.
 ///
-/// No step adds or removes a line, so the two always pair up.
 pub fn changed_lines(before: &[u8], after: &[u8]) -> usize {
-    before
-        .split(|byte| *byte == b'\n')
-        .zip(after.split(|byte| *byte == b'\n'))
-        .filter(|(before, after)| before != after)
-        .count()
+    let mut before = before.split(|byte| *byte == b'\n');
+    let mut after = after.split(|byte| *byte == b'\n');
+    let mut changed = 0;
+    loop {
+        match (before.next(), after.next()) {
+            (None, None) => return changed,
+            (Some(before), Some(after)) if before == after => {}
+            _ => changed += 1,
+        }
+    }
 }
 
 /// A running bracket depth.
@@ -399,5 +492,35 @@ mod tests {
             );
             nesting.feed(source[at]);
         }
+    }
+
+    #[test]
+    fn json_format_validates_and_pretty_prints_without_rewriting_values() {
+        let compact = br#"{"z":[1,-2.50e+3,{"escaped":"a\\nb"}],"z":null}"#;
+        assert_eq!(
+            format_json(compact, 2).unwrap().unwrap(),
+            b"{\n  \"z\": [\n    1,\n    -2.50e+3,\n    {\n      \"escaped\": \"a\\\\nb\"\n    }\n  ],\n  \"z\": null\n}"
+        );
+        assert!(format_json(b"{\n  \"ok\": true\n}", 2).unwrap().is_none());
+    }
+
+    #[test]
+    fn json_format_preserves_a_final_newline_and_supports_tab_indentation() {
+        assert_eq!(
+            format_json(b"{\"a\":[1]}\n", 0).unwrap().unwrap(),
+            b"{\n\t\"a\": [\n\t\t1\n\t]\n}\n"
+        );
+    }
+
+    #[test]
+    fn invalid_json_is_rejected_without_a_partial_result() {
+        let error = format_json(b"{\"missing\":}", 2).unwrap_err();
+        assert_eq!(error.line(), 1);
+        assert!(error.column() > 0);
+    }
+
+    #[test]
+    fn changed_lines_counts_lines_added_by_json_formatting() {
+        assert_eq!(changed_lines(b"[1,2]", b"[\n  1,\n  2\n]"), 4);
     }
 }

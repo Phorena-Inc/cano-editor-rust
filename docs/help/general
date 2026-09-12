@@ -42,17 +42,19 @@ Mouse
   scrollbar only moves the selection.
 
 Autoformat
-  :autoformat (or :Autoformat) tidies the buffer's whitespace, as
-  vim-autoformat does when no external formatter is set: re-indent from the
+  :autoformat (or :Autoformat) validates and pretty-prints a .json file. For
+  other files it tidies whitespace as vim-autoformat does when no external
+  formatter is set: re-indent from the
   bracket nesting, retab leading whitespace to match indent, then strip
   trailing spaces. Each step has a switch -- autoformat_autoindent,
   autoformat_retab, autoformat_remove_trailing_spaces -- all on by default;
   :set noautoformat_retab matters for a Makefile. [space] f runs it on the
   whole buffer; = in Visual mode runs it on the selected lines, taking every
   line the selection touches whole.
-  Brackets inside strings are
-  ignored, the line count never changes, and the whole rewrite is one undo
-  step.
+  Brackets inside strings are ignored and the whole rewrite is one undo step.
+  JSON formatting follows indent, preserves value spellings and a final
+  newline, and leaves malformed JSON untouched with an error message. Visual
+  = keeps using selected-line whitespace formatting.
 
 Invisible characters
   :set list draws them. The default set names every kind:

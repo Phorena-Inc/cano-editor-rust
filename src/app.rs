@@ -1432,9 +1432,12 @@ impl App {
             self.set_message("No comment syntax for this file type");
             return;
         };
+        let Some(token) = comment::token(language) else {
+            self.set_message("No comment syntax for this file type");
+            return;
+        };
         let before = &self.editor.buffer.data;
-        let Some((after, direction)) = comment::toggle(before, region, comment::token(language))
-        else {
+        let Some((after, direction)) = comment::toggle(before, region, token) else {
             self.set_message("Nothing to comment");
             return;
         };
@@ -1481,7 +1484,20 @@ impl App {
         };
         let indent = self.commands.indent.max(0) as usize;
         let before = &self.editor.buffer.data;
-        let Some(after) = autoformat::format(before, region, steps, indent) else {
+        let whole_json = region == (0, before.len())
+            && Language::for_path(&self.filename) == Some(Language::Json);
+        let after = if whole_json {
+            match autoformat::format_json(before, indent) {
+                Ok(after) => after,
+                Err(error) => {
+                    self.set_message(format!("Invalid JSON: {error}"));
+                    return;
+                }
+            }
+        } else {
+            autoformat::format(before, region, steps, indent)
+        };
+        let Some(after) = after else {
             self.set_message("Already formatted");
             return;
         };
@@ -4071,6 +4087,39 @@ b"
     }
 
     #[test]
+    fn json_autoformat_pretty_prints_and_undoes_as_one_change() {
+        let compact = b"{\"name\":\"cano\",\"items\":[1,2]}\n".to_vec();
+        let mut app = App::new(compact.clone(), PathBuf::from("data.json"));
+        assert!(ex(&mut app, b"set sw=2").is_empty());
+
+        assert!(ex(&mut app, b"autoformat").is_empty());
+        assert_eq!(
+            app.editor.buffer.data,
+            b"{\n  \"name\": \"cano\",\n  \"items\": [\n    1,\n    2\n  ]\n}\n"
+        );
+        assert_eq!(app.commands.message.as_deref(), Some("Formatted 8 lines"));
+        assert!(app.editor.buffer.invariants_hold());
+
+        assert!(app.handle(Input::Byte(b'u')).is_empty());
+        assert_eq!(app.editor.buffer.data, compact);
+        assert!(app.saved);
+    }
+
+    #[test]
+    fn json_autoformat_reports_invalid_input_without_touching_it() {
+        let invalid = b"{\"missing\":}\n".to_vec();
+        let mut app = App::new(invalid.clone(), PathBuf::from("data.json"));
+
+        assert!(ex(&mut app, b"autoformat").is_empty());
+        assert_eq!(app.editor.buffer.data, invalid);
+        assert_eq!(
+            app.commands.message.as_deref(),
+            Some("Invalid JSON: expected value at line 1 column 12")
+        );
+        assert!(app.saved);
+    }
+
+    #[test]
     fn visual_equals_formats_only_the_selected_lines() {
         let messy = b"f() {\nbad;\n  worse;\nalso bad;\n}\n".to_vec();
         let mut app = App::new(messy, PathBuf::from("f.rs"));
@@ -4220,6 +4269,17 @@ b"
         assert_eq!(plain.editor.buffer.data, b"x\n");
         assert_eq!(
             plain.commands.message.as_deref(),
+            Some("No comment syntax for this file type")
+        );
+
+        // JSON is recognized for highlighting and formatting, but comments
+        // are not part of its grammar.
+        let mut json = App::new(b"{}\n".to_vec(), PathBuf::from("data.json"));
+        assert!(json.handle(Input::Byte(b'V')).is_empty());
+        assert!(json.handle(Input::Control(5)).is_empty());
+        assert_eq!(json.editor.buffer.data, b"{}\n");
+        assert_eq!(
+            json.commands.message.as_deref(),
             Some("No comment syntax for this file type")
         );
 

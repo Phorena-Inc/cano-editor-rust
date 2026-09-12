@@ -42,6 +42,7 @@ pub enum Language {
     Bash,
     Vim,
     Lua,
+    Json,
 }
 
 impl Language {
@@ -90,6 +91,7 @@ impl Language {
             "sh" | "bash" | "zsh" | "ksh" | "ash" | "dash" => Some(Self::Bash),
             "vim" | "vimrc" => Some(Self::Vim),
             "lua" => Some(Self::Lua),
+            "json" => Some(Self::Json),
             _ => None,
         }
     }
@@ -104,6 +106,7 @@ impl Language {
             Self::Bash => bash_keywords(),
             Self::Vim => vim_keywords(),
             Self::Lua => lua_keywords(),
+            Self::Json => copied(&[b"false", b"null", b"true"]),
         }
     }
 
@@ -117,6 +120,7 @@ impl Language {
             Self::Bash => bash_builtins(),
             Self::Vim => vim_options(),
             Self::Lua => lua_builtins(),
+            Self::Json => Vec::new(),
         }
     }
 }
@@ -1373,6 +1377,59 @@ fn lua_scan(source: &[u8], at: usize) -> Option<Scan> {
     }
 }
 
+/// JSON has only double-quoted strings and no comments. Numbers use the type
+/// color so values remain distinct from both strings and literal keywords.
+fn json_scan(source: &[u8], at: usize) -> Option<Scan> {
+    match source[at] {
+        b'"' => Scan::colored(
+            SyntaxKind::String,
+            quoted(source, at, b'"', line_end(source, at)).0,
+        ),
+        b'-' | b'0'..=b'9' => {
+            json_number_end(source, at).and_then(|end| Scan::colored(SyntaxKind::Type, end))
+        }
+        _ => None,
+    }
+}
+
+fn json_number_end(source: &[u8], at: usize) -> Option<usize> {
+    let mut scan = at;
+    if source[scan] == b'-' {
+        scan += 1;
+    }
+    match source.get(scan)? {
+        b'0' => scan += 1,
+        b'1'..=b'9' => {
+            scan += 1;
+            while source.get(scan).is_some_and(u8::is_ascii_digit) {
+                scan += 1;
+            }
+        }
+        _ => return None,
+    }
+    if source.get(scan) == Some(&b'.') && source.get(scan + 1).is_some_and(u8::is_ascii_digit) {
+        scan += 2;
+        while source.get(scan).is_some_and(u8::is_ascii_digit) {
+            scan += 1;
+        }
+    }
+    if matches!(source.get(scan), Some(b'e' | b'E')) {
+        let exponent = scan;
+        scan += 1;
+        if matches!(source.get(scan), Some(b'+' | b'-')) {
+            scan += 1;
+        }
+        let digits = scan;
+        while source.get(scan).is_some_and(u8::is_ascii_digit) {
+            scan += 1;
+        }
+        if scan == digits {
+            scan = exponent;
+        }
+    }
+    Some(scan)
+}
+
 /// Consumes a `[[ … ]]` long bracket, at any `[=[ … ]=]` level.
 fn lua_long_bracket(source: &[u8], at: usize) -> Option<usize> {
     if source.get(at) != Some(&b'[') {
@@ -1430,6 +1487,7 @@ pub fn tokens(source: &[u8], config: &SyntaxConfig) -> Vec<SyntaxToken> {
             Language::Bash => bash_scan(source, at),
             Language::Vim => vim_scan(source, at),
             Language::Lua => lua_scan(source, at),
+            Language::Json => json_scan(source, at),
         };
         if let Some(scan) = scanned {
             // Every scanner consumes at least the byte it started on, so a
@@ -1660,6 +1718,7 @@ mod tests {
             ("rs", Language::Rust),
             ("py", Language::Python),
             ("pyi", Language::Python),
+            ("json", Language::Json),
         ] {
             assert_eq!(Language::for_extension(extension), Some(expected));
         }
@@ -1667,6 +1726,22 @@ mod tests {
         // file supplies a palette for it.
         assert_eq!(Language::for_extension("go"), None);
         assert_eq!(Language::for_extension(""), None);
+    }
+
+    #[test]
+    fn json_colors_strings_numbers_and_literals_without_inventing_comments() {
+        assert_eq!(
+            tags(
+                r#"{"name":"cano","n":-12.5e+2,"ok":true,"x":null}"#,
+                Language::Json
+            ),
+            ".SSSSSS.SSSSSS.SSS.TTTTTTTT.SSSS.KKKK.SSS.KKKK."
+        );
+        assert_eq!(
+            tags("{\"url\":\"a//b\"} // plain", Language::Json),
+            ".SSSSS.SSSSSS.........."
+        );
+        assert_eq!(tags("- 3. 4e+", Language::Json), "..T..T..");
     }
 
     #[test]

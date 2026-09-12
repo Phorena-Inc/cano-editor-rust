@@ -222,8 +222,8 @@ A click is not a key: it cannot answer the save prompt, complete an `:imap`, or
 pick an `s`/`t` jump label.
 
 ## Autoformat
-`:autoformat` (or `:Autoformat`) tidies the whole buffer's whitespace. It is
-the fallback that
+`:autoformat` (or `:Autoformat`) pretty-prints a valid `.json` document. For
+other files it tidies the whole buffer's whitespace as the fallback that
 [vim-autoformat](https://github.com/vim-autoformat/vim-autoformat) runs when no
 external formatter is configured, in the same order and each behind its own
 switch:
@@ -239,8 +239,14 @@ knowing for a Makefile, where a leading tab is not decoration.
 
 Indentation follows `indent`: a width of `0` means one tab per level, anything
 else that many spaces. Brackets inside string literals are ignored, so `a =
-"{";` does not open a block. The rewrite is **one undo step**, and never
-changes how many lines a file has.
+"{";` does not open a block. The rewrite is **one undo step**, and this
+non-JSON fallback never changes how many lines a file has.
+
+For JSON, object order, duplicate keys, number spellings, string escapes and a
+final newline are preserved. Indentation follows `indent`; malformed JSON is
+left untouched and its parse error is shown. Visual `=` still applies the
+selected-line whitespace formatter rather than trying to parse a fragment as a
+complete JSON document.
 
 It reports what it did (`Formatted 4 lines`, or `Already formatted`), and
 refuses on a read-only help page. There is no on-save hook — run it when you
@@ -611,7 +617,8 @@ function exit(code, message) end
 ```
 
 ## Syntax highlighting
-Cano highlights C, C++, Rust and Python out of the box, with no configuration.
+Cano highlights C, C++, Rust, Python, Bash, Vimscript, Lua and JSON out of the
+box, with no configuration.
 The language is chosen from the file's extension:
 
 | Language | Extensions |
@@ -623,6 +630,7 @@ The language is chosen from the file's extension:
 | Bash     | `sh`, `bash`, `zsh`, `ksh`, `ash`, `dash`, and the names `.bashrc`, `.bash_profile`, `.bash_aliases`, `.bash_logout`, `.profile`, `.zshrc`, `.zprofile`, `.zshenv`, `.zlogin`, `.zlogout`, `.kshrc` |
 | Vimscript | `vim`, `vimrc`, and the names `.vimrc`, `_vimrc`, `.gvimrc`, `.exrc` |
 | Lua      | `lua` |
+| JSON     | `json` |
 
 The language picks the scanner as well as the word lists, because the languages
 disagree about what the same characters mean: `//` opens a comment in C, C++ and
@@ -634,7 +642,8 @@ is also the comment marker; `--` is a comment in Lua and a minus sign elsewhere.
 Rust raw strings (`r#"…"#`) and nested block comments, Python triple-quoted and
 prefixed (`f"…"`, `rb'…'`) strings, shell parameter expansion, vim key notation
 (`<leader>`, `<C-x>`) and Lua long brackets (`[[…]]`, `[=[…]=]`) are all
-understood.
+understood. JSON strings and numbers are colored along with its `true`, `false`
+and `null` literals; comments stay plain because JSON has no comment syntax.
 
 Because `.vimrc` and `.bashrc` have no extension at all, the whole file name is
 consulted before falling back to one. A `.cyntax` palette is still keyed by

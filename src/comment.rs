@@ -28,15 +28,16 @@ impl Direction {
 
 /// The line-comment marker for a language.
 ///
-/// Line comments only.  A block comment would have to stay balanced across a
-/// toggle, and every language Cano knows has a line form, so there is nothing
-/// to gain by handling both.
-pub const fn token(language: Language) -> &'static [u8] {
+/// Line comments only. A block comment would have to stay balanced across a
+/// toggle. JSON deliberately returns `None` because comments are not valid
+/// JSON and the editor must not silently create an invalid document.
+pub const fn token(language: Language) -> Option<&'static [u8]> {
     match language {
-        Language::C | Language::Cpp | Language::Rust => b"//",
-        Language::Python | Language::Bash => b"#",
-        Language::Lua => b"--",
-        Language::Vim => b"\"",
+        Language::C | Language::Cpp | Language::Rust => Some(b"//"),
+        Language::Python | Language::Bash => Some(b"#"),
+        Language::Lua => Some(b"--"),
+        Language::Vim => Some(b"\""),
+        Language::Json => None,
     }
 }
 
@@ -225,13 +226,14 @@ mod tests {
     }
 
     #[test]
-    fn every_language_has_a_line_marker() {
-        assert_eq!(token(Language::C), b"//");
-        assert_eq!(token(Language::Cpp), b"//");
-        assert_eq!(token(Language::Rust), b"//");
-        assert_eq!(token(Language::Python), b"#");
-        assert_eq!(token(Language::Bash), b"#");
-        assert_eq!(token(Language::Lua), b"--");
-        assert_eq!(token(Language::Vim), b"\"");
+    fn languages_report_whether_they_have_line_comments() {
+        assert_eq!(token(Language::C), Some(&b"//"[..]));
+        assert_eq!(token(Language::Cpp), Some(&b"//"[..]));
+        assert_eq!(token(Language::Rust), Some(&b"//"[..]));
+        assert_eq!(token(Language::Python), Some(&b"#"[..]));
+        assert_eq!(token(Language::Bash), Some(&b"#"[..]));
+        assert_eq!(token(Language::Lua), Some(&b"--"[..]));
+        assert_eq!(token(Language::Vim), Some(&b"\""[..]));
+        assert_eq!(token(Language::Json), None);
     }
 }

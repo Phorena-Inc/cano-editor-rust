@@ -19,6 +19,7 @@ path = "src/main.rs"
 crossterm = "0.29.0"
 mlua = { version = "0.12.0", features = ["lua54", "vendored"] }
 ratatui = "0.30.2"
+serde_json = { version = "1", features = ["raw_value"] }
 
 # Already in the tree through crossterm, so naming it directly adds no crate
 # to the build.  It is only needed to stop this process for Ctrl-Z, which the
