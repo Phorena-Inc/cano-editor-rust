@@ -113,40 +113,23 @@ fn run() -> Result<u8, String> {
     }
     // Only slots the configuration actually set override the editor's
     // built-in defaults.
-    if let Some(syntax) = config.syntax {
-        app.commands.syntax = syntax;
-    }
-    if let Some(auto_indent) = config.auto_indent {
-        app.commands.auto_indent = auto_indent;
-    }
-    if let Some(relative) = config.relative {
-        app.commands.relative = relative;
-    }
-    if let Some(indent) = config.indent {
-        app.commands.indent = indent;
-    }
-    if let Some(undo_size) = config.undo_size {
-        app.commands.undo_size = undo_size;
-    }
-    if let Some(cursorline) = config.cursorline {
-        app.commands.cursorline = cursorline;
-    }
-    if let Some(mouse) = config.mouse {
-        app.commands.mouse = mouse;
-    }
-    if let Some(backup) = config.backup {
-        app.commands.backup = backup;
-    }
-    if let Some(list) = config.list {
-        app.commands.list = list;
-    }
+    let commands = &mut app.commands;
+    commands.syntax = config.syntax.unwrap_or(commands.syntax);
+    commands.auto_indent = config.auto_indent.unwrap_or(commands.auto_indent);
+    commands.relative = config.relative.unwrap_or(commands.relative);
+    commands.indent = config.indent.unwrap_or(commands.indent);
+    commands.undo_size = config.undo_size.unwrap_or(commands.undo_size);
+    commands.cursorline = config.cursorline.unwrap_or(commands.cursorline);
+    commands.mouse = config.mouse.unwrap_or(commands.mouse);
+    commands.backup = config.backup.unwrap_or(commands.backup);
+    commands.list = config.list.unwrap_or(commands.list);
     app.editor.indent = app.commands.indent.max(0) as usize;
 
     // Anything the configuration asked to run, in the order it asked. These
     // come last so a command can override a slot set above it.
     for line in &config.commands {
         let effects = app.run_command(line);
-        if apply_effects(&mut app, effects)? {
+        if apply_effects(&mut app, effects) {
             return Ok(0);
         }
     }
@@ -257,7 +240,7 @@ fn run() -> Result<u8, String> {
             terminal.redraw().map_err(|error| error.to_string())?;
             message_deadline = None;
         }
-        let quit = apply_effects(&mut app, effects)?;
+        let quit = apply_effects(&mut app, effects);
         // A pane held back by the save prompt opens only now that the write
         // has actually been applied.
         app.open_pending_pane();
@@ -337,7 +320,7 @@ fn highlighting(filename: &Path, config_path: &Path, enabled: bool) -> Option<Sy
     palette.or_else(|| language.map(SyntaxConfig::for_language))
 }
 
-fn apply_effects(app: &mut App, effects: Vec<AppEffect>) -> Result<bool, String> {
+fn apply_effects(app: &mut App, effects: Vec<AppEffect>) -> bool {
     let mut quit = false;
     let mut save_failed = false;
     for effect in effects {
@@ -382,7 +365,7 @@ fn apply_effects(app: &mut App, effects: Vec<AppEffect>) -> Result<bool, String>
             AppEffect::Suspend | AppEffect::Redraw => {}
         }
     }
-    Ok(quit)
+    quit
 }
 
 #[cfg(test)]
@@ -529,8 +512,7 @@ mod tests {
         let quit = apply_effects(
             &mut app,
             vec![AppEffect::Save(path.clone()), AppEffect::Quit],
-        )
-        .unwrap();
+        );
 
         assert!(quit);
         assert!(app.saved);
@@ -549,7 +531,7 @@ mod tests {
         assert_eq!(effects, [AppEffect::Save(path.clone()), AppEffect::Quit]);
         assert!(app.commands.quit);
 
-        let quit = apply_effects(&mut app, effects).unwrap();
+        let quit = apply_effects(&mut app, effects);
 
         assert!(!quit);
         assert!(!app.saved);

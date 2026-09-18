@@ -118,96 +118,47 @@ impl std::error::Error for HistoryError {}
 
 /// Applies one inverse operation and returns the inverse to put on the other
 /// stack.  Defined legacy quirks are preserved; unsafe ranges are errors.
-pub fn apply_record(
-    buffer: &mut Buffer,
-    mut record: UndoRecord,
-) -> Result<UndoRecord, HistoryError> {
-    match record.kind {
+pub fn apply_record(buffer: &mut Buffer, record: UndoRecord) -> Result<UndoRecord, HistoryError> {
+    // Every error is raised before the buffer changes, so it reports the
+    // length the record was checked against.
+    let (start, len) = (record.start, buffer.data.len());
+    let invalid = |end| HistoryError::InvalidRange { start, end, len };
+    let inverse = match record.kind {
         UndoKind::InsertChars | UndoKind::InsertCharsExact => {
-            let exact = record.kind == UndoKind::InsertCharsExact;
-            if record.start > buffer.data.len() {
-                return Err(HistoryError::InvalidRange {
-                    start: record.start,
-                    end: record.start,
-                    len: buffer.data.len(),
-                });
+            if !buffer.insert_selection(start, &record.data) {
+                return Err(invalid(start));
             }
-            if !buffer.insert_selection(record.start, &record.data) {
-                return Err(HistoryError::InvalidRange {
-                    start: record.start,
-                    end: record.start,
-                    len: buffer.data.len(),
-                });
-            }
-
             // Characterized compatibility defect: legacy `InsertChars` uses
             // `start + count - 1`, although deletion interprets it as
             // half-open. Exact editor actions opt into the correct endpoint.
             // Empty insertion remains a bounded no-op in either case.
-            let end = if record.data.is_empty() {
-                record.start
-            } else if exact {
-                record
-                    .start
-                    .checked_add(record.data.len())
-                    .ok_or(HistoryError::InvalidRange {
-                        start: record.start,
-                        end: usize::MAX,
-                        len: buffer.data.len(),
-                    })?
+            let count = record.data.len();
+            if record.kind == UndoKind::InsertCharsExact {
+                UndoRecord::delete_multiple_exact(start, start + count)
             } else {
-                record.start.checked_add(record.data.len() - 1).ok_or(
-                    HistoryError::InvalidRange {
-                        start: record.start,
-                        end: usize::MAX,
-                        len: buffer.data.len(),
-                    },
-                )?
-            };
-            Ok(if exact {
-                UndoRecord::delete_multiple_exact(record.start, end)
-            } else {
-                UndoRecord::delete_multiple(record.start, end)
-            })
+                UndoRecord::delete_multiple(start, start + count.saturating_sub(1))
+            }
         }
         UndoKind::DeleteMultiple | UndoKind::DeleteMultipleExact => {
-            let exact = record.kind == UndoKind::DeleteMultipleExact;
-            let len = buffer.data.len();
-            if record.start > record.end || record.end > len {
-                return Err(HistoryError::InvalidRange {
-                    start: record.start,
-                    end: record.end,
-                    len,
-                });
-            }
-            let deletion = buffer.delete_selection(record.start, record.end).ok_or(
-                HistoryError::InvalidRange {
-                    start: record.start,
-                    end: record.end,
-                    len,
-                },
-            )?;
-            Ok(if exact {
-                UndoRecord::insert_chars_exact(record.start, deletion.undo)
+            let deletion = buffer
+                .delete_selection(start, record.end)
+                .ok_or(invalid(record.end))?;
+            if record.kind == UndoKind::DeleteMultipleExact {
+                UndoRecord::insert_chars_exact(start, deletion.undo)
             } else {
-                UndoRecord::insert_chars(record.start, deletion.undo)
-            })
+                UndoRecord::insert_chars(start, deletion.undo)
+            }
         }
         UndoKind::DeleteChar => {
-            let len = buffer.data.len();
-            if record.start >= len {
-                return Err(HistoryError::InvalidRange {
-                    start: record.start,
-                    end: record.start.saturating_add(1),
-                    len,
-                });
+            if start >= len {
+                return Err(invalid(start.saturating_add(1)));
             }
-            buffer.cursor = record.start;
+            buffer.cursor = start;
             let _ = buffer.delete_byte();
 
             // The legacy handler never copied the displaced byte into the
             // generated redo record.
-            Ok(UndoRecord::insert_chars(record.start, Vec::new()))
+            UndoRecord::insert_chars(start, Vec::new())
         }
         UndoKind::ReplaceChar => {
             let replacement = record
@@ -215,54 +166,53 @@ pub fn apply_record(
                 .first()
                 .copied()
                 .ok_or(HistoryError::MissingReplacementByte)?;
-            let len = buffer.data.len();
-            let Some(slot) = buffer.data.get_mut(record.start) else {
-                return Err(HistoryError::InvalidRange {
-                    start: record.start,
-                    end: record.start.saturating_add(1),
-                    len,
-                });
-            };
-
-            let displaced = std::mem::replace(slot, replacement);
-            buffer.cursor = record.start;
+            let slot = buffer
+                .data
+                .get_mut(start)
+                .ok_or(invalid(start.saturating_add(1)))?;
+            *slot = replacement;
+            buffer.cursor = start;
             buffer.calculate_rows();
 
             // The C code writes the displaced byte onto the consumed record,
-            // not onto its inverse.  Keep that observable first application
-            // while representing the unsafe next application as an error.
-            record.data.clear();
-            record.data.push(displaced);
-            Ok(UndoRecord::new(
-                UndoKind::ReplaceChar,
-                Vec::new(),
-                record.start,
-                record.end,
-            ))
+            // not onto its inverse, so the inverse is empty: it applies once
+            // and the next application is reported as an error.
+            UndoRecord::new(UndoKind::ReplaceChar, Vec::new(), start, record.end)
         }
         UndoKind::ReplaceRegion => {
             // The inverse is the same shape with the two halves swapped, so
             // undo and redo of a substitution are one press each.
             let displaced = buffer
-                .replace_region(record.start, record.end, &record.data)
-                .ok_or(HistoryError::InvalidRange {
-                    start: record.start,
-                    end: record.end,
-                    len: buffer.data.len(),
-                })?;
-            let end =
-                record
-                    .start
-                    .checked_add(record.data.len())
-                    .ok_or(HistoryError::InvalidRange {
-                        start: record.start,
-                        end: usize::MAX,
-                        len: buffer.data.len(),
-                    })?;
-            buffer.cursor = record.start.min(buffer.data.len());
-            Ok(UndoRecord::replace_region(record.start, end, displaced))
+                .replace_region(start, record.end, &record.data)
+                .ok_or(invalid(record.end))?;
+            buffer.cursor = start;
+            UndoRecord::replace_region(start, start + record.data.len(), displaced)
         }
-    }
+    };
+    // Post: replaying never leaves the buffer inconsistent, and the inverse
+    // names a forward range at the same place, which is what the next replay
+    // will index with.
+    debug_assert_eq!(buffer.validate(), Ok(()));
+    debug_assert!(
+        inverse.start == start && start <= inverse.end,
+        "{inverse:?}"
+    );
+    Ok(inverse)
+}
+
+/// Moves the newest record on `from` through the buffer and puts its inverse
+/// on `to`.  A record that fails to apply is dropped, as the legacy editor
+/// did, so the other stack only grows on success.
+fn step(
+    from: &mut Vec<UndoRecord>,
+    to: &mut Vec<UndoRecord>,
+    buffer: &mut Buffer,
+) -> Result<bool, HistoryError> {
+    let Some(record) = from.pop() else {
+        return Ok(false);
+    };
+    to.push(apply_record(buffer, record)?);
+    Ok(true)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -283,26 +233,11 @@ impl History {
     }
 
     pub fn undo(&mut self, buffer: &mut Buffer) -> Result<bool, HistoryError> {
-        let Some(record) = self.undo.pop() else {
-            return Ok(false);
-        };
-        let inverse = apply_record(buffer, record)?;
-        self.redo.push(inverse);
-        Ok(true)
+        step(&mut self.undo, &mut self.redo, buffer)
     }
 
     pub fn redo(&mut self, buffer: &mut Buffer) -> Result<bool, HistoryError> {
-        let Some(record) = self.redo.pop() else {
-            return Ok(false);
-        };
-        let inverse = apply_record(buffer, record)?;
-        self.undo.push(inverse);
-        Ok(true)
-    }
-
-    pub fn clear(&mut self) {
-        self.undo.clear();
-        self.redo.clear();
+        step(&mut self.redo, &mut self.undo, buffer)
     }
 }
 

@@ -64,38 +64,8 @@ pub fn help_directories(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use super::*;
-
-    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
-
-    struct Fixture {
-        root: PathBuf,
-    }
-
-    impl Fixture {
-        fn new(label: &str) -> Self {
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock should follow the Unix epoch")
-                .as_nanos();
-            let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "cano-fresh-io-{label}-{}-{timestamp}-{sequence}",
-                std::process::id()
-            ));
-            fs::create_dir(&root).expect("create IO fixture");
-            Self { root }
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
+    use crate::test_support::Fixture;
 
     #[test]
     fn load_returns_empty_and_binary_files_byte_for_byte() {

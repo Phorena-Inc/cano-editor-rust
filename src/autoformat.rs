@@ -10,7 +10,8 @@
 //! Everything here is pure. The fallback only changes whitespace within a
 //! line; JSON pretty-printing may also add or remove lines.
 
-use crate::render::TAB_WIDTH;
+use crate::buffer::Nesting;
+use crate::render::{TAB_WIDTH, display_columns};
 use serde_json::value::RawValue;
 
 /// Which steps `:autoformat` runs, each on by default as in the plugin.
@@ -48,6 +49,9 @@ pub fn format(data: &[u8], region: (usize, usize), steps: Steps, indent: usize) 
         let region = moved(data, &result, region);
         result = remove_trailing_spaces(&result, region);
     }
+    // Post: every step rewrites within lines and never adds or drops one,
+    // which is what lets `moved` carry the region between them.
+    debug_assert_eq!(line_count(&result), line_count(data));
     (result != data).then_some(result)
 }
 
@@ -127,29 +131,22 @@ pub fn format_json(data: &[u8], indent: usize) -> Result<Option<Vec<u8>>, serde_
     if trailing_newline {
         out.push(b'\n');
     }
+    // Post: only whitespace between lexemes changed, so the document still
+    // parses.
+    debug_assert!(serde_json::from_slice::<Box<RawValue>>(&out).is_ok());
     Ok((out != data).then_some(out))
 }
 
 fn push_json_line(out: &mut Vec<u8>, depth: usize, indent: usize) {
     out.push(b'\n');
-    if indent == 0 {
-        out.extend(std::iter::repeat_n(b'\t', depth));
-    } else {
-        out.extend(std::iter::repeat_n(b' ', depth.saturating_mul(indent)));
-    }
+    push_indent(out, depth, indent);
 }
 
 /// Carries a byte region across a rewrite by counting lines rather than
 /// bytes, since a rewrite moves bytes but never moves a line.
 fn moved(before: &[u8], after: &[u8], region: (usize, usize)) -> (usize, usize) {
-    let first = before[..region.0.min(before.len())]
-        .iter()
-        .filter(|byte| **byte == b'\n')
-        .count();
-    let last = before[..region.1.min(before.len())]
-        .iter()
-        .filter(|byte| **byte == b'\n')
-        .count();
+    let first = line_count(&before[..region.0.min(before.len())]);
+    let last = line_count(&before[..region.1.min(before.len())]);
     let mut bounds = (after.len(), after.len());
     let mut at = 0;
     for (index, line) in after.split(|byte| *byte == b'\n').enumerate() {
@@ -175,41 +172,6 @@ pub fn changed_lines(before: &[u8], after: &[u8]) -> usize {
             (None, None) => return changed,
             (Some(before), Some(after)) if before == after => {}
             _ => changed += 1,
-        }
-    }
-}
-
-/// A running bracket depth.
-///
-/// This is [`crate::editor::brace_depth`] turned inside out so a whole buffer
-/// can be walked once: asking that function for every line in turn would
-/// rescan the file from the start each time.  The rules are identical, quotes
-/// included, so both agree on any position.
-#[derive(Default)]
-struct Nesting {
-    depth: usize,
-    quote: Option<u8>,
-    escaped: bool,
-}
-
-impl Nesting {
-    fn feed(&mut self, byte: u8) {
-        if let Some(active) = self.quote {
-            if self.escaped {
-                self.escaped = false;
-            } else if byte == b'\\' {
-                self.escaped = true;
-            } else if byte == active {
-                self.quote = None;
-            }
-            return;
-        }
-        if matches!(byte, b'\'' | b'"') {
-            self.quote = Some(byte);
-        } else if matches!(byte, b'(' | b'[' | b'{') {
-            self.depth += 1;
-        } else if matches!(byte, b')' | b']' | b'}') {
-            self.depth = self.depth.saturating_sub(1);
         }
     }
 }
@@ -256,9 +218,7 @@ fn retab(data: &[u8], region: (usize, usize), indent: usize) -> Vec<u8> {
             return;
         }
         let content = leading_end(line);
-        let columns = line[..content].iter().fold(0usize, |columns, byte| {
-            columns.saturating_add(if *byte == b'\t' { TAB_WIDTH } else { 1 })
-        });
+        let columns = display_columns(&line[..content]);
         if indent == 0 {
             out.extend(std::iter::repeat_n(b'\t', columns / TAB_WIDTH));
             out.extend(std::iter::repeat_n(b' ', columns % TAB_WIDTH));
@@ -309,8 +269,15 @@ fn rewrite(
     out
 }
 
+fn line_count(data: &[u8]) -> usize {
+    data.iter().filter(|byte| **byte == b'\n').count()
+}
+
 /// Where a line's leading whitespace ends.
-fn leading_end(line: &[u8]) -> usize {
+///
+/// Spaces and tabs only: CR and LF are terminators, and treating them as
+/// indentation would walk past the end of the line.
+pub(crate) fn leading_end(line: &[u8]) -> usize {
     line.iter()
         .position(|byte| !matches!(byte, b' ' | b'\t'))
         .unwrap_or(line.len())

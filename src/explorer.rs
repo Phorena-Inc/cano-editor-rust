@@ -115,38 +115,8 @@ impl Explorer {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use super::*;
-
-    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
-
-    struct Fixture {
-        root: PathBuf,
-    }
-
-    impl Fixture {
-        fn new(label: &str) -> Self {
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock should follow the Unix epoch")
-                .as_nanos();
-            let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "cano-fresh-explorer-{label}-{}-{timestamp}-{sequence}",
-                std::process::id()
-            ));
-            std::fs::create_dir(&root).expect("create explorer fixture");
-            Self { root }
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
-        }
-    }
+    use crate::test_support::Fixture;
 
     fn display_names(explorer: &Explorer) -> Vec<String> {
         explorer.entries.iter().map(Entry::display_name).collect()

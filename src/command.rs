@@ -196,8 +196,7 @@ pub fn lex(input: &[u8]) -> Result<Vec<Token>, CommandError> {
         }
 
         let start = at;
-        let kind;
-        if matches!(input[at], b'\'' | b'"') {
+        let kind = if matches!(input[at], b'\'' | b'"') {
             let quote = input[at];
             at += 1;
             let mut escaped = false;
@@ -217,7 +216,7 @@ pub fn lex(input: &[u8]) -> Result<Vec<Token>, CommandError> {
             if !terminated {
                 return Err(CommandError::UnterminatedString { at: start });
             }
-            kind = TokenKind::String;
+            TokenKind::String
         } else if input[at] == b'<' {
             at += 1;
             while at < input.len() && input[at] != b'>' {
@@ -226,13 +225,13 @@ pub fn lex(input: &[u8]) -> Result<Vec<Token>, CommandError> {
             if at < input.len() {
                 at += 1;
             }
-            kind = TokenKind::SpecialKey;
+            TokenKind::SpecialKey
         } else {
             while at < input.len() && !input[at].is_ascii_whitespace() {
                 at += 1;
             }
-            kind = classify(&input[start..at]);
-        }
+            classify(&input[start..at])
+        };
 
         result.push(Token {
             kind,
@@ -347,13 +346,13 @@ fn parse_integer_prefix(bytes: &[u8]) -> Result<i64, CommandError> {
     let digits = bytes
         .iter()
         .take_while(|byte| byte.is_ascii_digit())
-        .copied()
-        .collect::<Vec<_>>();
-    if digits.is_empty() {
+        .count();
+    if digits == 0 {
         return Err(CommandError::InvalidExpression);
     }
-    let text = std::str::from_utf8(&digits).map_err(|_| CommandError::InvalidExpression)?;
-    text.parse::<i64>()
+    // ASCII digits are valid UTF-8, so only the range can fail.
+    String::from_utf8_lossy(&bytes[..digits])
+        .parse::<i64>()
         .map_err(|_| CommandError::IntegerOverflow)
 }
 
@@ -369,9 +368,7 @@ fn expression(tokens: &[Token]) -> Result<i64, CommandError> {
     }
 
     let mut value = parse_integer_prefix(&first.bytes)?;
-    for pair in tokens[1..].chunks_exact(2) {
-        let operator = &pair[0];
-        let rhs_token = &pair[1];
+    for [operator, rhs_token] in tokens[1..].as_chunks::<2>().0 {
         if operator.kind != TokenKind::Operator
             || !matches!(operator.bytes.as_slice(), b"+" | b"-" | b"*" | b"/")
         {
@@ -553,26 +550,6 @@ pub fn parse(tokens: &[Token]) -> Result<Action, CommandError> {
             };
             Ok(Action::Echo(value))
         }
-        b"w" => {
-            exact_arity(tokens, 1)?;
-            Ok(Action::Write)
-        }
-        b"q" => {
-            exact_arity(tokens, 1)?;
-            Ok(Action::Quit { force: false })
-        }
-        b"q!" => {
-            exact_arity(tokens, 1)?;
-            Ok(Action::Quit { force: true })
-        }
-        b"wq" => {
-            exact_arity(tokens, 1)?;
-            Ok(Action::WriteExit)
-        }
-        b"e" => {
-            exact_arity(tokens, 1)?;
-            Ok(Action::Exit)
-        }
         b"imap" => {
             if tokens.len() < 3 {
                 return Err(CommandError::NotEnoughArgs);
@@ -603,19 +580,21 @@ pub fn parse(tokens: &[Token]) -> Result<Action, CommandError> {
             }
             Ok(Action::InsertMap { from, to })
         }
-        b"autoformat" | b"Autoformat" => {
+        // The rest take no arguments.
+        _ => {
+            let action = match name {
+                b"w" => Action::Write,
+                b"q" => Action::Quit { force: false },
+                b"q!" => Action::Quit { force: true },
+                b"wq" | b"we" => Action::WriteExit,
+                b"e" => Action::Exit,
+                b"autoformat" | b"Autoformat" => Action::AutoFormat,
+                b"nohl" | b"nohlsearch" => Action::NoHighlight,
+                _ => return Err(CommandError::UnknownCommand(command.bytes.clone())),
+            };
             exact_arity(tokens, 1)?;
-            Ok(Action::AutoFormat)
+            Ok(action)
         }
-        b"nohl" | b"nohlsearch" => {
-            exact_arity(tokens, 1)?;
-            Ok(Action::NoHighlight)
-        }
-        b"we" => {
-            exact_arity(tokens, 1)?;
-            Ok(Action::WriteExit)
-        }
-        _ => Err(CommandError::UnknownCommand(command.bytes.clone())),
     }
 }
 
@@ -766,22 +745,27 @@ impl CommandState {
     /// the application to perform.
     pub fn apply(&mut self, action: Action) -> Result<Option<ExternalEffect>, CommandError> {
         match action {
-            Action::SetVar { variable, value } => match variable {
-                ConfigVariable::Syntax => self.syntax = value,
-                ConfigVariable::Relative => self.relative = value,
-                ConfigVariable::AutoIndent => self.auto_indent = value,
-                ConfigVariable::Indent => self.indent = value,
-                ConfigVariable::UndoSize => self.undo_size = value,
-                ConfigVariable::CursorLine => self.cursorline = value,
-                ConfigVariable::Mouse => self.mouse = value,
-                ConfigVariable::Backup => self.backup = value,
-                ConfigVariable::List => self.list = value,
-                ConfigVariable::AutoFormatIndent => self.autoformat_autoindent = value,
-                ConfigVariable::AutoFormatRetab => self.autoformat_retab = value,
-                ConfigVariable::AutoFormatTrailing => {
-                    self.autoformat_remove_trailing_spaces = value;
+            Action::SetVar { variable, value } => {
+                match variable {
+                    ConfigVariable::Syntax => self.syntax = value,
+                    ConfigVariable::Relative => self.relative = value,
+                    ConfigVariable::AutoIndent => self.auto_indent = value,
+                    ConfigVariable::Indent => self.indent = value,
+                    ConfigVariable::UndoSize => self.undo_size = value,
+                    ConfigVariable::CursorLine => self.cursorline = value,
+                    ConfigVariable::Mouse => self.mouse = value,
+                    ConfigVariable::Backup => self.backup = value,
+                    ConfigVariable::List => self.list = value,
+                    ConfigVariable::AutoFormatIndent => self.autoformat_autoindent = value,
+                    ConfigVariable::AutoFormatRetab => self.autoformat_retab = value,
+                    ConfigVariable::AutoFormatTrailing => {
+                        self.autoformat_remove_trailing_spaces = value;
+                    }
                 }
-            },
+                // Post: `variable` reads back the slot this table just wrote,
+                // which keeps the two hand-written tables in step.
+                debug_assert_eq!(self.variable(variable), value);
+            }
             Action::SetOutput(output) => self.output = output,
             Action::SetMap { key, mut expansion } => {
                 expansion.push(0);

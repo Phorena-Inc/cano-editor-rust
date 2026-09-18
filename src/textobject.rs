@@ -5,7 +5,7 @@
 //! `None` means the cursor is not inside an object of that kind, which is what
 //! makes `di(` outside any parentheses do nothing rather than guess at one.
 
-use crate::buffer::{Buffer, Row, is_keyword, quoted_bytes};
+use crate::buffer::{Buffer, Row, balanced, is_keyword, quoted_bytes};
 
 /// Whether the delimiters belong to the range: vim's `i` and `a`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,7 +42,7 @@ fn class(byte: u8) -> Class {
 /// the bracket pairs (`b` for `(`, `B` for `{`, and either end of a pair
 /// standing for the pair) are resolved here rather than by the caller.
 pub fn range(buffer: &Buffer, cursor: usize, scope: Scope, object: u8) -> Option<(usize, usize)> {
-    match object {
+    let found = match object {
         b'w' => word(buffer, cursor, scope),
         b'p' => paragraph(buffer, cursor, scope),
         b'(' | b')' | b'b' => pair(buffer, cursor, scope, b'(', b')'),
@@ -51,7 +51,14 @@ pub fn range(buffer: &Buffer, cursor: usize, scope: Scope, object: u8) -> Option
         b'<' | b'>' => pair(buffer, cursor, scope, b'<', b'>'),
         b'"' | b'\'' | b'`' => quotes(buffer, cursor, scope, object),
         _ => None,
-    }
+    };
+    // Post: every object is a forward range inside the buffer, so an
+    // operator can take it as it stands.
+    debug_assert!(
+        found.is_none_or(|(start, end)| start <= end && end <= buffer.data.len()),
+        "{found:?}"
+    );
+    found
 }
 
 /// The row holding `cursor`, and the byte in it the object starts from.
@@ -133,53 +140,21 @@ fn pair(
 ) -> Option<(usize, usize)> {
     let data = &buffer.data;
     let quoted = quoted_bytes(data);
-    let unquoted = |at: usize| !quoted.get(at).copied().unwrap_or(false);
 
     // A cursor resting on either delimiter names that pair, so `di(` works
     // from the parenthesis itself and not only from between them.
-    let open_at = if data.get(cursor) == Some(&open) && unquoted(cursor) {
+    let open_at = if data.get(cursor) == Some(&open) && !quoted[cursor] {
         cursor
     } else {
-        let mut depth = 0usize;
-        let mut scan = cursor.min(data.len());
-        loop {
-            if scan == 0 {
-                return None;
-            }
-            scan -= 1;
-            if !unquoted(scan) {
-                continue;
-            }
-            if data[scan] == close {
-                depth += 1;
-            } else if data[scan] == open {
-                if depth == 0 {
-                    break;
-                }
-                depth -= 1;
-            }
-        }
-        scan
+        balanced(
+            data,
+            &quoted,
+            (0..cursor.min(data.len())).rev(),
+            close,
+            open,
+        )?
     };
-
-    let mut depth = 0usize;
-    let mut close_at = open_at + 1;
-    loop {
-        if close_at >= data.len() {
-            return None;
-        }
-        if unquoted(close_at) {
-            if data[close_at] == open {
-                depth += 1;
-            } else if data[close_at] == close {
-                if depth == 0 {
-                    break;
-                }
-                depth -= 1;
-            }
-        }
-        close_at += 1;
-    }
+    let close_at = balanced(data, &quoted, open_at + 1..data.len(), open, close)?;
 
     match scope {
         Scope::Inner => Some((open_at + 1, close_at)),

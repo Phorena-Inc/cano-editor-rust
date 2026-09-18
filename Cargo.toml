@@ -5,11 +5,6 @@ edition = "2024"
 exclude = ["build/", "result", "target/", "**/__pycache__/", "*.py[cod]"]
 license = "Apache-2.0"
 description = "Fresh Rust implementation of Cano from the migration specification"
-default-run = "cano"
-
-[lib]
-name = "cano_fresh"
-path = "src/lib.rs"
 
 [[bin]]
 name = "cano"

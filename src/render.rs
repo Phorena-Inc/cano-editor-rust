@@ -7,8 +7,9 @@
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer as TuiBuffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::widgets::Clear;
 
 use crate::buffer::Highlight;
 use crate::editor::{Editor, Mode};
@@ -96,10 +97,16 @@ impl Viewport {
         // The thumb is placed by truncating division, so the exact inverse is
         // the smallest item count that still reaches this row -- rounding
         // instead leaves the thumb a row behind the pointer that dragged it.
-        usize::from(row)
+        let item = usize::from(row)
             .saturating_mul(track.scrollable_items)
             .div_ceil(track.scrollable_track)
-            .min(track.scrollable_items)
+            .min(track.scrollable_items);
+        // Post: the thumb drawn for `item` starts on the row that was dragged.
+        debug_assert_eq!(
+            track.thumb_start(item),
+            usize::from(row).min(track.scrollable_track)
+        );
+        item
     }
 
     /// The buffer byte under a screen position, if the text is there.
@@ -174,11 +181,14 @@ impl Viewport {
             return cursor;
         }
         let origin = origin.min(cursor);
-        if cursor >= origin.saturating_add(extent) {
+        let origin = if cursor >= origin.saturating_add(extent) {
             cursor.saturating_add(1).saturating_sub(extent)
         } else {
             origin
-        }
+        };
+        // Post: the cursor is inside the window that starts at the new origin.
+        debug_assert!(origin <= cursor && cursor - origin < extent);
+        origin
     }
 }
 
@@ -242,6 +252,11 @@ impl ScreenLayout {
         let scrollbar_x = (editor_height > 0 && editor_width > 0)
             .then(|| area.x.saturating_add(area.width.saturating_sub(1)));
         let content_width = editor_width.saturating_sub(u16::from(scrollbar_x.is_some()));
+        // Invariant: gutter, text and scrollbar partition the width exactly.
+        debug_assert_eq!(
+            gutter_width + content_width + u16::from(scrollbar_x.is_some()),
+            area.width
+        );
 
         Self {
             area,
@@ -284,9 +299,9 @@ pub fn draw(
     scroll.rows = usize::from(layout.editor_height);
 
     let mut first_item = 0;
+    frame.render_widget(Clear, area);
     let cursor = {
         let buffer = frame.buffer_mut();
-        clear_area(buffer, area);
 
         let cursor = if let Some((entries, selected)) = options.history {
             let width = usize::from(layout.content_width);
@@ -310,7 +325,9 @@ pub fn draw(
                 first_item,
                 recent.cursor,
                 Style::default().fg(Color::Cyan),
-                |path| elide_start(&Recent::display_name(path), width),
+                // The whole path, because two recent files often share a
+                // base name.
+                |path| elide_start(&path.to_string_lossy(), width),
             )
         } else if let Some(explorer) = options.explorer {
             first_item = viewport_start(
@@ -344,21 +361,13 @@ pub fn draw(
     };
 
     scroll.first_item = first_item;
+    // Post: whichever pane placed it, the cursor is inside the frame.
+    debug_assert!(cursor.is_none_or(|(x, y)| area.contains(Position::new(x, y))));
 
     if editor.mode != Mode::Visual
         && let Some(position) = cursor
     {
         frame.set_cursor_position(position);
-    }
-}
-
-fn clear_area(buffer: &mut TuiBuffer, area: Rect) {
-    for y in area.y..area.y.saturating_add(area.height) {
-        for x in area.x..area.x.saturating_add(area.width) {
-            if let Some(cell) = buffer.cell_mut((x, y)) {
-                cell.reset();
-            }
-        }
     }
 }
 
@@ -394,10 +403,7 @@ fn draw_editor(
         if row_index >= editor.buffer.rows.len() {
             break;
         }
-        let y = layout
-            .area
-            .y
-            .saturating_add(u16::try_from(screen_row).unwrap_or(u16::MAX));
+        let y = shifted(layout.area.y, screen_row);
         draw_line_number(
             buffer,
             layout,
@@ -436,13 +442,8 @@ fn draw_editor(
     }
 
     Some((
-        layout
-            .content_x
-            .saturating_add(u16::try_from(screen_column).unwrap_or(u16::MAX)),
-        layout
-            .area
-            .y
-            .saturating_add(u16::try_from(screen_row).unwrap_or(u16::MAX)),
+        shifted(layout.content_x, screen_column),
+        shifted(layout.area.y, screen_row),
     ))
 }
 
@@ -456,19 +457,25 @@ fn viewport_start(cursor: usize, height: u16, total: usize) -> usize {
 }
 
 fn cursor_display_column(editor: &Editor) -> usize {
-    let Some(row_index) = editor.buffer.cursor_row() else {
-        return 0;
-    };
-    let row = editor.buffer.rows[row_index];
-    editor.buffer.data[row.start..editor.buffer.cursor.min(row.end)]
-        .iter()
-        .fold(0usize, |column, byte| {
-            column.saturating_add(display_width(*byte))
-        })
+    editor.buffer.cursor_row().map_or(0, |row| {
+        row_display_column(editor, row, editor.buffer.cursor)
+    })
 }
 
 fn display_width(byte: u8) -> usize {
     if byte == b'\t' { TAB_WIDTH } else { 1 }
+}
+
+/// The columns `bytes` take on screen, counting a tab as its full width.
+pub fn display_columns(bytes: &[u8]) -> usize {
+    bytes.iter().fold(0usize, |column, byte| {
+        column.saturating_add(display_width(*byte))
+    })
+}
+
+/// `base + by` in screen space, saturating at the edge of a `u16`.
+fn shifted(base: u16, by: usize) -> u16 {
+    base.saturating_add(u16::try_from(by).unwrap_or(u16::MAX))
 }
 
 fn draw_line_number(
@@ -488,23 +495,20 @@ fn draw_line_number(
         row.saturating_add(1)
     };
     let number = number.to_string();
-    let digit_width = usize::from(layout.gutter_digit_width);
-    let visible_start = number.len().saturating_sub(digit_width);
-    let visible = &number[visible_start..];
-    let padding = digit_width.saturating_sub(visible.len());
+    let visible = &number[number
+        .len()
+        .saturating_sub(usize::from(layout.gutter_digit_width))..];
+    // No longer than `gutter_digit_width`, so the conversion is exact.
+    let width = visible.len() as u16;
     write_text(
         buffer,
-        layout.area.x.saturating_add(
-            u16::try_from(padding)
-                .unwrap_or(u16::MAX)
-                .min(layout.gutter_digit_width),
-        ),
+        // Right-aligned: the digits end where the gutter's digit columns do.
+        layout
+            .area
+            .x
+            .saturating_add(layout.gutter_digit_width - width),
         y,
-        layout.gutter_digit_width.saturating_sub(
-            u16::try_from(padding)
-                .unwrap_or(u16::MAX)
-                .min(layout.gutter_digit_width),
-        ),
+        width,
         visible,
         // A terminal multiplexer may remap fixed ANSI palette entries. The
         // terminal's default foreground is the only color guaranteed to
@@ -554,9 +558,7 @@ fn draw_buffer_row(
             if column < first_column {
                 continue;
             }
-            let x = layout
-                .content_x
-                .saturating_add(u16::try_from(column - first_column).unwrap_or(u16::MAX));
+            let x = shifted(layout.content_x, column - first_column);
             let listed = overlays.list.and_then(|chars| {
                 list_glyph(
                     chars,
@@ -570,7 +572,7 @@ fn draw_buffer_row(
             let symbol = match listed {
                 Some(glyph) => glyph,
                 None if byte == b'\t' => ' ',
-                None => display_byte(byte),
+                None => display_char(char::from(byte)),
             };
             let mut style = overlays.styles.style(byte_index);
             if listed.is_some() {
@@ -597,9 +599,7 @@ fn draw_buffer_row(
     // glyph. Styling the following blank cell keeps an inclusive selection
     // visible on empty lines and at line ends.
     if display_column >= first_column && display_column < last_column {
-        let x = layout
-            .content_x
-            .saturating_add(u16::try_from(display_column - first_column).unwrap_or(u16::MAX));
+        let x = shifted(layout.content_x, display_column - first_column);
         // `eol` marks the line ending, so it is only drawn where there is
         // one: the last row of a file without a final newline has none.
         if let Some(eol) = overlays.list.and_then(|chars| chars.eol)
@@ -614,14 +614,6 @@ fn draw_buffer_row(
         {
             cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
         }
-    }
-}
-
-fn display_byte(byte: u8) -> char {
-    match byte {
-        b' '..=b'~' => char::from(byte),
-        0xa0..=u8::MAX => char::from(byte),
-        _ => '\u{fffd}',
     }
 }
 
@@ -677,12 +669,7 @@ impl CellStyles {
         let mut colors = vec![None; source.len()];
 
         for token in tokens(source, syntax) {
-            let color = syntax_color(&token.kind, syntax);
-            let start = token.start.min(source.len());
-            let end = token.end.min(source.len());
-            for slot in colors.iter_mut().take(end).skip(start) {
-                *slot = Some(color);
-            }
+            colors[token.start..token.end].fill(Some(syntax_color(&token.kind, syntax)));
         }
         Self::Syntax(colors)
     }
@@ -739,9 +726,9 @@ fn syntax_color(kind: &SyntaxKind, syntax: &SyntaxConfig) -> Color {
         SyntaxKind::Keyword => rgb_color(&syntax.keyword.color),
         SyntaxKind::Type => rgb_color(&syntax.type_name.color),
         SyntaxKind::Word => rgb_color(&syntax.word.color),
-        SyntaxKind::Preprocessor => rgb_color(&SyntaxConfig::preprocessor_color()),
-        SyntaxKind::String => rgb_color(&SyntaxConfig::string_color()),
-        SyntaxKind::Comment => rgb_color(&SyntaxConfig::comment_color()),
+        SyntaxKind::Preprocessor => rgb_color(&SyntaxConfig::PREPROCESSOR),
+        SyntaxKind::String => rgb_color(&SyntaxConfig::STRING),
+        SyntaxKind::Comment => rgb_color(&SyntaxConfig::COMMENT),
     }
 }
 
@@ -762,6 +749,7 @@ fn elide_start(text: &str, width: usize) -> String {
     // One column goes to the ellipsis standing in for the removed head.
     let mut result = String::from('\u{2026}');
     result.extend(text.chars().skip(count - width + 1));
+    debug_assert_eq!(result.chars().count(), width);
     result
 }
 
@@ -787,10 +775,7 @@ fn draw_list<T>(
         let Some(item) = items.get(first_item.saturating_add(screen_row)) else {
             break;
         };
-        let y = layout
-            .area
-            .y
-            .saturating_add(u16::try_from(screen_row).unwrap_or(u16::MAX));
+        let y = shifted(layout.area.y, screen_row);
         write_text(
             buffer,
             layout.content_x,
@@ -810,13 +795,7 @@ fn draw_list<T>(
     if screen_row >= usize::from(layout.editor_height) {
         return None;
     }
-    Some((
-        layout.content_x,
-        layout
-            .area
-            .y
-            .saturating_add(u16::try_from(screen_row).unwrap_or(u16::MAX)),
-    ))
+    Some((layout.content_x, shifted(layout.area.y, screen_row)))
 }
 
 /// Marks the cursor's row for vim's `cursorline`.
@@ -841,17 +820,13 @@ fn draw_cursor_line(
     if screen_row >= usize::from(layout.editor_height) {
         return;
     }
-    let y = layout
-        .area
-        .y
-        .saturating_add(u16::try_from(screen_row).unwrap_or(u16::MAX));
-    let style = Style::default().add_modifier(Modifier::UNDERLINED);
+    let y = shifted(layout.area.y, screen_row);
+    // The mark stops at the text's right edge; the scrollbar is past it.
     let end = layout.content_x.saturating_add(layout.content_width);
-    for x in layout.area.x..end {
-        if let Some(cell) = buffer.cell_mut((x, y)) {
-            cell.set_style(style);
-        }
-    }
+    buffer.set_style(
+        Rect::new(layout.area.x, y, end - layout.area.x, 1),
+        Style::default().add_modifier(Modifier::UNDERLINED),
+    );
 }
 
 /// Draws the `s`/`t` labels over the text they select.
@@ -895,10 +870,7 @@ fn draw_jump_labels(
         if screen_row >= usize::from(layout.editor_height) {
             continue;
         }
-        let y = layout
-            .area
-            .y
-            .saturating_add(u16::try_from(screen_row).unwrap_or(u16::MAX));
+        let y = shifted(layout.area.y, screen_row);
         let start = row_display_column(editor, row_index, target.match_start);
 
         for (offset, key) in label.iter().enumerate() {
@@ -906,9 +878,7 @@ fn draw_jump_labels(
             if column < first_column || column >= last_column {
                 continue;
             }
-            let x = layout
-                .content_x
-                .saturating_add(u16::try_from(column - first_column).unwrap_or(u16::MAX));
+            let x = shifted(layout.content_x, column - first_column);
             if let Some(cell) = buffer.cell_mut((x, y)) {
                 cell.set_char(char::from(*key)).set_style(style);
             }
@@ -959,11 +929,7 @@ fn row_display_column(editor: &Editor, row_index: usize, index: usize) -> usize 
     let Some(row) = editor.buffer.rows.get(row_index) else {
         return 0;
     };
-    editor.buffer.data[row.start..index.clamp(row.start, row.end)]
-        .iter()
-        .fold(0usize, |column, byte| {
-            column.saturating_add(display_width(*byte))
-        })
+    display_columns(&editor.buffer.data[row.start..index.clamp(row.start, row.end)])
 }
 
 /// The geometry of a scrollbar track.
@@ -988,11 +954,17 @@ impl Track {
             .saturating_add(total_items.saturating_sub(1))
             / total_items;
         let thumb_height = thumb_height.clamp(1, track_height.max(1));
-        Self {
+        let track = Self {
             thumb_height,
             scrollable_track: track_height.saturating_sub(thumb_height),
             scrollable_items: total_items.saturating_sub(visible_items),
-        }
+        };
+        // Invariant: the thumb fits the track, and it never has more rows to
+        // travel than there are items to scroll, so every row maps back to an
+        // item (see `Viewport::item_from_track`).
+        debug_assert!(track_height == 0 || track.scrollable_track + thumb_height == track_height);
+        debug_assert!(track.scrollable_track <= track.scrollable_items);
+        track
     }
 
     /// The track row the thumb starts on when `first_item` is at the top.
@@ -1023,10 +995,7 @@ fn draw_scrollbar(
     let thumb_start = track.thumb_start(first_item);
 
     for row in 0..track_height {
-        let y = layout
-            .area
-            .y
-            .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
+        let y = shifted(layout.area.y, row);
         let in_thumb = (thumb_start..thumb_start.saturating_add(thumb_height)).contains(&row);
         if let Some(cell) = buffer.cell_mut((x, y)) {
             if in_thumb {
@@ -1047,11 +1016,10 @@ fn draw_status(
     options: &RenderOptions<'_>,
 ) {
     let style = Style::default().add_modifier(Modifier::REVERSED);
-    for x in layout.area.x..layout.area.x.saturating_add(layout.area.width) {
-        if let Some(cell) = buffer.cell_mut((x, layout.status_y)) {
-            cell.set_style(style);
-        }
-    }
+    buffer.set_style(
+        Rect::new(layout.area.x, layout.status_y, layout.area.width, 1),
+        style,
+    );
 
     let column = editor.buffer.cursor_column().unwrap_or(0).saturating_add(1);
     let row = editor.buffer.cursor_row().unwrap_or(0).saturating_add(1);
@@ -1119,14 +1087,7 @@ fn draw_prompt(
         let cursor_column = prompt_cursor
             .saturating_sub(first_character)
             .min(available - 1);
-        return Some((
-            layout
-                .area
-                .x
-                .saturating_add(1)
-                .saturating_add(u16::try_from(cursor_column).unwrap_or(u16::MAX)),
-            y,
-        ));
+        return Some((shifted(layout.area.x.saturating_add(1), cursor_column), y));
     }
 
     if let Some(message) = options.message {
@@ -1164,7 +1125,7 @@ fn write_characters(
     style: Style,
 ) {
     for (offset, character) in characters.take(usize::from(width)).enumerate() {
-        let x = x.saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
+        let x = shifted(x, offset);
         if let Some(cell) = buffer.cell_mut((x, y)) {
             cell.set_char(display_char(character)).set_style(style);
         }
@@ -1178,9 +1139,8 @@ fn write_characters(
 /// recent-file entries carry whatever bytes the filesystem holds.  The backend
 /// prints a cell's symbol verbatim, so an ESC surviving to a cell hands the
 /// terminal an escape sequence -- one crafted name could recolour the screen,
-/// or drive OSC 52 to write the clipboard.  `display_byte` already stands the
-/// same guard over buffer text; this is the same substitution for the paths
-/// that arrive as `char`s.
+/// or drive OSC 52 to write the clipboard.  Buffer bytes pass through here
+/// too, widened to `char`: C0, DEL and C1 are exactly the control bytes.
 fn display_char(character: char) -> char {
     if character.is_control() {
         '\u{fffd}'

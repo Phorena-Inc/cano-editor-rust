@@ -89,12 +89,6 @@ impl Recent {
     pub fn selection(&self) -> Option<PathBuf> {
         self.paths.get(self.cursor).cloned()
     }
-
-    /// Lossy display text for one entry.  The whole path is shown because two
-    /// recent files often share a base name.
-    pub fn display_name(path: &Path) -> String {
-        path.to_string_lossy().into_owned()
-    }
 }
 
 #[cfg(unix)]
@@ -110,7 +104,7 @@ fn path_bytes(path: &Path) -> Vec<u8> {
 }
 
 #[cfg(unix)]
-fn bytes_to_path(bytes: &[u8]) -> PathBuf {
+pub(crate) fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
 
@@ -118,7 +112,7 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 }
 
 #[cfg(not(unix))]
-fn bytes_to_path(bytes: &[u8]) -> PathBuf {
+pub(crate) fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 

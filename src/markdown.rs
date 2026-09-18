@@ -79,13 +79,10 @@ struct Blocks {
     /// Byte span of the previous line when it was plain paragraph text, which
     /// is the only thing a setext underline is allowed to promote.
     paragraph: Option<(usize, usize)>,
-    line_number: usize,
 }
 
 impl Blocks {
     fn line(&mut self, faces: &mut [Face], source: &[u8], start: usize, end: usize) {
-        let number = self.line_number;
-        self.line_number += 1;
         let paragraph = self.paragraph.take();
 
         // Front matter only ever opens on the very first line, so a `---`
@@ -95,7 +92,7 @@ impl Blocks {
             self.front_matter = !closes_front_matter(source, start, end);
             return;
         }
-        if number == 0 && opens_front_matter(source, start, end) {
+        if start == 0 && opens_front_matter(source, start, end) {
             paint(faces, start, end, Kind::Rule);
             self.front_matter = true;
             return;
@@ -219,8 +216,13 @@ fn inline(faces: &mut [Face], source: &[u8], start: usize, end: usize, depth: us
             b'h' => bare_url(faces, source, at, end),
             _ => None,
         };
-        // Every helper either consumes at least one byte or declines, so the
-        // scan cannot stall on a construct it failed to close.
+        // Every helper either consumes at least one byte of the line or
+        // declines, so the scan cannot stall on a construct it failed to
+        // close.  The `max` keeps release builds moving regardless.
+        debug_assert!(
+            next.is_none_or(|next| at < next && next <= end),
+            "{at}..{next:?}"
+        );
         at = next.unwrap_or(at + 1).max(at + 1);
     }
 }
@@ -432,11 +434,12 @@ fn trim_blanks(source: &[u8], start: usize, mut end: usize) -> usize {
 }
 
 fn run(source: &[u8], at: usize, end: usize, byte: u8) -> usize {
-    let mut length = 0;
-    while at + length < end && source[at + length] == byte {
-        length += 1;
-    }
-    length
+    source
+        .get(at..end)
+        .unwrap_or_default()
+        .iter()
+        .take_while(|found| **found == byte)
+        .count()
 }
 
 fn opens_fence(source: &[u8], content: usize, end: usize) -> Option<Fence> {

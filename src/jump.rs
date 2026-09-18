@@ -119,12 +119,19 @@ pub fn labels(count: usize, keys: &[u8]) -> Vec<Vec<u8>> {
     for group in 0..prefixes {
         let share = remaining / prefixes + usize::from(group < remaining % prefixes);
         for suffix in labels(share, keys) {
-            let mut label = Vec::with_capacity(1 + suffix.len());
-            label.push(keys[singles + group]);
-            label.extend_from_slice(&suffix);
-            result.push(label);
+            result.push([&[keys[singles + group]][..], &suffix].concat());
         }
     }
+    // Post: one label per target and none a prefix of another, so every
+    // typed sequence names at most one target and never stops short of it.
+    // Sorted, a prefix sits right before a label it begins.
+    debug_assert!(
+        result.len() == count && {
+            let mut sorted = result.clone();
+            sorted.sort();
+            sorted.windows(2).all(|pair| !pair[1].starts_with(&pair[0]))
+        }
+    );
     result
 }
 

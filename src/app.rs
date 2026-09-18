@@ -10,6 +10,9 @@ const ASSUMED_ROWS: usize = 24;
 /// How many lines of `:` and `/` history are kept.
 const HISTORY_CAPACITY: usize = 50;
 
+/// How deep mappings, their replays and `.` may nest before they are refused.
+const MAX_DEPTH: usize = 64;
+
 use crate::autoformat::{self, Steps};
 use crate::buffer::Highlight;
 use crate::command::{Action, CommandState, ConfigVariable, ExternalEffect, key, lex, parse};
@@ -20,7 +23,7 @@ use crate::history::UndoRecord;
 use crate::io::load_buffer;
 use crate::jump::{Kind, Target, targets};
 use crate::listchars;
-use crate::recent::Recent;
+use crate::recent::{Recent, bytes_to_path};
 use crate::render::Viewport;
 use crate::substitute::{self, Substitute};
 use crate::syntax::Language;
@@ -192,11 +195,10 @@ pub struct App {
     /// Refuses writes; used for the built-in help pages so a save-and-quit
     /// cannot overwrite the installed documentation.
     pub readonly: bool,
-    /// The needle used by `n`.  Kept separately from the prompt, which is
-    /// cleared whenever a `:` command or Escape resets the prompt line.
-    last_search: Vec<u8>,
-    /// `*` repeats whole-word, `/` repeats by substring.
-    last_search_word: bool,
+    /// The pattern `n` and `N` repeat.  Kept separately from the prompt, which
+    /// is cleared whenever a `:` command or Escape resets the prompt line, and
+    /// it remembers whether `*` (whole words) or `/` (substrings) set it.
+    last_search: Highlight,
     saved_buffer: Vec<u8>,
     buffer_replaced: bool,
 }
@@ -244,8 +246,7 @@ impl App {
             saved: true,
             message_pending: false,
             readonly: false,
-            last_search: Vec::new(),
-            last_search_word: false,
+            last_search: Highlight::default(),
             saved_buffer,
             buffer_replaced: false,
         }
@@ -265,6 +266,26 @@ impl App {
             self.saved_buffer.clone_from(&self.editor.buffer.data);
         }
         self.saved = self.editor.buffer.data == self.saved_buffer;
+        // Invariants every key path, mapped or replayed, has to leave behind:
+        // the buffer is whole, at most one pane is up and its cursor names an
+        // entry, the prompt cursor is inside the prompt, Insert-only state
+        // does not outlive Insert mode, and a jump only waits in the modes
+        // that start one.
+        debug_assert_eq!(self.editor.buffer.validate(), Ok(()));
+        debug_assert!(!(self.explorer.is_some() && self.recent_open));
+        debug_assert!(!self.recent_open || self.recent.cursor < self.recent.paths.len());
+        debug_assert!(self.history_open.is_none() || self.history_cursor < self.history_list.len());
+        debug_assert!(
+            !matches!(self.editor.mode, Mode::Command | Mode::Search)
+                || self.prompt_cursor <= self.prompt.len()
+        );
+        debug_assert!(
+            self.editor.mode == Mode::Insert
+                || (self.insert_pending.is_empty() && self.completion.is_none())
+        );
+        debug_assert!(
+            self.jump.is_none() || matches!(self.editor.mode, Mode::Normal | Mode::Visual)
+        );
         effects
     }
 
@@ -352,7 +373,7 @@ impl App {
             self.set_message("No previous change");
             return Vec::new();
         }
-        if depth >= 64 {
+        if depth >= MAX_DEPTH {
             self.set_message("Recursive repeat");
             return Vec::new();
         }
@@ -366,6 +387,8 @@ impl App {
     }
 
     fn dispatch(&mut self, input: Input, depth: usize) -> Vec<AppEffect> {
+        // Pre: every nested call checked the bound before recursing.
+        debug_assert!(depth <= MAX_DEPTH);
         if self.pending_replace {
             self.pending_replace = false;
             // Escape, arrows, and other non-character keys cancel the pending
@@ -429,7 +452,7 @@ impl App {
             && let Some(key) = mapping_key(input)
             && let Some(expansion) = self.commands.mapping(key).map(|bytes| bytes.to_vec())
         {
-            if depth >= 64 {
+            if depth >= MAX_DEPTH {
                 self.set_message("Recursive key map");
                 return Vec::new();
             }
@@ -440,8 +463,7 @@ impl App {
             Mode::Normal => self.normal_input(input, depth),
             Mode::Insert => self.insert_input(input, depth),
             Mode::Visual => self.visual_input(input),
-            Mode::Search => self.search_input(input),
-            Mode::Command => self.command_input(input),
+            Mode::Search | Mode::Command => self.prompt_input(input),
         }
     }
 
@@ -694,9 +716,6 @@ impl App {
 
     /// Consumes a count typed before a command, defaulting to one.
     fn take_count(&mut self) -> usize {
-        if self.count.is_empty() {
-            return 1;
-        }
         let repetitions = self.count.iter().fold(0usize, |value, digit| {
             value
                 .saturating_mul(10)
@@ -725,10 +744,10 @@ impl App {
             self.set_message("No previous search");
             return;
         }
-        if self.last_search_word {
+        if self.last_search.whole_word {
             self.move_to_next_match();
         } else {
-            self.editor.buffer.cursor = self.editor.buffer.search_wrapped(&self.last_search);
+            self.editor.buffer.cursor = self.editor.buffer.search_wrapped(&self.last_search.needle);
         }
     }
 
@@ -739,13 +758,11 @@ impl App {
             self.set_message("No word under the cursor");
             return;
         };
-        let needle = self.editor.buffer.data[start..end].to_vec();
-        self.last_search.clone_from(&needle);
-        self.last_search_word = true;
-        self.highlight = Highlight {
-            needle,
+        self.last_search = Highlight {
+            needle: self.editor.buffer.data[start..end].to_vec(),
             whole_word: true,
         };
+        self.highlight = self.last_search.clone();
         self.move_to_next_match();
     }
 
@@ -758,21 +775,12 @@ impl App {
         self.move_to_previous_match();
     }
 
-    /// The pattern `n` and `N` repeat, which remembers whether it came from
-    /// `*` or from `/`.
-    fn search_pattern(&self) -> Highlight {
-        Highlight {
-            needle: self.last_search.clone(),
-            whole_word: self.last_search_word,
-        }
-    }
-
     /// Moves to the next occurrence of the last search, wrapping at EOF.
     ///
     /// The scan starts one byte past the cursor so a match the cursor is
     /// already sitting on does not count as the next one.
     fn move_to_next_match(&mut self) {
-        let pattern = self.search_pattern();
+        let pattern = &self.last_search;
         let from = self.editor.buffer.cursor.saturating_add(1);
         let data = &self.editor.buffer.data;
         if let Some(at) = pattern.find(data, from).or_else(|| pattern.find(data, 0)) {
@@ -785,7 +793,7 @@ impl App {
     /// The scan stops before the cursor for the same reason the forward scan
     /// starts after it: a match under the cursor is where you already are.
     fn move_to_previous_match(&mut self) {
-        let pattern = self.search_pattern();
+        let pattern = &self.last_search;
         let cursor = self.editor.buffer.cursor;
         let data = &self.editor.buffer.data;
         let wrapped = || pattern.rfind(data, data.len().saturating_add(1));
@@ -848,7 +856,7 @@ impl App {
         let replacement = mapping.to.clone();
         self.insert_pending.clear();
 
-        if depth >= 64 {
+        if depth >= MAX_DEPTH {
             self.set_message("Recursive key map");
             self.editor.insert_byte(byte);
             return Vec::new();
@@ -1003,7 +1011,8 @@ impl App {
         Vec::new()
     }
 
-    fn command_input(&mut self, input: Input) -> Vec<AppEffect> {
+    /// Keys for the `:` and `/` prompts, which differ only in what Enter runs.
+    fn prompt_input(&mut self, input: Input) -> Vec<AppEffect> {
         match input {
             Input::Escape | Input::Control(3) => {
                 self.clear_prompt();
@@ -1019,56 +1028,39 @@ impl App {
             // Vim's `Ctrl-F` on the command line opens the history window.
             Input::Control(6) => self.open_history_pane(),
             Input::Byte(byte) => self.prompt_insert(byte),
+            Input::Enter if self.editor.mode == Mode::Search => self.run_search(),
             Input::Enter => return self.execute_command(),
             _ => {}
         }
         Vec::new()
     }
 
-    fn search_input(&mut self, input: Input) -> Vec<AppEffect> {
-        match input {
-            Input::Escape | Input::Control(3) => {
-                self.clear_prompt();
-                self.editor.mode = Mode::Normal;
+    /// Runs the `/` prompt: moves to the next match, or rewrites it when the
+    /// line is spelled `s/old/new`.
+    fn run_search(&mut self) {
+        let searched = self.prompt.clone();
+        self.record_history(Mode::Search, &searched);
+        let mut destination = self.editor.buffer.search_wrapped(&self.prompt);
+        let mut needle = self.prompt.clone();
+        if let Some(replacement) = self.prompt.strip_prefix(b"s/") {
+            let mut parts = replacement.split(|byte| *byte == b'/');
+            if let (Some(old), Some(new)) = (parts.next(), parts.next()) {
+                destination = self.editor.buffer.search_wrapped(old);
+                needle = old.to_vec();
+                self.editor.buffer.replace_first_after_cursor(old, new);
             }
-            Input::Backspace => self.prompt_backspace(),
-            Input::Left => self.prompt_cursor = self.prompt_cursor.saturating_sub(1),
-            Input::Right => {
-                self.prompt_cursor = (self.prompt_cursor + 1).min(self.prompt.len());
-            }
-            Input::Up => self.browse_history(true),
-            Input::Down => self.browse_history(false),
-            Input::Control(6) => self.open_history_pane(),
-            Input::Byte(byte) => self.prompt_insert(byte),
-            Input::Enter => {
-                let searched = self.prompt.clone();
-                self.record_history(Mode::Search, &searched);
-                let mut destination = self.editor.buffer.search_wrapped(&self.prompt);
-                let mut needle = self.prompt.clone();
-                if let Some(replacement) = self.prompt.strip_prefix(b"s/") {
-                    let mut parts = replacement.split(|byte| *byte == b'/');
-                    if let (Some(old), Some(new)) = (parts.next(), parts.next()) {
-                        destination = self.editor.buffer.search_wrapped(old);
-                        needle = old.to_vec();
-                        self.editor.buffer.replace_first_after_cursor(old, new);
-                    }
-                }
-                if !needle.is_empty() {
-                    // A `/` search highlights the same way vim's `hlsearch`
-                    // does, which is what `<leader>o` exists to switch off.
-                    self.last_search.clone_from(&needle);
-                    self.last_search_word = false;
-                    self.highlight = Highlight {
-                        needle,
-                        whole_word: false,
-                    };
-                }
-                self.editor.buffer.cursor = destination;
-                self.editor.mode = Mode::Normal;
-            }
-            _ => {}
         }
-        Vec::new()
+        if !needle.is_empty() {
+            // A `/` search highlights the same way vim's `hlsearch`
+            // does, which is what `<leader>o` exists to switch off.
+            self.last_search = Highlight {
+                needle,
+                whole_word: false,
+            };
+            self.highlight = self.last_search.clone();
+        }
+        self.editor.buffer.cursor = destination;
+        self.editor.mode = Mode::Normal;
     }
 
     fn execute_command(&mut self) -> Vec<AppEffect> {
@@ -1113,49 +1105,27 @@ impl App {
                 Vec::new()
             }
             Ok(action) => match self.commands.apply(action) {
-                Ok(Some(ExternalEffect::Save(output))) => {
-                    let path = if output.is_empty() {
-                        self.filename.clone()
-                    } else {
-                        bytes_to_path(&output)
-                    };
+                Ok(effect) => {
+                    let mut effects = Vec::new();
+                    match effect {
+                        // The command state saves to its own output, which
+                        // is what `output_path` reads.
+                        Some(ExternalEffect::Save(_)) => {
+                            effects.push(AppEffect::Save(self.output_path()));
+                        }
+                        Some(ExternalEffect::AutoFormat) => self.autoformat(),
+                        Some(ExternalEffect::ClearHighlight) => {
+                            self.highlight = Highlight::default();
+                        }
+                        None => {}
+                    }
                     if self.commands.message.is_some() {
                         self.message_pending = true;
                     }
-                    let mut effects = vec![AppEffect::Save(path)];
                     if self.commands.quit {
                         effects.push(AppEffect::Quit);
                     }
                     effects
-                }
-                Ok(Some(ExternalEffect::AutoFormat)) => {
-                    self.autoformat();
-                    self.commands
-                        .quit
-                        .then_some(AppEffect::Quit)
-                        .into_iter()
-                        .collect()
-                }
-                Ok(Some(ExternalEffect::ClearHighlight)) => {
-                    self.highlight = Highlight::default();
-                    if self.commands.message.is_some() {
-                        self.message_pending = true;
-                    }
-                    self.commands
-                        .quit
-                        .then_some(AppEffect::Quit)
-                        .into_iter()
-                        .collect()
-                }
-                Ok(None) => {
-                    if self.commands.message.is_some() {
-                        self.message_pending = true;
-                    }
-                    self.commands
-                        .quit
-                        .then_some(AppEffect::Quit)
-                        .into_iter()
-                        .collect()
                 }
                 Err(error) => {
                     self.set_message(error.to_string());
@@ -1221,18 +1191,11 @@ impl App {
         };
 
         let total = session.matches.len();
-        let index = if forward {
-            match session.index {
-                None => Some(0),
-                Some(index) if index.saturating_add(1) < total => Some(index + 1),
-                Some(_) => None,
-            }
-        } else {
-            match session.index {
-                None => total.checked_sub(1),
-                Some(0) => None,
-                Some(index) => Some(index - 1),
-            }
+        let index = match (forward, session.index) {
+            (true, None) => Some(0),
+            (true, Some(index)) => Some(index + 1).filter(|next| *next < total),
+            (false, None) => total.checked_sub(1),
+            (false, Some(index)) => index.checked_sub(1),
         };
         let chosen = index
             .and_then(|index| session.matches.get(index))
@@ -1370,7 +1333,8 @@ impl App {
         self.prompt = entry;
         self.prompt_cursor = self.prompt.len();
         if mode == Some(Mode::Search) {
-            self.search_input(Input::Enter)
+            self.run_search();
+            Vec::new()
         } else {
             self.execute_command()
         }
@@ -1404,13 +1368,9 @@ impl App {
     /// `init.lua` without each one needing a configuration slot of its own.
     /// A leading `:` is accepted, because that is how the line reads in vim.
     pub fn run_command(&mut self, line: &[u8]) -> Vec<AppEffect> {
-        self.clear_prompt();
-        self.prompt
-            .extend_from_slice(line.strip_prefix(b":").unwrap_or(line));
-        self.prompt_cursor = self.prompt.len();
-        let effects = self.execute_command();
-        self.clear_prompt();
-        effects
+        // `execute_command` clears the prompt again on every path.
+        self.prompt = line.strip_prefix(b":").unwrap_or(line).to_vec();
+        self.execute_command()
     }
 
     /// Applies a `:set` line, which may carry several options at once.
@@ -1448,7 +1408,7 @@ impl App {
                     listchars::parse(value).map_err(|error| error.to_string())?;
                 return Ok(());
             }
-            let variable = named(name)?;
+            let variable = ConfigVariable::parse(name).ok_or_else(|| unknown(name))?;
             let text = std::str::from_utf8(value).map_err(|_| unknown(name))?;
             let number = text.parse::<i64>().map_err(|_| {
                 format!(
@@ -1461,10 +1421,8 @@ impl App {
         }
 
         // `name!` toggles, `noname` clears, and a bare name sets.
-        let (name, toggle) = match option.strip_suffix(b"!") {
-            Some(name) => (name, true),
-            None => (option, false),
-        };
+        let toggle = option.ends_with(b"!");
+        let name = option.strip_suffix(b"!").unwrap_or(option);
         let (name, off) = match name.strip_prefix(b"no") {
             // `nobackup` is the negation, but an option whose own name starts
             // with `no` would be shadowed; the full name wins.
@@ -1532,32 +1490,7 @@ impl App {
             self.set_message("Nothing to comment");
             return;
         };
-        let lines = autoformat::changed_lines(before, &after);
-
-        // One record for the whole toggle: composing it from a record per
-        // line would make undoing a commented block a keystroke per line.
-        let (start, old_end, new_end) = changed_span(before, &after);
-        let original = before[start..old_end].to_vec();
-        // The cursor is put back on the line it was on, since the byte it was
-        // on has moved by the width of the marker.
-        let row = self.editor.buffer.cursor_row().unwrap_or(0);
-        if self
-            .editor
-            .buffer
-            .replace_region(start, old_end, &after[start..new_end])
-            .is_some()
-        {
-            self.editor
-                .history
-                .push_undo(UndoRecord::replace_region(start, new_end, original));
-        }
-        let line = self
-            .editor
-            .buffer
-            .rows
-            .get(row)
-            .or_else(|| self.editor.buffer.rows.last());
-        self.editor.buffer.cursor = line.map_or(0, |row| row.start);
+        let lines = self.rewrite_buffer(&after);
         let many = if lines == 1 { "" } else { "s" };
         self.set_message(format!("{} {lines} line{many}", direction.verb()));
     }
@@ -1592,12 +1525,24 @@ impl App {
             self.set_message("Already formatted");
             return;
         };
-        let lines = autoformat::changed_lines(before, &after);
+        let lines = self.rewrite_buffer(&after);
+        let many = if lines == 1 { "" } else { "s" };
+        self.set_message(format!("Formatted {lines} line{many}"));
+    }
 
-        let (start, old_end, new_end) = changed_span(before, &after);
+    /// Replaces the buffer with `after` as one undo step, and reports how many
+    /// lines changed.
+    ///
+    /// The record is narrowed to the span that actually changed, so rewriting
+    /// a file does not put a copy of all of it on the undo stack, and it is
+    /// one record: composing it per line would make undoing a commented or
+    /// reformatted block a keystroke per line.  The cursor goes back to the
+    /// start of the row it was on, since the byte it was on has moved.
+    fn rewrite_buffer(&mut self, after: &[u8]) -> usize {
+        let before = &self.editor.buffer.data;
+        let lines = autoformat::changed_lines(before, after);
+        let (start, old_end, new_end) = changed_span(before, after);
         let original = before[start..old_end].to_vec();
-        // The cursor is put back on the line it was on, since the byte it was
-        // on has almost certainly moved.
         let row = self.editor.buffer.cursor_row().unwrap_or(0);
         if self
             .editor
@@ -1609,6 +1554,8 @@ impl App {
                 .history
                 .push_undo(UndoRecord::replace_region(start, new_end, original));
         }
+        // Post: splicing only the changed span reproduced all of `after`.
+        debug_assert!(self.editor.buffer.data == after);
         let line = self
             .editor
             .buffer
@@ -1616,8 +1563,7 @@ impl App {
             .get(row)
             .or_else(|| self.editor.buffer.rows.last());
         self.editor.buffer.cursor = line.map_or(0, |row| row.start);
-        let many = if lines == 1 { "" } else { "s" };
-        self.set_message(format!("Formatted {lines} line{many}"));
+        lines
     }
 
     /// Runs a substitution, or opens the `c` confirmation for it.
@@ -1661,15 +1607,12 @@ impl App {
         let first = matches[0];
         let last_end = matches[matches.len() - 1] + command.pattern.len();
         let original = self.editor.buffer.data[first..last_end].to_vec();
+        let tail = self.editor.buffer.data.len() - last_end;
 
         for at in matches.iter().rev() {
             command.apply_one(&mut self.editor.buffer, *at);
         }
-        let grew = isize::try_from(command.replacement.len())
-            .unwrap_or(0)
-            .saturating_sub(isize::try_from(command.pattern.len()).unwrap_or(0))
-            .saturating_mul(isize::try_from(matches.len()).unwrap_or(0));
-        let new_end = last_end.saturating_add_signed(grew);
+        let new_end = self.editor.buffer.data.len() - tail;
         self.editor
             .history
             .push_undo(UndoRecord::replace_region(first, new_end, original));
@@ -1843,9 +1786,6 @@ impl App {
         let Some(jump) = self.jump.take() else {
             return;
         };
-        if matches!(input, Input::Escape | Input::Control(3)) {
-            return;
-        }
         let Input::Byte(byte) = input else {
             return;
         };
@@ -1901,9 +1841,6 @@ impl App {
     /// The byte range the last frame drew, which bounds every jump target.
     fn visible_range(&self) -> (usize, usize) {
         let rows = &self.editor.buffer.rows;
-        if rows.is_empty() {
-            return (0, 0);
-        }
         let (first_row, past) = if self.unrendered {
             (0, rows.len())
         } else {
@@ -2079,9 +2016,6 @@ impl App {
     /// Scrolls so the scrollbar thumb sits at track row `row`.
     fn scroll_to_track(&mut self, row: u16) {
         let rows = self.editor.buffer.rows.len();
-        if rows == 0 {
-            return;
-        }
         self.viewport.row = self.viewport.item_from_track(row, rows);
         self.pull_cursor_into_view();
     }
@@ -2091,11 +2025,8 @@ impl App {
     /// The origin is pinned to the cursor on every frame, so scrolling away
     /// from it and leaving the cursor behind would simply be undone.
     fn scroll_lines(&mut self, delta: isize) {
-        let rows = self.editor.buffer.rows.len();
-        if rows == 0 {
-            return;
-        }
-        self.viewport.scroll_by(delta, rows);
+        self.viewport
+            .scroll_by(delta, self.editor.buffer.rows.len());
         self.pull_cursor_into_view();
     }
 
@@ -2105,9 +2036,6 @@ impl App {
     /// left the cursor outside it would simply be undone.
     fn pull_cursor_into_view(&mut self) {
         let rows = self.editor.buffer.rows.len();
-        if rows == 0 {
-            return;
-        }
         let (first, past) = self.viewport.visible_rows();
         let last = past.saturating_sub(1).min(rows.saturating_sub(1));
         let current = self.editor.buffer.cursor_row().unwrap_or(0);
@@ -2120,31 +2048,19 @@ impl App {
     /// Moves the cursor to `row`, keeping the column it was already in.
     fn place_cursor_on_row(&mut self, row: usize) {
         let rows = self.editor.buffer.rows.len();
-        if rows == 0 {
-            return;
-        }
         let column = self.editor.buffer.cursor_column().unwrap_or(0);
         let bounds = self.editor.buffer.rows[row.min(rows - 1)];
         self.editor.buffer.cursor = bounds.start.saturating_add(column).min(bounds.end);
         self.editor.refresh_visual();
-    }
-
-    /// How many buffer rows the window last had room for.
-    ///
-    /// Before the first frame there is no answer, and a page has to be some
-    /// size, so an ordinary terminal is assumed until the renderer reports.
-    fn window_rows(&self) -> usize {
-        if self.viewport.rows == 0 {
-            ASSUMED_ROWS
-        } else {
-            self.viewport.rows
-        }
+        // Post: the cursor landed on the row asked for, clamped to the file.
+        debug_assert_eq!(self.editor.buffer.cursor_row(), Some(row.min(rows - 1)));
     }
 
     /// Vim's Ctrl-F, Ctrl-B, Ctrl-D, Ctrl-U, Ctrl-E and Ctrl-Y, reporting
     /// whether the key was one of them.
     fn scroll_command(&mut self, code: u8, count: usize) -> bool {
-        let rows = self.window_rows();
+        let rows =
+            std::num::NonZeroUsize::new(self.viewport.rows).map_or(ASSUMED_ROWS, usize::from);
         // Vim leaves two lines of the old screen behind when it pages, so
         // the reader has something to find their place against.
         let page = rows.saturating_sub(2).max(1);
@@ -2170,15 +2086,8 @@ impl App {
     /// vim's paging keys feel like turning a page.
     fn scroll_with_cursor(&mut self, delta: isize) {
         let rows = self.editor.buffer.rows.len();
-        if rows == 0 {
-            return;
-        }
         let current = self.editor.buffer.cursor_row().unwrap_or(0);
-        let wanted = if delta < 0 {
-            current.saturating_sub(delta.unsigned_abs())
-        } else {
-            current.saturating_add(delta.unsigned_abs()).min(rows - 1)
-        };
+        let wanted = current.saturating_add_signed(delta).min(rows - 1);
         self.viewport.scroll_by(delta, rows);
         self.place_cursor_on_row(wanted);
         self.pull_cursor_into_view();
@@ -2419,10 +2328,6 @@ fn unknown(name: &[u8]) -> String {
     format!("Unknown option: {}", String::from_utf8_lossy(name))
 }
 
-fn named(name: &[u8]) -> Result<ConfigVariable, String> {
-    ConfigVariable::parse(name).ok_or_else(|| unknown(name))
-}
-
 /// Splits a `:set` line into its options.
 ///
 /// A backslash escapes the character after it, which is how a `listchars`
@@ -2430,22 +2335,17 @@ fn named(name: &[u8]) -> Result<ConfigVariable, String> {
 fn split_options(spec: &[u8]) -> Vec<Vec<u8>> {
     let mut options: Vec<Vec<u8>> = vec![Vec::new()];
     let mut escaped = false;
-    for byte in spec {
-        if escaped {
-            options
-                .last_mut()
-                .expect("one option is always open")
-                .push(*byte);
-            escaped = false;
-        } else if *byte == b'\\' {
-            escaped = true;
-        } else if byte.is_ascii_whitespace() {
-            options.push(Vec::new());
-        } else {
-            options
-                .last_mut()
-                .expect("one option is always open")
-                .push(*byte);
+    for &byte in spec {
+        match (escaped, byte) {
+            (false, b'\\') => escaped = true,
+            (false, byte) if byte.is_ascii_whitespace() => options.push(Vec::new()),
+            (_, byte) => {
+                escaped = false;
+                options
+                    .last_mut()
+                    .expect("one option is always open")
+                    .push(byte);
+            }
         }
     }
     options.retain(|option| !option.is_empty());
@@ -2462,19 +2362,6 @@ fn is_markdown(path: &Path) -> bool {
                 "md" | "markdown" | "mdown" | "mkd" | "mkdn" | "mdx"
             )
         })
-}
-
-#[cfg(unix)]
-fn bytes_to_path(bytes: &[u8]) -> PathBuf {
-    use std::ffi::OsString;
-    use std::os::unix::ffi::OsStringExt;
-
-    PathBuf::from(OsString::from_vec(bytes.to_vec()))
-}
-
-#[cfg(not(unix))]
-fn bytes_to_path(bytes: &[u8]) -> PathBuf {
-    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
 /// Whether `input` begins a change that `.` should be able to repeat.

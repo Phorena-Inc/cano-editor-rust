@@ -68,15 +68,7 @@ impl fmt::Display for ConfigError {
     }
 }
 
-impl Error for ConfigError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Io { source, .. } => Some(source),
-            Self::Lua(source) => Some(source),
-            Self::Poisoned => None,
-        }
-    }
-}
+impl Error for ConfigError {}
 
 impl From<mlua::Error> for ConfigError {
     fn from(value: mlua::Error) -> Self {
@@ -111,32 +103,18 @@ fn evaluate_named(source: &[u8], name: &str) -> Result<LuaConfig, ConfigError> {
 
     let setup = lua.create_function(move |lua, table: Table| {
         with_config(&setup_state, |config| {
-            if let Some(value) = boolean_slot(&table, "syntax")? {
-                config.syntax = Some(value);
-            }
-            if let Some(value) = boolean_slot(&table, "relative")? {
-                config.relative = Some(value);
-            }
-            if let Some(value) = boolean_slot(&table, "auto_indent")? {
-                config.auto_indent = Some(value);
-            }
-            if let Some(value) = boolean_slot(&table, "indent")? {
-                config.indent = Some(value);
-            }
-            if let Some(value) = boolean_slot(&table, "undo_size")? {
-                config.undo_size = Some(value);
-            }
-            if let Some(value) = boolean_slot(&table, "cursorline")? {
-                config.cursorline = Some(value);
-            }
-            if let Some(value) = boolean_slot(&table, "mouse")? {
-                config.mouse = Some(value);
-            }
-            if let Some(value) = boolean_slot(&table, "backup")? {
-                config.backup = Some(value);
-            }
-            if let Some(value) = boolean_slot(&table, "list")? {
-                config.list = Some(value);
+            for (name, slot) in [
+                ("syntax", &mut config.syntax),
+                ("relative", &mut config.relative),
+                ("auto_indent", &mut config.auto_indent),
+                ("indent", &mut config.indent),
+                ("undo_size", &mut config.undo_size),
+                ("cursorline", &mut config.cursorline),
+                ("mouse", &mut config.mouse),
+                ("backup", &mut config.backup),
+                ("list", &mut config.list),
+            ] {
+                *slot = boolean_slot(&table, name)?.or(*slot);
             }
             Ok::<_, mlua::Error>(())
         })??;
@@ -205,13 +183,12 @@ pub fn load(path: &Path) -> Result<LuaConfig, ConfigError> {
 /// Reads and evaluates a Lua configuration file, or uses the built-in
 /// defaults when the file does not exist.
 pub fn load_or_default(path: &Path) -> Result<LuaConfig, ConfigError> {
-    match fs::read(path) {
-        Ok(source) => evaluate_named(&source, &path.to_string_lossy()),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(LuaConfig::default()),
-        Err(source) => Err(ConfigError::Io {
-            path: path.to_path_buf(),
-            source,
-        }),
+    // `load` only reports `Io` for the read itself.
+    match load(path) {
+        Err(ConfigError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            Ok(LuaConfig::default())
+        }
+        other => other,
     }
 }
 

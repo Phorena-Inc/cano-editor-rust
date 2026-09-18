@@ -1,9 +1,9 @@
 //! Safe `.cyntax` parsing and byte-oriented source tokenization.
 
-use std::error::Error;
-use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::buffer::is_word;
 
 /// An RGB color in the `.cyntax` 0–255 range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,7 +106,7 @@ impl Language {
             Self::Bash => bash_keywords(),
             Self::Vim => vim_keywords(),
             Self::Lua => lua_keywords(),
-            Self::Json => copied(&[b"false", b"null", b"true"]),
+            Self::Json => copied(&["false null true"]),
         }
     }
 
@@ -162,75 +162,31 @@ impl SyntaxConfig {
         }
     }
 
-    pub const fn preprocessor_color() -> Rgb {
-        Rgb::new(0, 255, 255)
-    }
-
-    pub const fn string_color() -> Rgb {
-        Rgb::new(255, 0, 255)
-    }
-
-    pub const fn comment_color() -> Rgb {
-        Rgb::new(0, 255, 0)
-    }
+    pub const PREPROCESSOR: Rgb = Rgb::new(0, 255, 255);
+    pub const STRING: Rgb = Rgb::new(255, 0, 255);
+    pub const COMMENT: Rgb = Rgb::new(0, 255, 0);
 }
 
-fn copied(words: &[&[u8]]) -> Vec<Vec<u8>> {
-    words.iter().map(|word| word.to_vec()).collect()
+/// Word tables are written as whitespace-separated lines to keep them short.
+fn copied(lines: &[&str]) -> Vec<Vec<u8>> {
+    lines
+        .iter()
+        .flat_map(|line| line.split_ascii_whitespace())
+        .map(|word| word.as_bytes().to_vec())
+        .collect()
 }
 
 fn builtin_keywords() -> Vec<Vec<u8>> {
     copied(&[
-        b"auto",
-        b"break",
-        b"case",
-        b"const",
-        b"continue",
-        b"default",
-        b"do",
-        b"else",
-        b"enum",
-        b"extern",
-        b"for",
-        b"goto",
-        b"if",
-        b"inline",
-        b"register",
-        b"restrict",
-        b"return",
-        b"sizeof",
-        b"static",
-        b"struct",
-        b"switch",
-        b"typedef",
-        b"union",
-        b"volatile",
-        b"while",
-        b"_Alignas",
-        b"_Alignof",
-        b"_Atomic",
-        b"_Generic",
-        b"_Noreturn",
-        b"_Static_assert",
-        b"_Thread_local",
+        "auto break case const continue default do else enum extern for goto if inline register",
+        "restrict return sizeof static struct switch typedef union volatile while _Alignas",
+        "_Alignof _Atomic _Generic _Noreturn _Static_assert _Thread_local",
     ])
 }
 
 fn builtin_types() -> Vec<Vec<u8>> {
     copied(&[
-        b"_Bool",
-        b"_Complex",
-        b"_Imaginary",
-        b"bool",
-        b"char",
-        b"double",
-        b"float",
-        b"int",
-        b"long",
-        b"short",
-        b"signed",
-        b"unsigned",
-        b"void",
+        "_Bool _Complex _Imaginary bool char double float int long short signed unsigned void",
     ])
 }
 
@@ -239,62 +195,12 @@ fn builtin_types() -> Vec<Vec<u8>> {
 fn cpp_keywords() -> Vec<Vec<u8>> {
     let mut words = builtin_keywords();
     words.extend(copied(&[
-        b"alignas",
-        b"alignof",
-        b"and",
-        b"and_eq",
-        b"asm",
-        b"bitand",
-        b"bitor",
-        b"catch",
-        b"class",
-        b"compl",
-        b"concept",
-        b"const_cast",
-        b"consteval",
-        b"constexpr",
-        b"constinit",
-        b"co_await",
-        b"co_return",
-        b"co_yield",
-        b"decltype",
-        b"delete",
-        b"dynamic_cast",
-        b"explicit",
-        b"export",
-        b"false",
-        b"final",
-        b"friend",
-        b"mutable",
-        b"namespace",
-        b"new",
-        b"noexcept",
-        b"not",
-        b"not_eq",
-        b"nullptr",
-        b"operator",
-        b"or",
-        b"or_eq",
-        b"override",
-        b"private",
-        b"protected",
-        b"public",
-        b"reinterpret_cast",
-        b"requires",
-        b"static_assert",
-        b"static_cast",
-        b"template",
-        b"this",
-        b"thread_local",
-        b"throw",
-        b"true",
-        b"try",
-        b"typeid",
-        b"typename",
-        b"using",
-        b"virtual",
-        b"xor",
-        b"xor_eq",
+        "alignas alignof and and_eq asm bitand bitor catch class compl concept const_cast",
+        "consteval constexpr constinit co_await co_return co_yield decltype delete dynamic_cast",
+        "explicit export false final friend mutable namespace new noexcept not not_eq nullptr",
+        "operator or or_eq override private protected public reinterpret_cast requires",
+        "static_assert static_cast template this thread_local throw true try typeid typename",
+        "using virtual xor xor_eq",
     ]));
     words
 }
@@ -302,248 +208,59 @@ fn cpp_keywords() -> Vec<Vec<u8>> {
 fn cpp_types() -> Vec<Vec<u8>> {
     let mut words = builtin_types();
     words.extend(copied(&[
-        b"char16_t",
-        b"char32_t",
-        b"char8_t",
-        b"nullptr_t",
-        b"ptrdiff_t",
-        b"size_t",
-        b"wchar_t",
+        "char16_t char32_t char8_t nullptr_t ptrdiff_t size_t wchar_t",
         // Standard-library names are not reserved, but a C++ file without
         // them colored reads as if half the types were missing.
-        b"array",
-        b"map",
-        b"optional",
-        b"pair",
-        b"set",
-        b"shared_ptr",
-        b"string",
-        b"string_view",
-        b"unique_ptr",
-        b"unordered_map",
-        b"unordered_set",
-        b"vector",
-        b"wstring",
+        "array map optional pair set shared_ptr string string_view unique_ptr unordered_map",
+        "unordered_set vector wstring",
     ]));
     words
 }
 
 fn rust_keywords() -> Vec<Vec<u8>> {
     copied(&[
-        b"as",
-        b"async",
-        b"await",
-        b"break",
-        b"const",
-        b"continue",
-        b"crate",
-        b"dyn",
-        b"else",
-        b"enum",
-        b"extern",
-        b"false",
-        b"fn",
-        b"for",
-        b"if",
-        b"impl",
-        b"in",
-        b"let",
-        b"loop",
-        b"match",
-        b"mod",
-        b"move",
-        b"mut",
-        b"pub",
-        b"ref",
-        b"return",
-        b"self",
-        b"static",
-        b"struct",
-        b"super",
-        b"trait",
-        b"true",
-        b"type",
-        b"union",
-        b"unsafe",
-        b"use",
-        b"where",
-        b"while",
+        "as async await break const continue crate dyn else enum extern false fn for if impl in",
+        "let loop match mod move mut pub ref return self static struct super trait true type",
+        "union unsafe use where while",
         // Reserved for future use; coloring them warns before the compiler
         // does.
-        b"abstract",
-        b"become",
-        b"box",
-        b"do",
-        b"final",
-        b"gen",
-        b"macro",
-        b"override",
-        b"priv",
-        b"try",
-        b"typeof",
-        b"unsized",
-        b"virtual",
-        b"yield",
+        "abstract become box do final gen macro override priv try typeof unsized virtual yield",
     ])
 }
 
 fn rust_types() -> Vec<Vec<u8>> {
     copied(&[
-        b"Self",
-        b"bool",
-        b"char",
-        b"f32",
-        b"f64",
-        b"i8",
-        b"i16",
-        b"i32",
-        b"i64",
-        b"i128",
-        b"isize",
-        b"str",
-        b"u8",
-        b"u16",
-        b"u32",
-        b"u64",
-        b"u128",
-        b"usize",
+        "Self bool char f32 f64 i8 i16 i32 i64 i128 isize str u8 u16 u32 u64 u128 usize",
         // Prelude names, including the variants that read as constructors.
-        b"Arc",
-        b"BTreeMap",
-        b"BTreeSet",
-        b"Box",
-        b"Cow",
-        b"Err",
-        b"HashMap",
-        b"HashSet",
-        b"None",
-        b"Ok",
-        b"Option",
-        b"PathBuf",
-        b"Rc",
-        b"RefCell",
-        b"Result",
-        b"Some",
-        b"String",
-        b"Vec",
+        "Arc BTreeMap BTreeSet Box Cow Err HashMap HashSet None Ok Option PathBuf Rc RefCell",
+        "Result Some String Vec",
     ])
 }
 
 fn python_keywords() -> Vec<Vec<u8>> {
     copied(&[
-        b"False",
-        b"None",
-        b"True",
-        b"and",
-        b"as",
-        b"assert",
-        b"async",
-        b"await",
-        b"break",
-        b"case",
-        b"class",
-        b"continue",
-        b"def",
-        b"del",
-        b"elif",
-        b"else",
-        b"except",
-        b"finally",
-        b"for",
-        b"from",
-        b"global",
-        b"if",
-        b"import",
-        b"in",
-        b"is",
-        b"lambda",
-        b"match",
-        b"nonlocal",
-        b"not",
-        b"or",
-        b"pass",
-        b"raise",
-        b"return",
-        b"try",
-        b"while",
-        b"with",
-        b"yield",
+        "False None True and as assert async await break case class continue def del elif else",
+        "except finally for from global if import in is lambda match nonlocal not or pass raise",
+        "return try while with yield",
         // Not reserved, but every Python file binds them the same way.
-        b"cls",
-        b"self",
+        "cls self",
     ])
 }
 
 fn python_types() -> Vec<Vec<u8>> {
     copied(&[
-        b"bool",
-        b"bytearray",
-        b"bytes",
-        b"complex",
-        b"dict",
-        b"float",
-        b"frozenset",
-        b"int",
-        b"list",
-        b"memoryview",
-        b"object",
-        b"range",
-        b"set",
-        b"str",
-        b"tuple",
-        b"type",
+        "bool bytearray bytes complex dict float frozenset int list memoryview object range set",
+        "str tuple type",
         // The typing spellings that appear in annotations.
-        b"Any",
-        b"Callable",
-        b"Dict",
-        b"Iterable",
-        b"Iterator",
-        b"List",
-        b"Optional",
-        b"Sequence",
-        b"Set",
-        b"Tuple",
-        b"Union",
+        "Any Callable Dict Iterable Iterator List Optional Sequence Set Tuple Union",
     ])
 }
 
 fn bash_keywords() -> Vec<Vec<u8>> {
     copied(&[
-        b"alias",
-        b"break",
-        b"case",
-        b"continue",
-        b"coproc",
-        b"declare",
-        b"do",
-        b"done",
-        b"elif",
-        b"else",
-        b"esac",
-        b"eval",
-        b"exec",
-        b"exit",
-        b"export",
-        b"fi",
-        b"for",
-        b"function",
-        b"if",
-        b"in",
-        b"local",
-        b"readonly",
-        b"return",
-        b"select",
-        b"set",
-        b"shift",
-        b"source",
-        b"then",
-        b"time",
-        b"trap",
-        b"typeset",
-        b"unalias",
-        b"unset",
-        b"until",
-        b"while",
+        "alias break case continue coproc declare do done elif else esac eval exec exit export fi",
+        "for function if in local readonly return select set shift source then time trap typeset",
+        "unalias unset until while",
     ])
 }
 
@@ -551,169 +268,37 @@ fn bash_keywords() -> Vec<Vec<u8>> {
 /// script with only its keywords colored reads as if half of it were missing.
 fn bash_builtins() -> Vec<Vec<u8>> {
     copied(&[
-        b"bg",
-        b"builtin",
-        b"cd",
-        b"command",
-        b"echo",
-        b"false",
-        b"fg",
-        b"getopts",
-        b"hash",
-        b"jobs",
-        b"kill",
-        b"let",
-        b"mapfile",
-        b"printf",
-        b"pwd",
-        b"read",
-        b"readarray",
-        b"test",
-        b"true",
-        b"type",
-        b"ulimit",
-        b"umask",
-        b"wait",
+        "bg builtin cd command echo false fg getopts hash jobs kill let mapfile printf pwd read",
+        "readarray test true type ulimit umask wait",
     ])
 }
 
 fn vim_keywords() -> Vec<Vec<u8>> {
     copied(&[
-        b"abbreviate",
-        b"augroup",
-        b"autocmd",
-        b"behave",
-        b"break",
-        b"call",
-        b"catch",
-        b"cabbrev",
-        b"cmap",
-        b"cnoremap",
-        b"colorscheme",
-        b"command",
-        b"continue",
-        b"delcommand",
-        b"echo",
-        b"echoerr",
-        b"echom",
-        b"echomsg",
-        b"else",
-        b"elseif",
-        b"endfor",
-        b"endfunc",
-        b"endfunction",
-        b"endif",
-        b"endtry",
-        b"endwhile",
-        b"execute",
-        b"filetype",
-        b"finally",
-        b"finish",
-        b"for",
-        b"function",
-        b"hi",
-        b"highlight",
-        b"iabbrev",
-        b"if",
-        b"imap",
-        b"inoremap",
-        b"let",
-        b"map",
-        b"nmap",
-        b"nnoremap",
-        b"nohl",
-        b"nohlsearch",
-        b"noremap",
-        b"normal",
-        b"omap",
-        b"onoremap",
-        b"packadd",
-        b"return",
-        b"runtime",
-        b"set",
-        b"setglobal",
-        b"setlocal",
-        b"silent",
-        b"source",
-        b"syntax",
-        b"try",
-        b"unlet",
-        b"unmap",
-        b"vmap",
-        b"vnoremap",
-        b"while",
-        b"xmap",
-        b"xnoremap",
+        "abbreviate augroup autocmd behave break call catch cabbrev cmap cnoremap colorscheme",
+        "command continue delcommand echo echoerr echom echomsg else elseif endfor endfunc",
+        "endfunction endif endtry endwhile execute filetype finally finish for function hi",
+        "highlight iabbrev if imap inoremap let map nmap nnoremap nohl nohlsearch noremap normal",
+        "omap onoremap packadd return runtime set setglobal setlocal silent source syntax try",
+        "unlet unmap vmap vnoremap while xmap xnoremap",
     ])
 }
 
 /// The option and variable names a vimrc is mostly made of.
 fn vim_options() -> Vec<Vec<u8>> {
     copied(&[
-        b"autoindent",
-        b"background",
-        b"backup",
-        b"clipboard",
-        b"cursorline",
-        b"encoding",
-        b"expandtab",
-        b"foldlevel",
-        b"foldmethod",
-        b"hlsearch",
-        b"ignorecase",
-        b"incsearch",
-        b"laststatus",
-        b"list",
-        b"listchars",
-        b"mapleader",
-        b"mouse",
-        b"number",
-        b"relativenumber",
-        b"ruler",
-        b"scrolloff",
-        b"shiftwidth",
-        b"showcmd",
-        b"signcolumn",
-        b"smartcase",
-        b"smartindent",
-        b"splitbelow",
-        b"splitright",
-        b"swapfile",
-        b"tabstop",
-        b"termguicolors",
-        b"timeoutlen",
-        b"undofile",
-        b"updatetime",
-        b"wildmenu",
-        b"wildmode",
-        b"wrap",
+        "autoindent background backup clipboard cursorline encoding expandtab foldlevel",
+        "foldmethod hlsearch ignorecase incsearch laststatus list listchars mapleader mouse",
+        "number relativenumber ruler scrolloff shiftwidth showcmd signcolumn smartcase",
+        "smartindent splitbelow splitright swapfile tabstop termguicolors timeoutlen undofile",
+        "updatetime wildmenu wildmode wrap",
     ])
 }
 
 fn lua_keywords() -> Vec<Vec<u8>> {
     copied(&[
-        b"and",
-        b"break",
-        b"do",
-        b"else",
-        b"elseif",
-        b"end",
-        b"false",
-        b"for",
-        b"function",
-        b"goto",
-        b"if",
-        b"in",
-        b"local",
-        b"nil",
-        b"not",
-        b"or",
-        b"repeat",
-        b"return",
-        b"then",
-        b"true",
-        b"until",
-        b"while",
+        "and break do else elseif end false for function goto if in local nil not or repeat",
+        "return then true until while",
     ])
 }
 
@@ -721,37 +306,9 @@ fn lua_keywords() -> Vec<Vec<u8>> {
 /// most of its words on.
 fn lua_builtins() -> Vec<Vec<u8>> {
     copied(&[
-        b"assert",
-        b"collectgarbage",
-        b"coroutine",
-        b"debug",
-        b"dofile",
-        b"error",
-        b"getmetatable",
-        b"io",
-        b"ipairs",
-        b"math",
-        b"next",
-        b"os",
-        b"package",
-        b"pairs",
-        b"pcall",
-        b"print",
-        b"rawequal",
-        b"rawget",
-        b"rawlen",
-        b"rawset",
-        b"require",
-        b"select",
-        b"self",
-        b"setmetatable",
-        b"string",
-        b"table",
-        b"tonumber",
-        b"tostring",
-        b"type",
-        b"unpack",
-        b"xpcall",
+        "assert collectgarbage coroutine debug dofile error getmetatable io ipairs math next os",
+        "package pairs pcall print rawequal rawget rawlen rawset require select self setmetatable",
+        "string table tonumber tostring type unpack xpcall",
     ])
 }
 
@@ -829,60 +386,8 @@ impl PartialEq for SyntaxError {
 
 impl Eq for SyntaxError {}
 
-impl fmt::Display for SyntaxError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io { path, source } => {
-                write!(f, "could not read {}: {source}", path.display())
-            }
-            Self::UnterminatedGroup => f.write_str("unterminated .cyntax group"),
-            Self::UnknownGroup { group, tag } => write!(
-                f,
-                "unknown .cyntax group {group}: {}",
-                String::from_utf8_lossy(tag)
-            ),
-            Self::MissingFields { group } => {
-                write!(f, ".cyntax group {group} needs a tag and three colors")
-            }
-            Self::InvalidColor { group, component } => write!(
-                f,
-                "invalid color in .cyntax group {group}: {}",
-                String::from_utf8_lossy(component)
-            ),
-            Self::ColorOutOfRange { group, value } => {
-                write!(
-                    f,
-                    "color {value} in .cyntax group {group} is outside 0..=255"
-                )
-            }
-            Self::EmptyWord { group } => write!(f, "empty word in .cyntax group {group}"),
-        }
-    }
-}
-
-impl Error for SyntaxError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Io { source, .. } => Some(source),
-            _ => None,
-        }
-    }
-}
-
-fn trim(bytes: &[u8]) -> &[u8] {
-    let start = bytes
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
-    let end = bytes
-        .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-        .map_or(start, |index| index + 1);
-    &bytes[start..end]
-}
-
 fn color(component: &[u8], group: usize) -> Result<u8, SyntaxError> {
-    let component = trim(component);
+    let component = component.trim_ascii();
     let text = std::str::from_utf8(component).map_err(|_| SyntaxError::InvalidColor {
         group,
         component: component.to_vec(),
@@ -902,7 +407,7 @@ fn color(component: &[u8], group: usize) -> Result<u8, SyntaxError> {
 /// is never overridable from the file: it decides how the source is lexed,
 /// which a palette has no business changing.
 pub fn parse(source: &[u8], language: Language) -> Result<SyntaxConfig, SyntaxError> {
-    let source = trim(source);
+    let source = source.trim_ascii();
     if source.is_empty() {
         return Ok(SyntaxConfig::for_language(language));
     }
@@ -912,7 +417,7 @@ pub fn parse(source: &[u8], language: Language) -> Result<SyntaxConfig, SyntaxEr
 
     let mut config = SyntaxConfig::for_language(language);
     for (group_index, raw_group) in source.split(|byte| *byte == b'.').enumerate() {
-        let raw_group = trim(raw_group);
+        let raw_group = raw_group.trim_ascii();
         if raw_group.is_empty() {
             continue;
         }
@@ -920,13 +425,19 @@ pub fn parse(source: &[u8], language: Language) -> Result<SyntaxConfig, SyntaxEr
         if fields.len() < 4 {
             return Err(SyntaxError::MissingFields { group: group_index });
         }
-        let tag = trim(fields[0]);
-        if !matches!(tag, b"k" | b"t" | b"w") {
-            return Err(SyntaxError::UnknownGroup {
-                group: group_index,
-                tag: tag.to_vec(),
-            });
-        }
+        let tag = fields[0].trim_ascii();
+        // `w` has no built-in list: an empty word group stays empty.
+        let (group, defaults) = match tag {
+            b"k" => (&mut config.keyword, language.keywords()),
+            b"t" => (&mut config.type_name, language.types()),
+            b"w" => (&mut config.word, Vec::new()),
+            _ => {
+                return Err(SyntaxError::UnknownGroup {
+                    group: group_index,
+                    tag: tag.to_vec(),
+                });
+            }
+        };
         let parsed_color = Rgb::new(
             color(fields[1], group_index)?,
             color(fields[2], group_index)?,
@@ -935,36 +446,15 @@ pub fn parse(source: &[u8], language: Language) -> Result<SyntaxConfig, SyntaxEr
 
         let mut words = Vec::new();
         for field in &fields[4..] {
-            let word = trim(field);
+            let word = field.trim_ascii();
             if word.is_empty() {
                 return Err(SyntaxError::EmptyWord { group: group_index });
             }
             words.push(word.to_vec());
         }
 
-        match tag {
-            b"k" => {
-                config.keyword.color = parsed_color;
-                config.keyword.words = if words.is_empty() {
-                    language.keywords()
-                } else {
-                    words
-                };
-            }
-            b"t" => {
-                config.type_name.color = parsed_color;
-                config.type_name.words = if words.is_empty() {
-                    language.types()
-                } else {
-                    words
-                };
-            }
-            b"w" => {
-                config.word.color = parsed_color;
-                config.word.words = words;
-            }
-            _ => unreachable!("tag was checked above"),
-        }
+        group.color = parsed_color;
+        group.words = if words.is_empty() { defaults } else { words };
     }
     Ok(config)
 }
@@ -995,10 +485,6 @@ pub struct SyntaxToken {
     pub kind: SyntaxKind,
     pub start: usize,
     pub end: usize,
-}
-
-fn is_word_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 fn in_group(word: &[u8], group: &SyntaxGroup) -> bool {
@@ -1037,7 +523,7 @@ fn line_end(source: &[u8], at: usize) -> usize {
 }
 
 fn word_end(source: &[u8], mut at: usize) -> usize {
-    while at < source.len() && is_word_byte(source[at]) {
+    while at < source.len() && is_word(source[at]) {
         at += 1;
     }
     at
@@ -1088,6 +574,15 @@ fn quoted(source: &[u8], at: usize, quote: u8, limit: usize) -> (usize, bool) {
     (scan, false)
 }
 
+/// A literal that has to close on its own line, or is not a literal at all.
+fn line_literal(source: &[u8], at: usize, quote: u8) -> Option<Scan> {
+    let (end, terminated) = quoted(source, at, quote, line_end(source, at));
+    terminated.then_some(Scan {
+        kind: Some(SyntaxKind::String),
+        end,
+    })
+}
+
 fn c_scan(source: &[u8], at: usize) -> Option<Scan> {
     match source[at] {
         b'/' if source.get(at + 1) == Some(&b'/') => {
@@ -1100,13 +595,7 @@ fn c_scan(source: &[u8], at: usize) -> Option<Scan> {
         // A character literal must close on the same line; otherwise a stray
         // apostrophe (say, inside a comment) would swallow the rest of the
         // file as one string span.
-        b'\'' => {
-            let (end, terminated) = quoted(source, at, b'\'', line_end(source, at));
-            terminated.then_some(Scan {
-                kind: Some(SyntaxKind::String),
-                end,
-            })
-        }
+        b'\'' => line_literal(source, at, b'\''),
         b'#' => Scan::colored(SyntaxKind::Preprocessor, word_end(source, at + 1)),
         _ => None,
     }
@@ -1130,11 +619,8 @@ fn rust_scan(source: &[u8], at: usize) -> Option<Scan> {
         // told apart by what follows the second byte.
         b'\'' => {
             let literal = source.get(at + 1) == Some(&b'\\') || source.get(at + 2) == Some(&b'\'');
-            if literal {
-                let (end, terminated) = quoted(source, at, b'\'', line_end(source, at));
-                if terminated {
-                    return Scan::colored(SyntaxKind::String, end);
-                }
+            if literal && let Some(scan) = line_literal(source, at, b'\'') {
+                return Some(scan);
             }
             Scan::plain(word_end(source, at + 1))
         }
@@ -1163,22 +649,18 @@ fn rust_raw_string(source: &[u8], at: usize) -> Option<usize> {
     if source.get(scan) != Some(&b'"') {
         return None;
     }
-    scan += 1;
-    while scan < source.len() {
-        if source[scan] == b'"' {
-            let closing = scan + 1;
-            let seen = source[closing..]
-                .iter()
-                .take(hashes)
-                .take_while(|byte| **byte == b'#')
-                .count();
-            if seen == hashes {
-                return Some(closing + hashes);
-            }
-        }
-        scan += 1;
-    }
-    Some(source.len())
+    let mut closer = vec![b'#'; hashes + 1];
+    closer[0] = b'"';
+    Some(close_at(source, scan + 1, &closer))
+}
+
+/// The end of the first `closer` at or after `from`; an unclosed literal runs
+/// to EOF.
+fn close_at(source: &[u8], from: usize, closer: &[u8]) -> usize {
+    source[from..]
+        .windows(closer.len())
+        .position(|window| window == closer)
+        .map_or(source.len(), |offset| from + offset + closer.len())
 }
 
 /// Consumes `#[…]` or `#![…]`, which is how Rust spells a directive.
@@ -1220,7 +702,7 @@ fn python_scan(source: &[u8], at: usize) -> Option<Scan> {
         // A decorator opens its line; `@` anywhere else is matrix multiply.
         b'@' if only_blanks_before(source, at) => {
             let mut end = at + 1;
-            while end < source.len() && (is_word_byte(source[end]) || source[end] == b'.') {
+            while end < source.len() && (is_word(source[end]) || source[end] == b'.') {
                 end += 1;
             }
             Scan::colored(SyntaxKind::Preprocessor, end)
@@ -1307,7 +789,7 @@ fn bash_expansion(source: &[u8], at: usize) -> Option<Scan> {
             scan += 1;
         }
         scan.saturating_add(1).min(source.len())
-    } else if is_word_byte(next) {
+    } else if is_word(next) {
         word_end(source, at + 1)
     } else if matches!(next, b'?' | b'!' | b'#' | b'@' | b'*' | b'$' | b'-') {
         at + 2
@@ -1332,20 +814,14 @@ fn vim_scan(source: &[u8], at: usize) -> Option<Scan> {
                 Scan::colored(SyntaxKind::Comment, limit)
             }
         }
-        b'\'' => {
-            let (end, terminated) = quoted(source, at, b'\'', line_end(source, at));
-            terminated.then_some(Scan {
-                kind: Some(SyntaxKind::String),
-                end,
-            })
-        }
+        b'\'' => line_literal(source, at, b'\''),
         // `<CR>`, `<leader>` and `<C-x>` are vim's notation for keys.
         b'<' => {
             let limit = line_end(source, at);
             let inside = source.get(at + 1..limit)?;
             let length = inside
                 .iter()
-                .take_while(|byte| is_word_byte(**byte) || **byte == b'-')
+                .take_while(|byte| is_word(**byte) || **byte == b'-')
                 .count();
             // `a < b` is a comparison, not a key: the brackets have to hold
             // something and close immediately after it.
@@ -1444,22 +920,10 @@ fn lua_long_bracket(source: &[u8], at: usize) -> Option<usize> {
     if source.get(scan) != Some(&b'[') {
         return None;
     }
-    scan += 1;
-    while scan < source.len() {
-        if source[scan] == b']' {
-            let closing = scan + 1;
-            let seen = source[closing..]
-                .iter()
-                .take(level)
-                .take_while(|byte| **byte == b'=')
-                .count();
-            if seen == level && source.get(closing + level) == Some(&b']') {
-                return Some(closing + level + 1);
-            }
-        }
-        scan += 1;
-    }
-    Some(source.len())
+    let mut closer = vec![b'='; level + 2];
+    closer[0] = b']';
+    closer[level + 1] = b']';
+    Some(close_at(source, scan + 1, &closer))
 }
 
 fn only_blanks_before(source: &[u8], at: usize) -> bool {
@@ -1490,8 +954,15 @@ pub fn tokens(source: &[u8], config: &SyntaxConfig) -> Vec<SyntaxToken> {
             Language::Json => json_scan(source, at),
         };
         if let Some(scan) = scanned {
-            // Every scanner consumes at least the byte it started on, so a
-            // construct it could not close can never stall the loop.
+            // Scanner contract: every scanner consumes at least the byte it
+            // started on and stays inside the source, so a construct it could
+            // not close can never stall the loop.  The clamp is the release
+            // build's guard should a scanner ever break that.
+            debug_assert!(
+                at < scan.end && scan.end <= source.len(),
+                "scan {at}..{}",
+                scan.end
+            );
             let end = scan.end.clamp(at + 1, source.len());
             if let Some(kind) = scan.kind {
                 result.push(SyntaxToken {
@@ -1504,7 +975,7 @@ pub fn tokens(source: &[u8], config: &SyntaxConfig) -> Vec<SyntaxToken> {
             continue;
         }
 
-        if is_word_byte(source[at]) {
+        if is_word(source[at]) {
             let start = at;
             at = word_end(source, at + 1);
             let word = &source[start..at];
@@ -1529,6 +1000,14 @@ pub fn tokens(source: &[u8], config: &SyntaxConfig) -> Vec<SyntaxToken> {
 
         at += 1;
     }
+    // Post: spans are non-empty, in order and inside the source, which is
+    // what the renderer's slice writes rely on.
+    debug_assert!(
+        result
+            .iter()
+            .all(|t| t.start < t.end && t.end <= source.len())
+            && result.windows(2).all(|pair| pair[0].end <= pair[1].start)
+    );
     result
 }
 

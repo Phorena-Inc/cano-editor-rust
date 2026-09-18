@@ -11,7 +11,7 @@
 
 use std::fmt;
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, is_word};
 
 /// Which lines a substitution covers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,10 +55,6 @@ impl Pattern {
         self.text.len()
     }
 
-    fn is_word(byte: u8) -> bool {
-        byte.is_ascii_alphanumeric() || byte == b'_'
-    }
-
     fn matches_at(&self, data: &[u8], at: usize) -> bool {
         let Some(candidate) = data.get(at..at.saturating_add(self.text.len())) else {
             return false;
@@ -75,14 +71,14 @@ impl Pattern {
             && at
                 .checked_sub(1)
                 .and_then(|index| data.get(index))
-                .is_some_and(|byte| Self::is_word(*byte))
+                .is_some_and(|byte| is_word(*byte))
         {
             return false;
         }
         if self.end_boundary
             && data
                 .get(at + self.text.len())
-                .is_some_and(|byte| Self::is_word(*byte))
+                .is_some_and(|byte| is_word(*byte))
         {
             return false;
         }
@@ -112,7 +108,6 @@ pub struct Substitute {
 pub enum SubstituteError {
     MissingPattern,
     UnknownFlag(u8),
-    EmptyRange,
 }
 
 impl fmt::Display for SubstituteError {
@@ -122,7 +117,6 @@ impl fmt::Display for SubstituteError {
             Self::UnknownFlag(flag) => {
                 write!(f, "Unknown substitute flag: {}", char::from(*flag))
             }
-            Self::EmptyRange => f.write_str("Invalid range"),
         }
     }
 }
@@ -177,12 +171,10 @@ pub fn parse(input: &[u8]) -> Option<Result<Substitute, SubstituteError>> {
 
 /// Reads the optional line range in front of the command name.
 fn parse_range(input: &[u8]) -> Option<(Range, usize)> {
-    let mut at = 0;
     if input.first() == Some(&b'%') {
         return Some((Range::WholeFile, 1));
     }
-    let (first, next) = parse_address(input, at)?;
-    at = next;
+    let (first, at) = parse_address(input, 0)?;
     let Some(first) = first else {
         return Some((Range::CurrentLine, at));
     };
@@ -230,23 +222,12 @@ fn split(input: &[u8], mut at: usize, delimiter: u8) -> (Vec<u8>, usize) {
             match input.get(at + 1) {
                 // Only the delimiter and a backslash lose their backslash;
                 // `\<` and `\>` have to survive for the pattern to see them.
-                Some(next) if *next == delimiter || *next == b'\\' => {
-                    text.push(*next);
-                    at += 2;
-                    continue;
-                }
-                Some(next) => {
-                    text.push(byte);
-                    text.push(*next);
-                    at += 2;
-                    continue;
-                }
-                None => {
-                    text.push(byte);
-                    at += 1;
-                    continue;
-                }
+                Some(&next) if next == delimiter || next == b'\\' => text.push(next),
+                Some(&next) => text.extend([byte, next]),
+                None => text.push(byte),
             }
+            at = (at + 2).min(input.len());
+            continue;
         }
         if byte == delimiter {
             return (text, at + 1);
@@ -328,6 +309,16 @@ impl Substitute {
                 at = index + self.pattern.len();
             }
         }
+        // Post: matches are in order, never overlap and lie inside `range`,
+        // which is what applying them back to front relies on.
+        debug_assert!(
+            found
+                .windows(2)
+                .all(|pair| pair[0] + self.pattern.len() <= pair[1])
+                && found
+                    .iter()
+                    .all(|&at| start <= at && at + self.pattern.len() <= end)
+        );
         found
     }
 

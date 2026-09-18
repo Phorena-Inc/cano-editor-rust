@@ -14,6 +14,12 @@ pub fn is_keyword(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_alphanumeric() || byte >= 0x80
 }
 
+/// The ASCII-only word class the legacy motions, `*` and the highlighters
+/// use: unlike [`is_keyword`], bytes past 0x7f are separators.
+pub fn is_word(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Row {
     pub start: usize,
@@ -21,10 +27,6 @@ pub struct Row {
 }
 
 impl Row {
-    pub fn len(self) -> usize {
-        self.end.saturating_sub(self.start)
-    }
-
     pub fn is_empty(self) -> bool {
         self.start == self.end
     }
@@ -50,6 +52,10 @@ pub enum InvariantError {
     },
 }
 
+/// Invariant (see `validate`): `cursor <= data.len()` and `rows` is exactly
+/// what `derived_rows` makes of `data`, so there is always at least one row.
+/// The fields are public, so the invariant is re-checked in debug builds
+/// wherever the buffer changes rather than trusted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Buffer {
     pub data: Vec<u8>,
@@ -82,7 +88,7 @@ impl Highlight {
         }
         let before = at.checked_sub(1).map(|index| data[index]);
         let after = data.get(at + self.needle.len()).copied();
-        !before.is_some_and(Buffer::is_word) && !after.is_some_and(Buffer::is_word)
+        !before.is_some_and(is_word) && !after.is_some_and(is_word)
     }
 
     /// The start of the first occurrence at or after `from`.
@@ -195,7 +201,7 @@ impl Buffer {
     pub fn word_at(&self, index: usize) -> Option<(usize, usize)> {
         let row = *self.rows.get(self.row_for_index(index)?)?;
         let mut start = index.clamp(row.start, row.end);
-        while start < row.end && !Self::is_word(self.data[start]) {
+        while start < row.end && !is_word(self.data[start]) {
             start += 1;
         }
         if start >= row.end {
@@ -203,11 +209,11 @@ impl Buffer {
         }
         // The cursor may have landed inside a word rather than on its first
         // byte, so walk back to where the word actually starts.
-        while start > row.start && Self::is_word(self.data[start - 1]) {
+        while start > row.start && is_word(self.data[start - 1]) {
             start -= 1;
         }
         let mut end = start;
-        while end < row.end && Self::is_word(self.data[end]) {
+        while end < row.end && is_word(self.data[end]) {
             end += 1;
         }
         Some((start, end))
@@ -258,11 +264,12 @@ impl Buffer {
     /// The keyword bytes immediately before `index`, which is the prefix a
     /// completion has to extend.
     pub fn keyword_before(&self, index: usize) -> &[u8] {
-        let mut start = index.min(self.data.len());
-        while start > 0 && is_keyword(self.data[start - 1]) {
-            start -= 1;
-        }
-        &self.data[start..index.min(self.data.len())]
+        let end = index.min(self.data.len());
+        let start = self.data[..end]
+            .iter()
+            .rposition(|byte| !is_keyword(*byte))
+            .map_or(0, |at| at + 1);
+        &self.data[start..end]
     }
 
     pub fn cursor_row(&self) -> Option<usize> {
@@ -281,6 +288,7 @@ impl Buffer {
         self.data.insert(self.cursor, byte);
         self.cursor += 1;
         self.calculate_rows();
+        debug_assert_eq!(self.validate(), Ok(()));
         self.cursor
     }
 
@@ -291,6 +299,7 @@ impl Buffer {
         }
         self.data.remove(self.cursor);
         self.calculate_rows();
+        debug_assert_eq!(self.validate(), Ok(()));
         true
     }
 
@@ -311,10 +320,10 @@ impl Buffer {
     /// legacy implementation's undefined memory behavior.
     pub fn delete_selection(&mut self, start: usize, end: usize) -> Option<SelectionDeletion> {
         let clipboard = self.copy_selection(start, end)?;
-        let undo = self.data.get(start..end)?.to_vec();
         self.cursor = start;
-        self.data.drain(start..end);
+        let undo = self.data.drain(start..end).collect();
         self.calculate_rows();
+        debug_assert_eq!(self.validate(), Ok(()));
         Some(SelectionDeletion { clipboard, undo })
     }
 
@@ -327,10 +336,13 @@ impl Buffer {
         if start > end || end > self.data.len() {
             return None;
         }
-        let removed = self.data[start..end].to_vec();
-        self.data.splice(start..end, bytes.iter().copied());
+        let removed = self
+            .data
+            .splice(start..end, bytes.iter().copied())
+            .collect();
         self.calculate_rows();
         self.cursor = self.cursor.min(self.data.len());
+        debug_assert_eq!(self.validate(), Ok(()));
         Some(removed)
     }
 
@@ -343,6 +355,7 @@ impl Buffer {
         self.cursor = start;
         self.data.splice(start..start, selection.iter().copied());
         self.calculate_rows();
+        debug_assert_eq!(self.validate(), Ok(()));
         true
     }
 
@@ -356,6 +369,7 @@ impl Buffer {
         let column = self.cursor - self.rows[row_index].start;
         let target = self.rows[row_index - 1];
         self.cursor = (target.start + column).min(target.end);
+        debug_assert_eq!(self.cursor_row(), Some(row_index - 1));
     }
 
     pub fn move_down(&mut self) {
@@ -368,6 +382,7 @@ impl Buffer {
         let column = self.cursor - self.rows[row_index].start;
         let target = self.rows[row_index + 1];
         self.cursor = (target.start + column).min(target.end);
+        debug_assert_eq!(self.cursor_row(), Some(row_index + 1));
     }
 
     pub fn move_left(&mut self) {
@@ -406,21 +421,17 @@ impl Buffer {
         }
     }
 
-    fn is_word(byte: u8) -> bool {
-        byte.is_ascii_alphanumeric() || byte == b'_'
-    }
-
     fn is_space(byte: u8) -> bool {
         matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
     }
 
     /// Legacy `e`: byte/ASCII oriented, including its whitespace behavior.
     pub fn move_word_end(&mut self) {
-        if self.cursor + 1 < self.data.len() && !Self::is_word(self.data[self.cursor + 1]) {
+        if self.cursor + 1 < self.data.len() && !is_word(self.data[self.cursor + 1]) {
             self.cursor += 1;
         }
         while self.cursor + 1 < self.data.len()
-            && (Self::is_word(self.data[self.cursor + 1]) || Self::is_space(self.data[self.cursor]))
+            && (is_word(self.data[self.cursor + 1]) || Self::is_space(self.data[self.cursor]))
         {
             self.cursor += 1;
         }
@@ -429,7 +440,7 @@ impl Buffer {
     /// Legacy `w`, whose transition rules intentionally differ from Vim.
     pub fn move_word_next(&mut self) {
         while self.cursor < self.data.len()
-            && (Self::is_word(self.data[self.cursor])
+            && (is_word(self.data[self.cursor])
                 || self
                     .data
                     .get(self.cursor + 1)
@@ -448,11 +459,11 @@ impl Buffer {
             return;
         }
         self.cursor = self.cursor.min(self.data.len());
-        if self.cursor > 1 && !Self::is_word(self.data[self.cursor - 1]) {
+        if self.cursor > 1 && !is_word(self.data[self.cursor - 1]) {
             self.cursor -= 1;
         }
         while self.cursor > 1
-            && (Self::is_word(self.data[self.cursor - 1])
+            && (is_word(self.data[self.cursor - 1])
                 || self
                     .data
                     .get(self.cursor + 1)
@@ -474,19 +485,11 @@ impl Buffer {
         }
 
         let base = self.cursor % self.data.len();
-        for offset in 1..self.data.len() {
-            let position = (base + offset) % self.data.len();
-            if needle.is_empty() {
-                return position;
-            }
-            let Some(end) = position.checked_add(needle.len()) else {
-                continue;
-            };
-            if self.data.get(position..end) == Some(needle) {
-                return position;
-            }
-        }
-        self.cursor
+        // An empty needle matches at once, on the byte after the cursor.
+        (1..self.data.len())
+            .map(|offset| (base + offset) % self.data.len())
+            .find(|&position| self.data[position..].starts_with(needle))
+            .unwrap_or(self.cursor)
     }
 
     /// Searches, replaces only when the search moved, and leaves the cursor
@@ -496,13 +499,10 @@ impl Buffer {
         if position == self.cursor {
             return false;
         }
-        self.cursor = position;
-        for _ in 0..old.len() {
-            let _ = self.delete_byte();
-        }
-        for byte in new {
-            self.insert_byte(*byte);
-        }
+        // `search_wrapped` only stops where `old` matches, so the range is
+        // always inside the buffer.
+        self.replace_region(position, position + old.len(), new);
+        self.cursor = position + new.len();
         true
     }
 
@@ -522,51 +522,27 @@ impl Buffer {
         matches!(byte, b'(' | b'[' | b'{')
     }
 
-    pub fn is_closing_brace(byte: u8) -> bool {
-        matches!(byte, b')' | b']' | b'}')
-    }
-
     pub fn matching_brace_index(&self, index: usize) -> Option<usize> {
         let &initial = self.data.get(index)?;
         let opposite = Self::matching_brace(initial)?;
         let quoted = quoted_bytes(&self.data);
-        if quoted.get(index).copied().unwrap_or(false) {
+        if quoted[index] {
             return None;
         }
-
-        let mut depth = 0usize;
-        if Self::is_opening_brace(initial) {
-            for (position, is_quoted) in quoted.iter().copied().enumerate().skip(index + 1) {
-                if is_quoted {
-                    continue;
-                }
-                let byte = self.data[position];
-                if byte == initial {
-                    depth += 1;
-                } else if byte == opposite {
-                    if depth == 0 {
-                        return Some(position);
-                    }
-                    depth -= 1;
-                }
-            }
+        let found = if Self::is_opening_brace(initial) {
+            balanced(
+                &self.data,
+                &quoted,
+                index + 1..self.data.len(),
+                initial,
+                opposite,
+            )
         } else {
-            for (position, is_quoted) in quoted[..index].iter().copied().enumerate().rev() {
-                if is_quoted {
-                    continue;
-                }
-                let byte = self.data[position];
-                if byte == initial {
-                    depth += 1;
-                } else if byte == opposite {
-                    if depth == 0 {
-                        return Some(position);
-                    }
-                    depth -= 1;
-                }
-            }
-        }
-        None
+            balanced(&self.data, &quoted, (0..index).rev(), initial, opposite)
+        };
+        // Post: the partner is the opposite bracket, and outside any quote.
+        debug_assert!(found.is_none_or(|at| self.data[at] == opposite && !quoted[at]));
+        found
     }
 
     /// Moves `%` only when the current byte has a safely bounded match.
@@ -579,29 +555,74 @@ impl Buffer {
     }
 }
 
-/// Marks bytes inside single- or double-quoted regions.  Backslash escapes are
-/// honored so braces in quoted literals cannot affect matching or indentation.
-pub(crate) fn quoted_bytes(data: &[u8]) -> Vec<bool> {
-    let mut result = vec![false; data.len()];
-    let mut quote = None;
-    let mut escaped = false;
+/// A running bracket depth that skips over quoted literals.
+///
+/// Bracket matching, the bracket text objects, smart indentation and
+/// autoformat all read brackets through this one state machine, so a brace
+/// inside a string literal is invisible to every one of them alike.
+/// Backslash escapes are honored inside quotes.
+#[derive(Default)]
+pub(crate) struct Nesting {
+    pub(crate) depth: usize,
+    pub(crate) quote: Option<u8>,
+    escaped: bool,
+}
 
-    for (index, byte) in data.iter().copied().enumerate() {
-        if let Some(active) = quote {
-            result[index] = true;
-            if escaped {
-                escaped = false;
+impl Nesting {
+    pub(crate) fn feed(&mut self, byte: u8) {
+        if let Some(active) = self.quote {
+            if self.escaped {
+                self.escaped = false;
             } else if byte == b'\\' {
-                escaped = true;
+                self.escaped = true;
             } else if byte == active {
-                quote = None;
+                self.quote = None;
             }
-        } else if matches!(byte, b'\'' | b'"') {
-            result[index] = true;
-            quote = Some(byte);
+            return;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            self.quote = Some(byte);
+        } else if matches!(byte, b'(' | b'[' | b'{') {
+            self.depth += 1;
+        } else if matches!(byte, b')' | b']' | b'}') {
+            self.depth = self.depth.saturating_sub(1);
         }
     }
-    result
+}
+
+/// Marks bytes inside single- or double-quoted regions, the quotes included.
+pub(crate) fn quoted_bytes(data: &[u8]) -> Vec<bool> {
+    let mut nesting = Nesting::default();
+    data.iter()
+        .map(|&byte| {
+            let quoted = nesting.quote.is_some() || matches!(byte, b'\'' | b'"');
+            nesting.feed(byte);
+            quoted
+        })
+        .collect()
+}
+
+/// The first unquoted `target` along `positions` that no earlier `nest`
+/// pairs off: the partner of a bracket, searched in either direction.
+pub(crate) fn balanced(
+    data: &[u8],
+    quoted: &[bool],
+    positions: impl Iterator<Item = usize>,
+    nest: u8,
+    target: u8,
+) -> Option<usize> {
+    let mut depth = 0usize;
+    for at in positions.filter(|&at| !quoted[at]) {
+        if data[at] == nest {
+            depth += 1;
+        } else if data[at] == target {
+            if depth == 0 {
+                return Some(at);
+            }
+            depth -= 1;
+        }
+    }
+    None
 }
 
 #[cfg(test)]

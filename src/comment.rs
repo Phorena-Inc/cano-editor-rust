@@ -8,6 +8,7 @@
 //! [`crate::autoformat::format`] does, so the caller can narrow the result to
 //! a single undo step.
 
+use crate::autoformat::leading_end;
 use crate::syntax::Language;
 
 /// Whether a toggle put markers in or took them out.
@@ -122,16 +123,6 @@ pub fn toggle(data: &[u8], region: (usize, usize), token: &[u8]) -> Option<(Vec<
 /// content rather than in front of the return.
 fn content(line: &[u8]) -> &[u8] {
     line.strip_suffix(b"\r").unwrap_or(line)
-}
-
-/// Where a line's leading whitespace ends.
-///
-/// Spaces and tabs only: CR and LF are terminators, and treating them as
-/// indentation would walk past the end of the line.
-fn leading_end(line: &[u8]) -> usize {
-    line.iter()
-        .position(|byte| !matches!(byte, b' ' | b'\t'))
-        .unwrap_or(line.len())
 }
 
 #[cfg(test)]

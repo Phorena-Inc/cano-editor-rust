@@ -1,5 +1,5 @@
-use crate::buffer::{Buffer, is_keyword};
-use crate::history::{History, HistoryError, UndoKind, UndoRecord};
+use crate::buffer::{Buffer, Nesting, is_keyword};
+use crate::history::{History, HistoryError, UndoRecord};
 use crate::textobject::{self, Scope};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -123,11 +123,7 @@ impl Editor {
     }
 
     fn begin_insert_record(&mut self) {
-        self.active_insert = UndoRecord {
-            kind: UndoKind::DeleteMultiple,
-            start: self.buffer.cursor,
-            ..UndoRecord::default()
-        };
+        self.active_insert = UndoRecord::delete_multiple(self.buffer.cursor, 0);
     }
 
     pub fn enter_insert(&mut self, entry: InsertEntry) {
@@ -185,23 +181,14 @@ impl Editor {
         }
 
         self.active_insert.end = self.buffer.insert_byte(byte);
-        let partner = match byte {
-            b'(' => Some(b')'),
-            b'[' => Some(b']'),
-            b'{' => Some(b'}'),
-            _ => None,
-        };
+        let partner = Buffer::matching_brace(byte).filter(|_| Buffer::is_opening_brace(byte));
         if let Some(partner) = partner {
             self.active_insert.end = self.active_insert.end.saturating_sub(1);
             self.push_active_insert();
             let start = self.buffer.cursor.saturating_sub(1);
             let end = self.buffer.insert_byte(partner);
-            self.history.push_undo(UndoRecord {
-                kind: UndoKind::DeleteMultiple,
-                start,
-                end,
-                ..UndoRecord::default()
-            });
+            self.history
+                .push_undo(UndoRecord::delete_multiple(start, end));
             self.buffer.move_left();
             self.begin_insert_record();
         }
@@ -240,25 +227,15 @@ impl Editor {
         if self.mode != Mode::Insert {
             return false;
         }
-        if self.indent == 0 {
-            self.active_insert.end = self.buffer.insert_byte(b'\t');
-        } else {
-            for _ in 0..self.indent {
-                self.active_insert.end = self.buffer.insert_byte(b' ');
-            }
+        for byte in self.indentation() {
+            self.active_insert.end = self.buffer.insert_byte(byte);
         }
         true
     }
 
     fn add_indent(&mut self, depth: usize) {
-        if self.indent == 0 {
-            for _ in 0..depth {
-                self.buffer.insert_byte(b'\t');
-            }
-        } else {
-            for _ in 0..self.indent.saturating_mul(depth) {
-                self.buffer.insert_byte(b' ');
-            }
+        for byte in self.indentation().repeat(depth) {
+            self.buffer.insert_byte(byte);
         }
     }
 
@@ -381,22 +358,15 @@ impl Editor {
             return true;
         }
 
-        if self.leader == Leader::None {
-            match key {
-                b'd' => {
-                    self.leader = Leader::Delete;
-                    return true;
-                }
-                b'y' => {
-                    self.leader = Leader::Yank;
-                    return true;
-                }
-                b'c' => {
-                    self.leader = Leader::Change;
-                    return true;
-                }
-                _ => {}
-            }
+        let operator = match key {
+            b'd' => Leader::Delete,
+            b'y' => Leader::Yank,
+            b'c' => Leader::Change,
+            _ => Leader::None,
+        };
+        if self.leader == Leader::None && operator.is_operator() {
+            self.leader = operator;
+            return true;
         }
 
         if self.leader.is_operator() && matches!(key, b'i' | b'a') {
@@ -433,23 +403,11 @@ impl Editor {
             b'O' => self.open_line(false),
             b'v' => self.start_visual(VisualKind::Charwise),
             b'V' => self.start_visual(VisualKind::Linewise),
-            b'h' => self.buffer.move_left(),
-            b'j' => self.buffer.move_down(),
-            b'k' => self.buffer.move_up(),
-            b'l' => self.buffer.move_right(),
-            b'0' => self.buffer.move_line_start(),
-            b'$' => self.buffer.move_line_end(),
-            b'w' => self.buffer.move_word_next(),
-            b'b' => self.buffer.move_word_back(),
-            b'e' => self.buffer.move_word_end(),
-            b'g' => self.buffer.move_file_start(0),
-            b'G' => self.buffer.move_file_end(0),
-            b'%' => {
-                self.buffer.move_matching_brace();
-            }
             _ => {
-                self.leader = Leader::None;
-                return false;
+                if !self.motion(key) {
+                    self.leader = Leader::None;
+                    return false;
+                }
             }
         }
         self.leader = Leader::None;
@@ -462,9 +420,10 @@ impl Editor {
             // The two-byte clipboard (with a synthetic NUL past EOF) is
             // characterized legacy behavior; a no-op `x` at EOF must not
             // clobber the clipboard, so it is only captured on deletion.
-            self.clipboard = (0..2)
-                .map(|offset| self.buffer.data.get(start + offset).copied().unwrap_or(0))
-                .collect();
+            self.clipboard = self
+                .buffer
+                .copy_selection(start, start + 1)
+                .unwrap_or_default();
             self.buffer.delete_byte();
             self.history
                 .push_undo(UndoRecord::insert_chars_exact(start, vec![deleted]));
@@ -487,17 +446,11 @@ impl Editor {
     }
 
     fn yank_current_row(&mut self) {
-        let index = self.buffer.cursor_row().unwrap_or(0);
-        let row = self.buffer.rows[index];
-        self.clipboard.clear();
-        if index == 0 {
-            self.clipboard.push(b'\n');
-            self.clipboard
-                .extend_from_slice(&self.buffer.data[row.start..row.end]);
-        } else {
-            self.clipboard
-                .extend_from_slice(&self.buffer.data[row.start - 1..row.end]);
-        }
+        let row = self.buffer.rows[self.buffer.cursor_row().unwrap_or(0)];
+        // Every row after the first starts after the newline that ends the
+        // one before it; the first gets one supplied.  Either way the
+        // clipboard leads with the `\n` that makes `p` paste linewise.
+        self.clipboard = [&b"\n"[..], &self.buffer.data[row.start..row.end]].concat();
     }
 
     fn delete_current_row(&mut self) {
@@ -516,15 +469,7 @@ impl Editor {
         } else {
             (row.start - 1, row.end)
         };
-        if let Some(deleted) = self.buffer.delete_selection(start, end) {
-            self.clipboard = deleted.clipboard;
-            self.history.push_undo(UndoRecord {
-                kind: UndoKind::InsertChars,
-                data: deleted.undo,
-                start,
-                end,
-            });
-        }
+        self.cut(start, end);
         let target_index = index.min(self.buffer.rows.len().saturating_sub(1));
         let target = self.buffer.rows[target_index];
         self.buffer.cursor = (target.start + column).min(target.end);
@@ -623,6 +568,12 @@ impl Editor {
             }
             _ => return None,
         };
+        // Post: given a cursor inside the buffer, every motion yields a
+        // forward range inside it too.
+        debug_assert!(
+            range.0 <= range.1 && range.1 <= self.buffer.data.len(),
+            "{range:?}"
+        );
         Some(range)
     }
 
@@ -643,21 +594,23 @@ impl Editor {
                 self.buffer.cursor = start;
             }
             Leader::Delete | Leader::Change => {
-                if let Some(deleted) = self.buffer.delete_selection(start, end) {
-                    self.clipboard = deleted.clipboard;
-                    self.history.push_undo(UndoRecord {
-                        kind: UndoKind::InsertChars,
-                        data: deleted.undo,
-                        start,
-                        end,
-                    });
-                }
+                self.cut(start, end);
                 if leader == Leader::Change {
                     self.buffer.cursor = start.min(self.buffer.data.len());
                     self.enter_insert(InsertEntry::Cursor);
                 }
             }
             Leader::None => {}
+        }
+    }
+
+    /// Deletes `start..end` into the clipboard, recorded with the legacy
+    /// `InsertChars` inverse every cut uses.
+    fn cut(&mut self, start: usize, end: usize) {
+        if let Some(deleted) = self.buffer.delete_selection(start, end) {
+            self.clipboard = deleted.clipboard;
+            self.history
+                .push_undo(UndoRecord::insert_chars(start, deleted.undo));
         }
     }
 
@@ -738,11 +691,8 @@ impl Editor {
     }
 
     fn visual_bounds(&self) -> (usize, usize) {
-        if self.visual.start <= self.visual.end {
-            (self.visual.start, self.visual.end)
-        } else {
-            (self.visual.end, self.visual.start)
-        }
+        let (start, end) = (self.visual.start, self.visual.end);
+        (start.min(end), start.max(end))
     }
 
     pub fn visual_key(&mut self, key: u8) -> bool {
@@ -775,38 +725,39 @@ impl Editor {
                 } else {
                     (start, end)
                 };
-                if let Some(deleted) = self.buffer.delete_selection(start, end) {
-                    self.clipboard = deleted.clipboard;
-                    self.history.push_undo(UndoRecord {
-                        kind: UndoKind::InsertChars,
-                        data: deleted.undo,
-                        start,
-                        end,
-                    });
-                }
+                self.cut(start, end);
                 self.mode = Mode::Normal;
             }
             b'y' => {
                 let (start, end) = self.visual_bounds();
+                // A selection ending past EOF yanks only the legacy NUL.
                 self.clipboard = self
                     .buffer
-                    .data
-                    .get(start..end)
-                    .unwrap_or_default()
-                    .to_vec();
-                self.clipboard
-                    .push(self.buffer.data.get(end).copied().unwrap_or(0));
+                    .copy_selection(start, end)
+                    .unwrap_or_else(|| vec![0]);
                 self.buffer.cursor = start;
                 self.mode = Mode::Normal;
             }
-            b'>' => {
-                self.indent_visual();
+            b'>' | b'<' => {
+                let (first, last) = self.selected_rows();
+                for row in first..=last {
+                    self.shift_row(row, key == b'>');
+                }
                 self.mode = Mode::Normal;
             }
-            b'<' => {
-                self.unindent_visual();
-                self.mode = Mode::Normal;
+            _ => {
+                if !self.motion(key) {
+                    return false;
+                }
             }
+        }
+        self.refresh_visual();
+        true
+    }
+
+    /// The cursor motions Normal and Visual mode share.
+    fn motion(&mut self, key: u8) -> bool {
+        match key {
             b'h' => self.buffer.move_left(),
             b'j' => self.buffer.move_down(),
             b'k' => self.buffer.move_up(),
@@ -823,7 +774,6 @@ impl Editor {
             }
             _ => return false,
         }
-        self.refresh_visual();
         true
     }
 
@@ -854,13 +804,8 @@ impl Editor {
         if self.visual.kind.is_linewise() {
             let anchor = self.buffer.row_for_index(self.visual.anchor).unwrap_or(0);
             let current = self.buffer.cursor_row().unwrap_or(0);
-            let (first, last) = if anchor <= current {
-                (anchor, current)
-            } else {
-                (current, anchor)
-            };
-            self.visual.start = self.buffer.rows[first].start;
-            self.visual.end = self.buffer.rows[last].end;
+            self.visual.start = self.buffer.rows[anchor.min(current)].start;
+            self.visual.end = self.buffer.rows[anchor.max(current)].end;
         } else {
             self.visual.end = self.buffer.cursor;
         }
@@ -928,20 +873,6 @@ impl Editor {
         let first = self.buffer.row_for_index(start).unwrap_or(0);
         let last = self.buffer.row_for_index(end).unwrap_or(first);
         (first, last)
-    }
-
-    fn indent_visual(&mut self) {
-        let (first, last) = self.selected_rows();
-        for row in first..=last {
-            self.shift_row(row, true);
-        }
-    }
-
-    fn unindent_visual(&mut self) {
-        let (first, last) = self.selected_rows();
-        for row in first..=last {
-            self.shift_row(row, false);
-        }
     }
 
     /// Deletes the rectangle a blockwise selection covers.
@@ -1082,11 +1013,7 @@ impl Editor {
         self.active_insert.end = cursor;
         self.push_active_insert();
         let delta = self.shift_row(row, right);
-        let moved = if delta < 0 {
-            cursor.saturating_sub(delta.unsigned_abs())
-        } else {
-            cursor.saturating_add(delta.unsigned_abs())
-        };
+        let moved = cursor.saturating_add_signed(delta);
         let bounds = self.buffer.rows[row.min(self.buffer.rows.len().saturating_sub(1))];
         self.buffer.cursor = moved.clamp(bounds.start, bounds.end);
         self.begin_insert_record();
@@ -1265,29 +1192,9 @@ fn numbers_on(line: &[u8]) -> Vec<Number> {
 
 /// The nesting depth at `end`, ignoring brackets inside string literals.
 pub fn brace_depth(data: &[u8], end: usize) -> usize {
-    let mut depth = 0usize;
-    let mut quote = None;
-    let mut escaped = false;
-    for byte in data.iter().copied().take(end) {
-        if let Some(active) = quote {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == active {
-                quote = None;
-            }
-            continue;
-        }
-        if matches!(byte, b'\'' | b'"') {
-            quote = Some(byte);
-        } else if matches!(byte, b'(' | b'[' | b'{') {
-            depth += 1;
-        } else if matches!(byte, b')' | b']' | b'}') {
-            depth = depth.saturating_sub(1);
-        }
-    }
-    depth
+    let mut nesting = Nesting::default();
+    data.iter().take(end).for_each(|&byte| nesting.feed(byte));
+    nesting.depth
 }
 
 #[cfg(test)]

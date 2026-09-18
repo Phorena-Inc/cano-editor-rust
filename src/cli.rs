@@ -1,6 +1,3 @@
-use std::error::Error;
-use std::fmt;
-
 /// Command-line values understood by Cano.
 ///
 /// `filename` is optional here because startup applies the legacy `out.txt`
@@ -20,17 +17,6 @@ pub enum CliError {
     UnexpectedFlag,
 }
 
-impl fmt::Display for CliError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingConfigValue => formatter.write_str("missing value for --config"),
-            Self::UnexpectedFlag => formatter.write_str("unexpected command-line flag"),
-        }
-    }
-}
-
-impl Error for CliError {}
-
 /// Parse an argv-style slice whose first element is the program name.
 ///
 /// Two prefix matches are intentional compatibility behavior: every argument
@@ -42,7 +28,6 @@ impl Error for CliError {}
 /// argument becomes the filename.
 pub fn parse(args: &[String]) -> Result<Cli, CliError> {
     let mut cli = Cli::default();
-    let mut first_positional = None;
     let mut index = 1;
 
     while index < args.len() {
@@ -70,14 +55,12 @@ pub fn parse(args: &[String]) -> Result<Cli, CliError> {
         } else if argument.starts_with('-') {
             return Err(CliError::UnexpectedFlag);
         } else {
-            if first_positional.is_none() {
-                first_positional = Some(argument.clone());
-            }
+            // The first positional is the file; later ones are ignored.
+            cli.filename.get_or_insert_with(|| argument.clone());
             index += 1;
         }
     }
 
-    cli.filename = first_positional;
     Ok(cli)
 }
 

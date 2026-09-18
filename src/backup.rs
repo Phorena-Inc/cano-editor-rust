@@ -67,6 +67,12 @@ fn destination(directory: &Path, name: &OsStr, stamp: &str) -> PathBuf {
         next.push(format!(".{nth}"));
         candidate = directory.join(next);
     }
+    // Post: `prune` recognises what is written here as a backup of `name`,
+    // so no copy a save makes is ever left out of the pruning.
+    debug_assert!(is_backup_of(
+        candidate.file_name().unwrap_or_default(),
+        name
+    ));
     candidate
 }
 
