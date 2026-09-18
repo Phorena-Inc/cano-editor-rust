@@ -581,7 +581,7 @@ impl Buffer {
 
 /// Marks bytes inside single- or double-quoted regions.  Backslash escapes are
 /// honored so braces in quoted literals cannot affect matching or indentation.
-fn quoted_bytes(data: &[u8]) -> Vec<bool> {
+pub(crate) fn quoted_bytes(data: &[u8]) -> Vec<bool> {
     let mut result = vec![false; data.len()];
     let mut quote = None;
     let mut escaped = false;

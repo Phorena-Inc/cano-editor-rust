@@ -177,6 +177,16 @@ pub struct App {
     /// counts as visible rather than none of it.
     unrendered: bool,
     pub pending_replace: bool,
+    /// Keys of the change being typed, and the completed one `.` replays.
+    ///
+    /// Inputs are kept rather than bytes because the arrows and the other keys
+    /// with no single-byte spelling have to survive a replay, and the
+    /// `set-map` expansion path cannot carry them.
+    change_keys: Vec<Input>,
+    last_change: Vec<Input>,
+    /// Height of the undo stack when the recording started, so a command that
+    /// turned out to change nothing does not displace the last real change.
+    change_mark: usize,
     pub saved: bool,
     pub message_pending: bool,
     /// Refuses writes; used for the built-in help pages so a save-and-quit
@@ -228,6 +238,9 @@ impl App {
             viewport: Viewport::default(),
             unrendered: true,
             pending_replace: false,
+            change_keys: Vec::new(),
+            last_change: Vec::new(),
+            change_mark: 0,
             saved: true,
             message_pending: false,
             readonly: false,
@@ -245,7 +258,9 @@ impl App {
 
     pub fn handle(&mut self, input: Input) -> Vec<AppEffect> {
         self.buffer_replaced = false;
+        self.open_change(input);
         let effects = self.handle_mapped(input, 0);
+        self.close_change();
         if self.buffer_replaced {
             self.saved_buffer.clone_from(&self.editor.buffer.data);
         }
@@ -279,12 +294,75 @@ impl App {
 
     /// Whether a Normal-mode command is still waiting for keys to finish it.
     fn collecting_command(&self) -> bool {
-        self.editor.leader != Leader::None
+        self.editor.pending_operator()
             || !self.count.is_empty()
             || self.pending_replace
             || self.leader_pending
             || self.window_pending
             || self.jump.is_some()
+    }
+
+    /// Starts recording a change, or adds a key to the one in progress.
+    ///
+    /// Only keys typed at the top level are recorded.  A `set-map` expansion
+    /// arrives underneath this, so `.` repeats the mapping rather than the
+    /// keys it stood for, and replaying one is not mistaken for typing it.
+    fn open_change(&mut self, input: Input) {
+        if self.change_keys.is_empty() {
+            if self.editor.mode != Mode::Normal || !begins_change(input) {
+                return;
+            }
+            self.change_mark = self.editor.history.undo.len();
+        }
+        self.change_keys.push(input);
+    }
+
+    /// Ends the recording once the change is finished and did something.
+    ///
+    /// A change is finished when the editor is back in Normal mode with no
+    /// operator, count or pending key still waiting — the same condition that
+    /// tells `i_CTRL-O` its one command is over.
+    fn close_change(&mut self) {
+        if self.change_keys.is_empty() {
+            return;
+        }
+        // A prompt is not part of a change, and its keys are not replayable as
+        // one either, so a prompt opened mid-command abandons the recording
+        // rather than swallowing every key until Normal mode comes back.
+        if matches!(self.editor.mode, Mode::Command | Mode::Search) {
+            self.change_keys.clear();
+            return;
+        }
+        if self.editor.mode != Mode::Normal || self.collecting_command() {
+            return;
+        }
+        let keys = std::mem::take(&mut self.change_keys);
+        // An abandoned operator (`d` then Esc) and an insert that typed
+        // nothing both leave the undo stack where they found it.  Replaying
+        // either does nothing, and letting one land would throw away the
+        // change `.` should still be repeating.
+        if self.editor.history.undo.len() > self.change_mark {
+            self.last_change = keys;
+        }
+    }
+
+    /// `.`: types the last change again.
+    fn repeat_change(&mut self, depth: usize) -> Vec<AppEffect> {
+        if self.last_change.is_empty() {
+            self.set_message("No previous change");
+            return Vec::new();
+        }
+        if depth >= 64 {
+            self.set_message("Recursive repeat");
+            return Vec::new();
+        }
+        let mut effects = Vec::new();
+        // The replay runs underneath `handle`, which is where recording
+        // happens, so `last_change` survives it and `.` can be pressed again.
+        for input in self.last_change.clone() {
+            effects.extend(self.handle_mapped(input, depth + 1));
+        }
+        effects
     }
 
     fn dispatch(&mut self, input: Input, depth: usize) -> Vec<AppEffect> {
@@ -359,7 +437,7 @@ impl App {
         }
 
         match self.editor.mode {
-            Mode::Normal => self.normal_input(input),
+            Mode::Normal => self.normal_input(input, depth),
             Mode::Insert => self.insert_input(input, depth),
             Mode::Visual => self.visual_input(input),
             Mode::Search => self.search_input(input),
@@ -367,7 +445,7 @@ impl App {
         }
     }
 
-    fn normal_input(&mut self, input: Input) -> Vec<AppEffect> {
+    fn normal_input(&mut self, input: Input, depth: usize) -> Vec<AppEffect> {
         // Ctrl-W prefixes vim's window commands.  Cano has one window, so
         // the prefix exists to swallow the key that follows it and say so,
         // rather than let `Ctrl-W v` fall through and start Visual mode.
@@ -380,7 +458,7 @@ impl App {
         }
         if input == Input::Control(14) {
             self.toggle_pane(Pane::Explorer);
-            self.editor.leader = Leader::None;
+            self.editor.cancel_pending();
             return Vec::new();
         }
 
@@ -388,7 +466,7 @@ impl App {
         // where every other editor's "open something I had open" lives.
         if input == Input::Control(16) {
             self.toggle_pane(Pane::Recent);
-            self.editor.leader = Leader::None;
+            self.editor.cancel_pending();
             return Vec::new();
         }
 
@@ -402,7 +480,7 @@ impl App {
                 Input::Escape | Input::Control(3) => self.recent_open = false,
                 _ => {}
             }
-            self.editor.leader = Leader::None;
+            self.editor.cancel_pending();
             return Vec::new();
         }
 
@@ -420,11 +498,11 @@ impl App {
                 }
                 Input::Enter => {
                     self.enter_explorer();
-                    self.editor.leader = Leader::None;
+                    self.editor.cancel_pending();
                 }
                 Input::Escape | Input::Control(3) => {
                     self.explorer = None;
-                    self.editor.leader = Leader::None;
+                    self.editor.cancel_pending();
                 }
                 _ => {}
             }
@@ -455,7 +533,7 @@ impl App {
         // Enter is otherwise unbound in Normal mode, so nothing is lost.
         if matches!(input, Input::Control(13) | Input::Enter) {
             self.toggle_markdown();
-            self.editor.leader = Leader::None;
+            self.editor.cancel_pending();
             return Vec::new();
         }
 
@@ -470,14 +548,22 @@ impl App {
                     self.editor.delete_rows(repetitions);
                     return Vec::new();
                 }
+                // `c` arms the operator once and the count is dropped.
+                // Repeating the key the way `dispatch_repeated` does would let
+                // the second press complete `cc`, and the motion meant for the
+                // operator would then be typed into the line it opened.
+                if byte == b'c' {
+                    self.editor.normal_key(b'c');
+                    return Vec::new();
+                }
                 if byte == b'g' && self.editor.leader != Leader::Delete {
                     self.editor.buffer.move_file_start(repetitions);
-                    self.editor.leader = Leader::None;
+                    self.editor.cancel_pending();
                     return Vec::new();
                 }
                 if byte == b'G' && self.editor.leader != Leader::Delete {
                     self.editor.buffer.move_file_end(repetitions);
-                    self.editor.leader = Leader::None;
+                    self.editor.cancel_pending();
                     return Vec::new();
                 }
                 for _ in 0..repetitions {
@@ -501,23 +587,28 @@ impl App {
             Input::Byte(b'/') => self.enter_prompt(Mode::Search),
             Input::Byte(b'n') => {
                 self.repeat_search();
-                self.editor.leader = Leader::None;
+                self.editor.cancel_pending();
             }
             Input::Byte(b'N') => {
                 self.repeat_search_back();
-                self.editor.leader = Leader::None;
+                self.editor.cancel_pending();
             }
             Input::Byte(b'u') => {
                 self.undo_with_report();
-                self.editor.leader = Leader::None;
+                self.editor.cancel_pending();
             }
             Input::Byte(b'U') => {
                 self.redo_with_report();
-                self.editor.leader = Leader::None;
+                self.editor.cancel_pending();
             }
             Input::Byte(b'r') => {
                 self.pending_replace = true;
-                self.editor.leader = Leader::None;
+                self.editor.cancel_pending();
+            }
+            // `.` is unbound in Cano otherwise, and an operator is never
+            // waiting on it, so it can be taken before the editor sees it.
+            Input::Byte(b'.') if !self.editor.pending_operator() => {
+                return self.repeat_change(depth);
             }
             // `let mapleader = " "`: space arms the leader, and `<leader>i` /
             // `<leader>o` are `*` and `:nohl`.
@@ -562,39 +653,39 @@ impl App {
             Input::Control(26) => return vec![AppEffect::Suspend],
             // Vim's scrolling and paging keys.
             Input::Control(code) if self.scroll_command(code, count) => {
-                self.editor.leader = Leader::None;
+                self.editor.cancel_pending();
             }
             Input::Control(18) => {
                 for _ in 0..count {
                     self.redo_with_report();
                 }
-                self.editor.leader = Leader::None;
+                self.editor.cancel_pending();
             }
             Input::Control(1) => self.step_number(count, true),
             Input::Control(24) => self.step_number(count, false),
             Input::Control(7) => {
                 self.report_file_status();
-                self.editor.leader = Leader::None;
+                self.editor.cancel_pending();
             }
             Input::Control(12) => {
-                self.editor.leader = Leader::None;
+                self.editor.cancel_pending();
                 // Vim's Ctrl-L takes the message line down with the rest of
                 // what was on the screen.
                 self.commands.message = None;
                 return vec![AppEffect::Redraw];
             }
             Input::Control(22) => {
-                self.editor.leader = Leader::None;
+                self.editor.cancel_pending();
                 self.editor.start_visual(VisualKind::Blockwise);
             }
             Input::Control(23) => {
-                self.editor.leader = Leader::None;
+                self.editor.cancel_pending();
                 self.window_pending = true;
             }
             Input::Control(3) | Input::Escape => {
                 self.count.clear();
                 self.prompt.clear();
-                self.editor.leader = Leader::None;
+                self.editor.cancel_pending();
             }
             _ => self.editor.leader = Leader::None,
         }
@@ -1084,7 +1175,7 @@ impl App {
     fn enter_prompt(&mut self, mode: Mode) {
         self.clear_prompt();
         self.editor.mode = mode;
-        self.editor.leader = Leader::None;
+        self.editor.cancel_pending();
     }
 
     fn clear_prompt(&mut self) {
@@ -2096,7 +2187,7 @@ impl App {
     /// Vim's Ctrl-A and Ctrl-X.  A count multiplies the step, so `5<C-x>`
     /// takes five off the number under the cursor.
     fn step_number(&mut self, count: usize, up: bool) {
-        self.editor.leader = Leader::None;
+        self.editor.cancel_pending();
         let magnitude = i64::try_from(count).unwrap_or(i64::MAX);
         let delta = if up { magnitude } else { -magnitude };
         if !self.editor.adjust_number(delta) {
@@ -2386,6 +2477,23 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
+/// Whether `input` begins a change that `.` should be able to repeat.
+///
+/// Operators (`d`, `c`, `r`) finish over the keys that follow them and the
+/// Insert-mode entries run until Esc, so this only has to name the first key;
+/// the recording itself ends when the command does.  A command that is not
+/// named here simply leaves the previous change in place for `.`.
+fn begins_change(input: Input) -> bool {
+    matches!(
+        input,
+        Input::Byte(
+            b'x' | b'd' | b'c' | b'p' | b'r' | b'i' | b'I' | b'a' | b'A' | b'o' | b'O'
+        )
+        // Ctrl-O opens a line below, and Ctrl-A / Ctrl-X step a number.
+        | Input::Control(15 | 1 | 24)
+    )
+}
+
 fn mapping_key(input: Input) -> Option<i32> {
     match input {
         Input::Byte(byte) | Input::Control(byte) => Some(i32::from(byte)),
@@ -2453,6 +2561,132 @@ mod tests {
         assert!(app.handle(Input::Control(18)).is_empty());
         assert_eq!(app.editor.buffer.data, b"acd");
         assert!(!app.recent_open);
+    }
+
+    fn typed(app: &mut App, keys: &[u8]) {
+        for key in keys {
+            app.handle(Input::Byte(*key));
+        }
+    }
+
+    fn repeating(text: &[u8]) -> App {
+        App::new(text.to_vec(), PathBuf::from("file"))
+    }
+
+    #[test]
+    fn a_count_in_front_of_c_is_dropped_rather_than_repeating_the_key() {
+        let mut app = repeating(b"one two three");
+        typed(&mut app, b"3cw");
+        // One word, not three, and the motion reached the operator instead of
+        // being typed into a line `cc` had opened.
+        assert_eq!(app.editor.buffer.data, b" two three");
+        assert_eq!(app.editor.mode, Mode::Insert);
+
+        // `3d` still deletes three lines, which is what it always did.
+        let mut rows = repeating(b"a\nb\nc\nd\ne");
+        typed(&mut rows, b"3d");
+        assert_eq!(rows.editor.buffer.data, b"d\ne");
+    }
+
+    #[test]
+    fn dot_repeats_a_one_key_change() {
+        let mut app = repeating(b"abcdef");
+        typed(&mut app, b"x");
+        assert_eq!(app.editor.buffer.data, b"bcdef");
+        typed(&mut app, b".");
+        assert_eq!(app.editor.buffer.data, b"cdef");
+        // And again, because a replay leaves the recording in place.
+        typed(&mut app, b"..");
+        assert_eq!(app.editor.buffer.data, b"ef");
+    }
+
+    #[test]
+    fn dot_repeats_a_change_over_a_text_object() {
+        let mut app = repeating(b"one two three");
+        typed(&mut app, b"ciwX");
+        app.handle(Input::Escape);
+        assert_eq!(app.editor.buffer.data, b"X two three");
+
+        // On the next word, `.` types the same change again.
+        typed(&mut app, b"ww.");
+        assert_eq!(app.editor.buffer.data, b"X two X");
+        assert_eq!(app.editor.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn dot_repeats_a_linewise_delete() {
+        let mut app = repeating(b"a\nb\nc\nd");
+        typed(&mut app, b"dd");
+        assert_eq!(app.editor.buffer.data, b"b\nc\nd");
+        typed(&mut app, b".");
+        assert_eq!(app.editor.buffer.data, b"c\nd");
+    }
+
+    #[test]
+    fn dot_repeats_an_insertion_with_everything_typed_into_it() {
+        let mut app = repeating(b"ab");
+        typed(&mut app, b"iXY");
+        app.handle(Input::Escape);
+        assert_eq!(app.editor.buffer.data, b"XYab");
+
+        // Cano's `$` rests past the last byte of the row rather than on it,
+        // so the repeat appends.
+        typed(&mut app, b"$.");
+        assert_eq!(app.editor.buffer.data, b"XYabXY");
+    }
+
+    #[test]
+    fn dot_without_a_previous_change_says_so_and_edits_nothing() {
+        let mut app = repeating(b"abc");
+        typed(&mut app, b".");
+        assert_eq!(app.editor.buffer.data, b"abc");
+        assert_eq!(app.commands.message.as_deref(), Some("No previous change"));
+    }
+
+    #[test]
+    fn a_command_that_changes_nothing_leaves_the_last_change_alone() {
+        let mut app = repeating(b"abcdef");
+        typed(&mut app, b"x");
+
+        // An operator abandoned with Esc is not a change, so `.` still
+        // repeats the `x` rather than doing nothing.
+        typed(&mut app, b"d");
+        app.handle(Input::Escape);
+        typed(&mut app, b".");
+        assert_eq!(app.editor.buffer.data, b"cdef");
+
+        // Nor is an insert that typed nothing at all.
+        typed(&mut app, b"i");
+        app.handle(Input::Escape);
+        typed(&mut app, b".");
+        assert_eq!(app.editor.buffer.data, b"def");
+    }
+
+    #[test]
+    fn a_motion_does_not_displace_the_last_change() {
+        let mut app = repeating(b"one two");
+        typed(&mut app, b"x");
+        assert_eq!(app.editor.buffer.data, b"ne two");
+        // Motions are not changes and record nothing, so `.` is still the `x`
+        // and deletes the byte it is moved onto rather than repeating a move.
+        typed(&mut app, b"w");
+        typed(&mut app, b".");
+        assert_eq!(app.editor.buffer.data, b"ne wo");
+    }
+
+    #[test]
+    fn a_prompt_opened_mid_command_abandons_the_recording() {
+        let mut app = repeating(b"abcdef");
+        typed(&mut app, b"x");
+
+        // `c` then `:` leaves a half-typed operator behind a prompt; the
+        // recording is dropped rather than swallowing the prompt's keys.
+        typed(&mut app, b"c:");
+        app.handle(Input::Escape);
+        assert!(app.change_keys.is_empty());
+
+        typed(&mut app, b".");
+        assert_eq!(app.editor.buffer.data, b"cdef");
     }
 
     #[test]

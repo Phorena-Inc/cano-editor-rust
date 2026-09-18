@@ -50,7 +50,7 @@ cargo test --locked --all-targets
 ```
 
 ## Modes
-Normal - For motions and deletion \
+Normal - For motions, and for the operators that delete, yank and change \
 Insert - For inserting text \
 Visual - For selecting text and performing actions on them \
 Search - For searching of text in the current buffer \
@@ -95,6 +95,11 @@ Command - For executing commands
 |Normal/Insert| Ctrl + S| Save and exit                                   |
 |Normal| r              | Replace current char with the next typed key (Esc cancels) |
 |Normal| d + motion     | Delete over the next motion                     |
+|Normal| y + motion     | Yank over the next motion                       |
+|Normal| c + motion     | Change over the next motion, then Insert mode   |
+|Normal| cc             | Change the current line, keeping the line       |
+|Normal| d/y/c + i/a + object | Act on the text object under the cursor   |
+|Normal| .              | Repeat the last change                          |
 |Normal| (n) + motion   | Repeat next motion n times (also `n`, `N`, `u`, `U`) |
 |Normal| (n) + d        | Delete n lines                                  |
 |Normal| (n) + g / G    | Go to line n                                    |
@@ -200,6 +205,62 @@ The history is per session; it is not written to disk.
 `Ctrl + w` is vim's window prefix. Cano has one window and no splits, so the
 prefix swallows the key that follows it and says so rather than let `Ctrl + w`
 `v` fall through and start Visual mode. Esc cancels it silently.
+
+## Operators and text objects
+`d`, `y` and `c` are operators: each waits for something to work on, and takes
+either a motion (`0`, `$`, `w`, `b`, `e`, `g`, `G`) or a text object. Doubling
+the key acts on the line — `dd` removes it, `cc` empties it but leaves the line
+to type on, the way vim's do.
+
+`c` deletes and then opens Insert mode where the text was, in one undo step:
+`u` puts back both what was removed and what was typed. `cw` on a non-blank
+changes to the end of the word rather than through the blanks after it, which
+is vim's one irregular operator-motion pair and the reason typing after `cw`
+does not run into the next word.
+
+A count in front of `c` is dropped rather than applied — `3cw` changes one
+word, not three. `3d` deletes three lines, so the two operators disagree here;
+the count is refused on `c` because repeating the key the way a count does
+would complete `cc` on the second press and type the motion into the line it
+had just opened.
+
+A text object is `i` (inner) or `a` (around) and then the kind:
+
+| Object | Takes |
+|--------|-------|
+| `w`    | The run of like bytes under the cursor: a word, a run of punctuation, or a run of blanks |
+| `p`    | A paragraph: the run of blank or non-blank rows the cursor is in |
+| `(` `)` `b` | The innermost parentheses enclosing the cursor |
+| `[` `]` | The innermost square brackets |
+| `{` `}` `B` | The innermost braces |
+| `<` `>` | The innermost angle brackets |
+| `"` `'` `` ` `` | The quoted run the cursor is in, or the first one after it on the row |
+
+So `diw` removes the word under the cursor, `ci"` retypes the contents of a
+string, and `ya{` copies a block with its braces. `a` takes the delimiters as
+well as what is between them; for `aw` and `a"` it also takes the blanks that
+follow, and `aw` reaches backwards instead when the word ends the line, so
+neither leaves a double space behind.
+
+Brackets are matched with quoting in mind, the same way `%` is: the `(` in
+`f("(", x)` is inside a string literal and does not open a pair. An object that
+is not there — `di(` outside any parentheses — does nothing at all rather than
+guessing at a range.
+
+## Repeating a change
+`.` types the last change again. A change is anything that edited the buffer:
+`x`, an operator and its target, `p`, `r`, `Ctrl + a` / `Ctrl + x`, or an Insert
+mode entry (`i`, `a`, `o`, and their capitals) together with everything typed
+before Esc. `ciwword` then Esc, `w`, `.` rewrites the next word the same way.
+
+Motions, searches, undo and the file panes are not changes and leave `.` alone,
+so moving somewhere and pressing `.` repeats the edit rather than the move. A
+command that turned out to change nothing — an operator abandoned with Esc, an
+insert that typed nothing — does not displace what `.` is holding either.
+
+The keys are replayed as typed, so a `set-map` expansion repeats as the key that
+was mapped rather than what it stood for. A change interrupted by a `:` or `/`
+prompt is abandoned rather than recorded.
 
 ## Mouse
 The mouse is on by default and can be turned off with `:set-var mouse 0`, or
@@ -477,6 +538,11 @@ byte for `Ctrl + m` and `Enter`, so `Enter` toggles it in Normal mode too.
 ## Visual
 Visual mode works the same as Normal mode, except it works on the entire selection, instead of character by character.
 The motions `h j k l 0 $ w b e g G %` and the arrow keys extend the selection.
+
+The selection is what the operators act on here, so they take no target of
+their own: `d` and `y` work on what is already highlighted. Text objects and
+`c` belong to Normal mode — `ciw` is how a word is changed, rather than
+selecting it first.
 | Keybind        | Action                                          |
 |----------------|-------------------------------------------------|
 | s{char}        | Extend the selection to any {char} on screen    |

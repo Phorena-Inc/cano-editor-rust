@@ -1,5 +1,6 @@
 use crate::buffer::{Buffer, is_keyword};
 use crate::history::{History, HistoryError, UndoKind, UndoRecord};
+use crate::textobject::{self, Scope};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Mode {
@@ -33,6 +34,13 @@ pub enum Leader {
     None,
     Delete,
     Yank,
+    Change,
+}
+
+impl Leader {
+    pub fn is_operator(self) -> bool {
+        !matches!(self, Self::None)
+    }
 }
 
 /// The shape of a visual selection: vim's `v`, `V` and `Ctrl-V`.
@@ -77,6 +85,10 @@ pub struct Editor {
     pub clipboard: Vec<u8>,
     pub visual: VisualSelection,
     pub indent: usize,
+    /// Set by the `i`/`a` of an operator-pending `diw`, and spent by the key
+    /// that names the object.  It is separate from `leader` because the two
+    /// are independent: every operator takes every object.
+    object: Option<Scope>,
     active_insert: UndoRecord,
 }
 
@@ -90,8 +102,24 @@ impl Editor {
             clipboard: Vec::new(),
             visual: VisualSelection::default(),
             indent: 0,
+            object: None,
             active_insert: UndoRecord::default(),
         }
+    }
+
+    /// Abandons a half-typed operator command, `i`/`a` included.
+    ///
+    /// Callers used to clear `leader` directly; an armed object has to go with
+    /// it, or the next key typed would be read as the object of an operator
+    /// that is no longer pending.
+    pub fn cancel_pending(&mut self) {
+        self.leader = Leader::None;
+        self.object = None;
+    }
+
+    /// Whether an operator is still waiting for the keys that complete it.
+    pub fn pending_operator(&self) -> bool {
+        self.leader.is_operator() || self.object.is_some()
     }
 
     fn begin_insert_record(&mut self) {
@@ -337,6 +365,22 @@ impl Editor {
         if self.mode != Mode::Normal {
             return false;
         }
+        // The key after an operator's `i`/`a` names the object it works on.
+        // It is taken before anything else so that `di` cannot fall through to
+        // `i` and open Insert mode in the middle of a delete.
+        if let Some(scope) = self.object.take() {
+            let leader = self.leader;
+            self.leader = Leader::None;
+            if !leader.is_operator() {
+                return false;
+            }
+            let found = textobject::range(&self.buffer, self.buffer.cursor, scope, key);
+            if let Some((start, end)) = found {
+                self.apply_operator(leader, start, end);
+            }
+            return true;
+        }
+
         if self.leader == Leader::None {
             match key {
                 b'd' => {
@@ -347,15 +391,31 @@ impl Editor {
                     self.leader = Leader::Yank;
                     return true;
                 }
+                b'c' => {
+                    self.leader = Leader::Change;
+                    return true;
+                }
                 _ => {}
             }
         }
 
-        if self.leader == Leader::Delete
+        if self.leader.is_operator() && matches!(key, b'i' | b'a') {
+            self.object = Some(if key == b'i' {
+                Scope::Inner
+            } else {
+                Scope::Around
+            });
+            return true;
+        }
+
+        if self.leader.is_operator()
             && matches!(key, b'0' | b'$' | b'w' | b'b' | b'e' | b'g' | b'G')
         {
-            self.delete_motion(key);
+            let leader = self.leader;
             self.leader = Leader::None;
+            if let Some((start, end)) = self.motion_range(leader, key) {
+                self.apply_operator(leader, start, end);
+            }
             return true;
         }
 
@@ -363,6 +423,7 @@ impl Editor {
             b'x' => self.delete_character(),
             b'd' if self.leader == Leader::Delete => self.delete_current_row(),
             b'y' if self.leader == Leader::Yank => self.yank_current_row(),
+            b'c' if self.leader == Leader::Change => self.change_current_row(),
             b'p' if !self.clipboard.is_empty() => self.paste(),
             b'i' => self.enter_insert(InsertEntry::Cursor),
             b'I' => self.enter_insert(InsertEntry::FirstNonBlank),
@@ -478,9 +539,30 @@ impl Editor {
         self.leader = Leader::None;
     }
 
-    fn delete_motion(&mut self, key: u8) {
+    /// The byte range a motion covers when an operator is waiting on it.
+    ///
+    /// The cursor is moved to work the range out, exactly as the bare motion
+    /// would move it; the caller's operator is what decides where it ends up.
+    fn motion_range(&mut self, leader: Leader, key: u8) -> Option<(usize, usize)> {
         let original = self.buffer.cursor;
-        let (start, end) = match key {
+        let linewise_change = leader == Leader::Change;
+        // Vim's one irregular operator-motion pair: `cw` on a non-blank
+        // changes to the end of the word the way `ce` does, instead of taking
+        // the blanks after it and leaving what you type jammed against the
+        // next word.
+        let key = if leader == Leader::Change
+            && key == b'w'
+            && self
+                .buffer
+                .data
+                .get(original)
+                .is_some_and(|byte| !byte.is_ascii_whitespace())
+        {
+            b'e'
+        } else {
+            key
+        };
+        let range = match key {
             b'0' => {
                 self.buffer.move_line_start();
                 (self.buffer.cursor, original)
@@ -510,13 +592,14 @@ impl Editor {
             }
             b'g' => {
                 // Linewise to the first row: consume the current row's newline
-                // so no blank line is left behind.
+                // so no blank line is left behind.  A change keeps it, because
+                // `cg` leaves you typing on a line that has to exist.
                 let row = self.buffer.cursor_row().unwrap_or(0);
                 let end = self.buffer.rows[row].end;
                 self.buffer.move_file_start(0);
                 (
                     self.buffer.cursor,
-                    if end < self.buffer.data.len() {
+                    if end < self.buffer.data.len() && !linewise_change {
                         end + 1
                     } else {
                         end
@@ -525,26 +608,70 @@ impl Editor {
             }
             b'G' => {
                 // Linewise to the final row: consume the newline that
-                // terminates the preceding row.
+                // terminates the preceding row, for the same reason.
                 let row = self.buffer.cursor_row().unwrap_or(0);
                 let start = self.buffer.rows[row].start;
                 self.buffer.move_file_end(0);
                 (
-                    start.saturating_sub(usize::from(start > 0)),
+                    if linewise_change {
+                        start
+                    } else {
+                        start.saturating_sub(usize::from(start > 0))
+                    },
                     self.buffer.cursor,
                 )
             }
-            _ => return,
+            _ => return None,
         };
-        if let Some(deleted) = self.buffer.delete_selection(start, end) {
-            self.clipboard = deleted.clipboard;
-            self.history.push_undo(UndoRecord {
-                kind: UndoKind::InsertChars,
-                data: deleted.undo,
-                start,
-                end,
-            });
+        Some(range)
+    }
+
+    /// Runs `leader` over `start..end`, the one place `d`, `c` and `y` differ.
+    ///
+    /// `d` and `c` share a deletion so the buffer edit and the undo record
+    /// they leave are the same one; `c` then opens Insert mode where the text
+    /// used to be.  A yank takes the range exactly, without the spare byte
+    /// [`Buffer::copy_selection`] appends for the legacy clipboard, since a
+    /// motion's range is half-open and already ends where it should.
+    fn apply_operator(&mut self, leader: Leader, start: usize, end: usize) {
+        if start > end || end > self.buffer.data.len() {
+            return;
         }
+        match leader {
+            Leader::Yank => {
+                self.clipboard = self.buffer.data[start..end].to_vec();
+                self.buffer.cursor = start;
+            }
+            Leader::Delete | Leader::Change => {
+                if let Some(deleted) = self.buffer.delete_selection(start, end) {
+                    self.clipboard = deleted.clipboard;
+                    self.history.push_undo(UndoRecord {
+                        kind: UndoKind::InsertChars,
+                        data: deleted.undo,
+                        start,
+                        end,
+                    });
+                }
+                if leader == Leader::Change {
+                    self.buffer.cursor = start.min(self.buffer.data.len());
+                    self.enter_insert(InsertEntry::Cursor);
+                }
+            }
+            Leader::None => {}
+        }
+    }
+
+    /// `cc`: replaces the row's contents, keeping the row itself.
+    ///
+    /// Unlike `dd` this never takes the newline, because the whole point is to
+    /// leave a line to type on.  Vim re-indents here; Cano has no `autoindent`
+    /// to consult, so the line is left empty.
+    fn change_current_row(&mut self) {
+        let Some(index) = self.buffer.cursor_row() else {
+            return;
+        };
+        let row = self.buffer.rows[index];
+        self.apply_operator(Leader::Change, row.start, row.end);
     }
 
     pub fn start_visual(&mut self, kind: VisualKind) {
@@ -1558,6 +1685,144 @@ mod tests {
         to_last.normal_key(b'd');
         to_last.normal_key(b'G');
         assert_eq!(to_last.buffer.data, b"aa");
+    }
+
+    fn keys(text: &[u8], cursor: usize, keys: &[u8]) -> Editor {
+        let mut editor = Editor::new(text.to_vec());
+        editor.buffer.cursor = cursor;
+        for key in keys {
+            editor.normal_key(*key);
+        }
+        assert!(editor.buffer.invariants_hold());
+        editor
+    }
+
+    #[test]
+    fn change_over_a_motion_deletes_it_and_opens_insert_mode() {
+        let editor = keys(b"one two", 0, b"cw");
+        // `cw` on a non-blank is `ce`: the blank before `two` survives, so
+        // what gets typed does not run into the next word.
+        assert_eq!(editor.buffer.data, b" two");
+        assert_eq!(editor.mode, Mode::Insert);
+        assert_eq!(editor.buffer.cursor, 0);
+
+        assert_eq!(keys(b"abcd", 2, b"c$").buffer.data, b"ab");
+        assert_eq!(keys(b"abcd", 2, b"c0").buffer.data, b"cd");
+    }
+
+    #[test]
+    fn cw_on_a_blank_still_takes_the_blanks() {
+        // The `ce` rule is only for a cursor on a word; on a blank `cw`
+        // behaves like `dw` and stops at the word that follows.
+        assert_eq!(keys(b"a  b", 1, b"cw").buffer.data, b"ab");
+    }
+
+    #[test]
+    fn cc_empties_the_row_without_removing_it() {
+        let editor = keys(b"one\ntwo\nthree", 5, b"cc");
+        assert_eq!(editor.buffer.data, b"one\n\nthree");
+        assert_eq!(editor.mode, Mode::Insert);
+        assert_eq!(editor.buffer.rows.len(), 3);
+    }
+
+    #[test]
+    fn dd_still_removes_the_row_that_cc_only_empties() {
+        assert_eq!(
+            keys(b"one\ntwo\nthree", 5, b"dd").buffer.data,
+            b"one\nthree"
+        );
+    }
+
+    #[test]
+    fn operators_take_text_objects() {
+        assert_eq!(
+            keys(b"say (a, b) now", 6, b"di(").buffer.data,
+            b"say () now"
+        );
+        assert_eq!(keys(b"say (a, b) now", 6, b"da(").buffer.data, b"say  now");
+
+        let changed = keys(b"say (a, b) now", 6, b"ci(");
+        assert_eq!(changed.buffer.data, b"say () now");
+        assert_eq!(changed.mode, Mode::Insert);
+        assert_eq!(changed.buffer.cursor, 5);
+
+        assert_eq!(keys(b"the fox runs", 4, b"diw").buffer.data, b"the  runs");
+        assert_eq!(keys(b"the fox runs", 4, b"daw").buffer.data, b"the runs");
+    }
+
+    #[test]
+    fn a_yank_object_copies_the_range_exactly_and_changes_nothing() {
+        let editor = keys(b"the fox runs", 4, b"yiw");
+        assert_eq!(editor.buffer.data, b"the fox runs");
+        // No spare byte: the object's range already ends where it should.
+        assert_eq!(editor.clipboard, b"fox");
+        assert_eq!(editor.mode, Mode::Normal);
+        assert_eq!(editor.buffer.cursor, 4);
+    }
+
+    #[test]
+    fn yank_takes_a_motion_now_that_every_operator_shares_one_path() {
+        // `yy` was the only yank before; `y` reaching a motion falls out of
+        // the operators being one implementation rather than three.
+        let editor = keys(b"one two", 0, b"yw");
+        assert_eq!(editor.buffer.data, b"one two");
+        assert_eq!(editor.clipboard, b"one ");
+        assert_eq!(editor.buffer.cursor, 0);
+
+        assert_eq!(keys(b"abcd", 2, b"y$").clipboard, b"cd");
+    }
+
+    #[test]
+    fn an_object_that_is_not_there_leaves_the_buffer_alone() {
+        let editor = keys(b"no parens", 3, b"di(");
+        assert_eq!(editor.buffer.data, b"no parens");
+        assert_eq!(editor.mode, Mode::Normal);
+        assert!(editor.history.undo.is_empty());
+    }
+
+    #[test]
+    fn the_i_of_an_operator_never_opens_insert_mode() {
+        // `di` waits for the object rather than falling through to `i`, which
+        // is what it used to do.
+        let mut editor = Editor::new(b"text".to_vec());
+        assert!(editor.normal_key(b'd'));
+        assert!(editor.normal_key(b'i'));
+        assert_eq!(editor.mode, Mode::Normal);
+        assert!(editor.pending_operator());
+
+        // And an unknown object spends the operator without editing.
+        assert!(editor.normal_key(b'z'));
+        assert_eq!(editor.buffer.data, b"text");
+        assert_eq!(editor.mode, Mode::Normal);
+        assert!(!editor.pending_operator());
+    }
+
+    #[test]
+    fn cancelling_clears_a_half_typed_object() {
+        let mut editor = Editor::new(b"a(b)c".to_vec());
+        editor.normal_key(b'd');
+        editor.normal_key(b'i');
+        editor.cancel_pending();
+        assert!(!editor.pending_operator());
+        // The `(` is now an ordinary unbound key, not an object.
+        editor.normal_key(b'(');
+        assert_eq!(editor.buffer.data, b"a(b)c");
+    }
+
+    #[test]
+    fn a_change_is_one_undo_step_that_restores_what_it_took() {
+        let mut editor = keys(b"the fox runs", 4, b"ciw");
+        for byte in b"cat" {
+            editor.insert_byte(*byte);
+        }
+        editor.leave_insert();
+        assert_eq!(editor.buffer.data, b"the cat runs");
+
+        assert!(editor.undo().unwrap());
+        assert_eq!(editor.buffer.data, b"the  runs");
+        assert!(editor.undo().unwrap());
+        assert_eq!(editor.buffer.data, b"the fox runs");
+        assert!(editor.buffer.invariants_hold());
     }
 
     #[test]

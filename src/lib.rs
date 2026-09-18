@@ -21,3 +21,4 @@ pub mod render;
 pub mod substitute;
 pub mod syntax;
 pub mod terminal;
+pub mod textobject;
