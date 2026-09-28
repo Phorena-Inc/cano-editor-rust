@@ -129,12 +129,6 @@ pub struct TerminalSession {
     pending: VecDeque<u8>,
 }
 
-/// Restores the terminal before the default panic output runs.
-///
-/// The release profile aborts on panic, so `Drop for TerminalSession` never
-/// runs on that path; without this hook a panic leaves the user's shell in
-/// raw mode on the alternate screen, and the panic message is either
-/// invisible or erased along with that screen.
 /// Takes the terminal: raw mode, the alternate screen and a block cursor.
 fn enter_terminal() -> io::Result<()> {
     enable_raw_mode()?;
@@ -160,6 +154,12 @@ fn release_terminal() {
     );
 }
 
+/// Restores the terminal before the default panic output runs.
+///
+/// The release profile aborts on panic, so `Drop for TerminalSession` never
+/// runs on that path; without this hook a panic leaves the user's shell in
+/// raw mode on the alternate screen, and the panic message is either
+/// invisible or erased along with that screen.
 fn install_panic_hook() {
     static HOOK: std::sync::Once = std::sync::Once::new();
     HOOK.call_once(|| {

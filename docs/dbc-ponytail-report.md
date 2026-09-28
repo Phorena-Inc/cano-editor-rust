@@ -1,27 +1,33 @@
 # Design-by-Contract + Ponytail refactor — report
 
-Date: 2026-09-17 · Base commit: `ceac76a` (0.26.917) · Scope: whole crate (`src/`, `tests/`, `Cargo.toml`)
+Date: 2026-09-19 · Base commit: `ceac76a` (0.26.917) · Scope: whole crate (`src/`, `tests/`, `Cargo.toml`)
+
+The refactor (passes 1 and 2) was committed as `e6fcafc`, with a version bump to 0.26.918 that followed from
+tooling in this workspace rather than from the work itself. The fixes in pass 3 are still uncommitted.
 
 ## Summary
 
-Two passes over the codebase, both behaviour-preserving:
+Three passes over the codebase. The first two are behaviour-preserving; the third fixes bugs they found:
 
-1. **Design by Contract.** 38 contracts added as `debug_assert!`, covering type invariants, preconditions and
+1. **Design by Contract.** 39 contracts added as `debug_assert!`, covering type invariants, preconditions and
    postconditions. They are checked in every debug build and every test run, and compile out of release builds
    entirely. No crate was added.
 2. **Ponytail refactor.** A repo-wide ponytail audit (`ponytail-audit`) was run by four parallel read-only
    reviewers. Each finding was then checked against the code before it was applied. The contracts from pass 1
    served as the safety net for this pass.
+3. **Bug fixes.** Thirteen real bugs: a crash, three hangs and two ways to lose text. Eleven came from the
+   audit and two from the randomized stress run. All are fixed in section 3, each with a regression test that
+   was checked to fail without its fix. This pass does change behaviour, deliberately.
 
 | Metric | Before | After |
 |---|---|---|
-| Lines in `src/` | 18,623 | 17,648 (**−975**, −5.2%) |
-| Diff | | +835 / −1,815 across 22 files |
-| Tests passing | 353 / 353 | 353 / 353 (no test expectation changed) |
+| Lines in `src/` | 18,623 | 18,022 (**−601**, −3.2%; the refactor cut 975, the fixes and their tests added 374) |
+| Diff | | refactor +835 / −1,815 (22 files), fixes +483 / −95 (9 files, tests included) |
+| Tests passing | 353 / 353 | 363 / 363 (353 unchanged, +10 regression tests) |
 | `cargo clippy --all-targets` warnings | 2 | **0** |
 | `cargo fmt --check` | clean | clean |
-| Release binary (`opt-level="z"`, LTO) | 967,136 B | 948,928 B (−18 KB) |
-| Runtime contracts | 0 | 38 (debug builds only) |
+| Release binary (`opt-level="z"`, LTO) | 967,136 B | 951,072 B (−16 KB) |
+| Runtime contracts | 0 | 39 (debug builds only) |
 | Dependencies | 5 | 5 |
 
 ## 1. Design by Contract
@@ -41,7 +47,7 @@ Two passes over the codebase, both behaviour-preserving:
   with its synthetic NUL, and a failed undo record being dropped. The contracts describe the characterized
   behaviour from `MIGRATION_NOTES.md`.
 
-### Contract inventory (38)
+### Contract inventory (39)
 
 | Module | Kind | Contract | What relies on it |
 |---|---|---|---|
@@ -50,6 +56,7 @@ Two passes over the codebase, both behaviour-preserving:
 | `buffer` | post | `matching_brace_index` returns the opposite bracket, outside any quote | `%` |
 | `history` | post ×2 | `apply_record` leaves the buffer valid; the inverse starts where the record did and is a forward range | Every later undo/redo replay |
 | `editor` | post | `motion_range` returns a forward, in-bounds range | `d`/`c`/`y` + motion |
+| `editor` | pre | a recorded insertion never inverts (`push_active_insert`) | Undo of typed text (added with fix 2) |
 | `textobject` | post | `range` returns a forward, in-bounds range | `diw`, `ci(`, … |
 | `command` | post | after `SetVar`, `variable(v) == value` | Keeps the two hand-written 12-arm tables in step |
 | `substitute` | post | `matches` are ordered, non-overlapping, inside the range | App applies them back to front |
@@ -153,56 +160,75 @@ dependency), `yagni` (one-caller layer), `shrink` (same logic, fewer lines).
 | `main::run` → `Box<dyn Error>` | Reworks error plumbing to save about 6 lines |
 | Remove the empty `impl Error for X {}` markers where `Display` is used | Conventional std interop; the cut is 1 line each |
 | `Substitute::resolve` empty-rows guard | Removing it changes the `Option` signature and ripples to callers |
-| `config` `Arc<Mutex>` → `Rc<RefCell>` | Only safe together with the re-entrancy bug fix below |
+| `config` `Arc<Mutex>` → `Rc<RefCell>` | Was unsafe until bug 7 below; now that the lock is not held across Lua calls it is an option, but it buys nothing on its own |
 | API used only by its own tests (`command::Span`, `History::new`, `Cli::help_page` shape, …) | Cutting it means editing test expectations |
 | Recent/Explorer/comment contracts | Each held trivially by construction; the pane state is already checked in `App::handle` |
 
-## 3. Bugs found along the way (not fixed: out of scope for a behaviour-preserving refactor)
+## 3. Bugs found, and fixed
 
-**Reproduced** (throwaway tests driving `App::handle`, since deleted):
+The refactor itself changed no behaviour. These fixes are a separate, third pass, each with a regression test.
+**Every test below was checked to fail without its fix**: the fix was reverted, that one test was run, and the
+fix put back. Bug 8 cannot be reverted in place, so it was confirmed against the committed pre-fix state in a
+scratch worktree, where the mapping returns `[Quit]` with unsaved changes; bugs 12 and 13 were confirmed there
+too, hanging before the fixes and finishing instantly after them.
 
-| # | Severity | Bug | Repro | Suggested fix |
-|---|---|---|---|---|
-| 1 | **High: crash** | Prompt history recall indexes past the end. `history_browse` survives Escape and is shared by `:` and `/` | `:a⏎ :b⏎ :c⏎ /x⏎` then `:` `↑` `Esc` `/` `↑`. Panics with index out of bounds in `browse_history`. The release profile uses `panic = "abort"`, so unsaved work is lost | Reset `history_browse` in `clear_prompt` |
-| 2 | **High: data loss** | A mouse click in Insert mode moves the cursor without closing the active insert record, so undo deletes text that was there before | Buffer `hello world`: `i` `ab`, click column 8, `Esc`, `u`. The buffer becomes `world` | Route the click through the same close/restart path as `insert_move` |
-| 3 | Medium | `delete_rows` clears the operator but not an armed text object, so the next key is swallowed | `one/two/three/four`: `d` `i` `3` `d` `x`. The `x` does nothing | Call `cancel_pending()` in `delete_rows` |
-| 4 | Low | `:set sw=2 bogus` updates `commands.indent` but returns before syncing `editor.indent` | After it, `commands.indent == 2` but `editor.indent` still holds the old value | Sync the indent before the early return |
+Neither hang needs an exotic file or a corrupted buffer: a one-line mapping, or a dot-repeat of an ordinary
+insertion, is enough to wedge the editor with no way out but to kill it.
 
-**By inspection** (not executed):
+| # | Severity | Bug and fix | Regression test |
+|---|---|---|---|
+| 1 | **Crash** | Prompt history recall indexed past the end: `history_browse` survived Escape and was shared by `:` and `/`, so `:a⏎ :b⏎ :c⏎ /x⏎` then `:` `↑` `Esc` `/` `↑` panicked, and release builds abort. **Fix:** `clear_prompt` drops the walk, which also makes `↑` start from the newest entry again | `app`: `walking_the_history_starts_again_for_each_prompt` |
+| 2 | **Data loss** | A mouse click in Insert mode moved the cursor without closing the record in flight, so `i` `ab`, click, `Esc`, `u` deleted `abhello ` from `hello world`. **Fix:** `Editor::place_cursor` closes the record and starts a new one, as the arrow keys already did; the click and the scroll wheel both go through it | `app`: `a_click_in_insert_mode_closes_the_insertion_it_leaves` |
+| 3 | Medium | `delete_rows` cleared the operator but not an armed text object, so after `d` `i` `3` `d` the next key was swallowed. **Fix:** `cancel_pending()` | `editor`: `a_counted_delete_disarms_the_object_it_never_used` |
+| 4 | Low | `:set sw=2 bogus` applied `sw=2` but returned before syncing `editor.indent`, so the editor kept indenting by the old width. **Fix:** sync after the loop either way | `app`: `a_failed_set_keeps_the_options_that_came_before_it` |
+| 5 | Medium | `cano.exit(-1)` reported success, because the code was clamped to `0..=255`. **Fix:** a negative code is taken as its low byte the way C takes it (`-1` → 255); wide codes still saturate | `lifecycle`: `a_negative_lua_exit_code_still_reports_failure` |
+| 6 | Medium | Backup pruning sorted counters as text, so `.10` sorted before `.2` and saves within one second could prune the newest copies. **Fix:** sort by stamp, then by counter as a number | `backup`: `counters_are_pruned_in_numeric_order` |
+| 7 | **Hang** | The configuration lock was held while `table.get` ran. A Lua `__index` metamethod calling `setup`, `cano.command` or `cano.exit` took the same lock on the same thread and hung forever. **Fix:** read all nine slots first, then merge them under the lock | `config`: `a_metamethod_that_calls_back_into_the_api_does_not_hang` (bounded wait, so a regression fails instead of hanging) |
+| 8 | **Data loss** | `saved` was a cache refreshed only at the end of a keypress, so a mapping such as `x:q⏎` edited and then quit without the "No write since last change" refusal. **Fix (root cause):** `saved()` compares the buffer with the last written copy on every read, so there is no stale copy to read. The `buffer_replaced` flag it needed is gone | `app`: `a_mapping_that_edits_before_quitting_is_still_refused` |
+| 9 | Low | The Vim scanner treated `\` inside `'…'` as an escape, so `'C:\'` looked unterminated and lost its colour. Vim single quotes are literal and `''` is one quote. **Fix:** `vim_literal` | `syntax`: `vim_tells_a_comment_quote_from_a_string_quote` |
+| 10 | Cosmetic | Two doc comments sat on the wrong item: the panic-hook explanation on `enter_terminal`, and the extension mapping on `for_path`. **Fix:** moved to `install_panic_hook` and `for_extension` | — |
+| 11 | Low | `autoformat::format` dragged a region past EOF onto the last line, so a region that named no line still reformatted one. Not reachable from the editor, which never passes one. **Fix:** a region starting past the end stays past the end | `autoformat`: `a_region_takes_whole_lines_and_leaves_the_rest_alone` |
+| 12 | **Hang** | `.` could repeat itself. A replay runs against the state it finds, not the one it was recorded in, so a `.` typed into Insert mode can come back as a Normal-mode repeat of the change it is inside. Each nesting multiplies the keys replayed, and the depth cap of 64 bounds nesting, not work. **Fix:** a `.` met while replaying is not a repeat | `app`: `a_repeat_met_while_repeating_is_not_another_repeat` |
+| 13 | **Hang** | A key mapping that expands to itself (`:set-map 'Q' 'QQ'`) doubles at every level, so 64 levels never finish. **Fix:** one press may expand into at most `MAX_EXPANSION` (10,000) keys, then it stops with the existing "Recursive key map" message | `app`: `a_mapping_that_expands_to_itself_stops_instead_of_spinning` |
 
-- `cano.exit(-1)` exits with status 0, because the code clamps to `0..=255`; C would give 255.
-- Backups: counter suffixes sort as text (`.10` < `.2`). With many saves in one second, `prune` can delete a
-  newer copy.
-- `config`: the mutex is held while `table.get` runs. A Lua `__index` metamethod that calls `setup`,
-  `cano.command` or `cano.exit` re-locks it on the same thread and hangs.
-- `saved` is only refreshed at the end of `handle`. A mapping such as `x:q⏎` can edit and then quit without the
-  "No write since last change" refusal.
-- The Vim scanner treats a backslash inside `'…'` as an escape; Vim single quotes are literal, so this is minor
-  mis-colouring.
-- Two misplaced doc comments: the panic-hook doc sits on `terminal::enter_terminal`, and the `for_extension` doc
-  sits on `syntax::for_path`.
-
-Once bug 2 is fixed, a further contract becomes true and is worth adding: `mode != Insert ||
-active_insert.start <= buffer.cursor`. Today that path breaks it legitimately.
+One contract became true only after fix 2 and was added with it: a recorded insertion never inverts
+(`push_active_insert`). Before the fix, a click to the left of the insertion produced exactly that.
 
 ## 4. Verification
 
-- `cargo test --locked --all-targets`: 353 passed, the same count as before. No `assert` line and no `#[test]`
-  was added, removed or changed. The only test-code edits are:
-  - moving the duplicated `Fixture` into `lib::test_support`;
-  - dropping two `.unwrap()`s after `apply_effects` stopped returning `Result`.
+- `cargo test --locked --all-targets`: **363 passed** (356 lib, 4 bin, 3 integration).
+  - The refactor left all 353 original tests untouched: no `assert` line and no `#[test]` was added, removed or
+    changed by it. Its only test-code edits were moving the duplicated `Fixture` into `lib::test_support` and
+    dropping two `.unwrap()`s after `apply_effects` stopped returning `Result`.
+  - The fixes added 10 regression tests, and one existing test (`opening_an_explorer_file_resets_the_saved_baseline`)
+    now dirties the buffer by typing instead of writing to the `saved` field the fix removed. The two tests for
+    the hangs run their work on a thread and wait at most ten seconds, so a regression fails the suite instead
+    of wedging it.
+- **Each fix was checked to be the thing its test catches.** For every fix, the source change was reverted, that
+  one test was run, and the fix was restored: all eleven reverted fixes failed their test. Bug 8 cannot be reverted
+  in place, so it was confirmed against the committed pre-fix state in a scratch worktree, where the mapping
+  `x:q⏎` returns `[Quit]` on a dirty buffer.
 - `cargo clippy --locked --all-targets`: 0 warnings, down from 2. `cargo fmt --check` is clean.
-- `cargo build --release --locked`: clean, 948,928 B.
+- `cargo build --release --locked`: clean, 951,072 B.
 - `tests/pty_smoke.py` drives a real PTY through resize, `:q` refusal, `:w`, `:wq`, `:q!`, `-h`/`--help`,
   comment toggle and the Control keys. It passed against the **release** binary, and against the **debug**
   binary with all contracts live.
-- **Randomized stress (throwaway, not committed).** Seeds 1–30,000, each a session of up to 400 keys over 6 buffer
-  shapes and 5 file types, driven through `App::handle` in a debug build. The keys were weighted toward motions,
+- **Randomized stress (throwaway, not committed).** Seeds 1–30,000, each a session of up to 400 keys over 6
+  buffer shapes and 5 file types, driven through `App::handle` in a debug build, weighted toward motions,
   operators, text objects, `.`, `:s///gc`, `:set`, `:imap`, mouse and scrolling. It ran as three 10k shards of
-  about 80–90 s each. **No contract fired and nothing panicked.**
-  - Two sessions were stopped at a 256 KiB buffer cap, because repeated `yG`/`p` doubles the buffer.
-  - An earlier attempt without that cap was terminated (SIGTERM) before reporting anything, so that run
-    counts for nothing.
+  200–380 s. **No contract fired and nothing panicked.** Each session also presses `u` 2,000 times at the end;
+  about half of all sessions undo exactly back to the text they started from. Why the others do not was not
+  audited — a session may have opened another file into the buffer, and the characterized legacy records
+  (`DeleteChar` keeps no redo bytes, `InsertChars` is a byte short) do not all round-trip. What the run checks
+  is that undoing everything never panics and never breaks a contract.
+  - **This run is what found bug 12.** One shard never finished, and the seed behind it hung inside a single
+    `.`; probing the same shape by hand then turned up bug 13. Before the fixes that shard could not complete;
+    after them all three finish.
+  - The driver runs in an empty temporary directory. In the repo the explorer opens whatever it finds, and a
+    session that loaded a multi-megabyte build artifact out of `target/` looked like a hang while it was only
+    doing O(file size) work per key with contracts on — which also made runs irreproducible, since `target/`
+    changes between them.
+  - About 1 session in 600 is stopped at a 256 KiB buffer cap, because repeated `yG`/`p` doubles the buffer.
   - Random keys rarely hit the exact bug-1 sequence, which is why it was reproduced by hand.
 - Line endings: the working tree was a Windows checkout with mixed CRLF/LF. Source files were normalized to LF
   to match the index and `.gitattributes`; git sees no line-ending changes.

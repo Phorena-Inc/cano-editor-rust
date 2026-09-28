@@ -13,6 +13,12 @@ const HISTORY_CAPACITY: usize = 50;
 /// How deep mappings, their replays and `.` may nest before they are refused.
 const MAX_DEPTH: usize = 64;
 
+/// How many keys one press may expand into, mappings and `.` replays
+/// together.  Depth alone does not bound the work: a level that replays two
+/// keys which each nest again doubles, and 64 levels of doubling never
+/// finish.  This is the ceiling on the whole expansion, not on one step.
+const MAX_EXPANSION: usize = 10_000;
+
 use crate::autoformat::{self, Steps};
 use crate::buffer::Highlight;
 use crate::command::{Action, CommandState, ConfigVariable, ExternalEffect, key, lex, parse};
@@ -154,6 +160,11 @@ pub struct App {
     /// True once Ctrl-W has been pressed in Normal mode; the next key is the
     /// window command it prefixes.
     window_pending: bool,
+    /// Keys this press has expanded into so far, against [`MAX_EXPANSION`].
+    expanded: usize,
+    /// True while `.` is replaying, so a `.` inside the replay is not read as
+    /// another repeat of the change it is part of.
+    repeating: bool,
     /// Lines executed from the `:` prompt, oldest first.
     pub command_history: Vec<Vec<u8>>,
     /// Patterns searched for from the `/` prompt, oldest first.
@@ -190,7 +201,6 @@ pub struct App {
     /// Height of the undo stack when the recording started, so a command that
     /// turned out to change nothing does not displace the last real change.
     change_mark: usize,
-    pub saved: bool,
     pub message_pending: bool,
     /// Refuses writes; used for the built-in help pages so a save-and-quit
     /// cannot overwrite the installed documentation.
@@ -199,8 +209,10 @@ pub struct App {
     /// is cleared whenever a `:` command or Escape resets the prompt line, and
     /// it remembers whether `*` (whole words) or `/` (substrings) set it.
     last_search: Highlight,
+    /// The buffer as it was last written, which is what `saved` compares
+    /// against.  It is not a cached answer: a mapping that edits and then
+    /// quits within one keypress has to see the edit.
     saved_buffer: Vec<u8>,
-    buffer_replaced: bool,
 }
 
 impl App {
@@ -229,6 +241,8 @@ impl App {
             completion: None,
             insert_normal: false,
             window_pending: false,
+            expanded: 0,
+            repeating: false,
             command_history: Vec::new(),
             search_history: Vec::new(),
             history_browse: None,
@@ -243,29 +257,27 @@ impl App {
             change_keys: Vec::new(),
             last_change: Vec::new(),
             change_mark: 0,
-            saved: true,
             message_pending: false,
             readonly: false,
             last_search: Highlight::default(),
             saved_buffer,
-            buffer_replaced: false,
         }
+    }
+
+    /// Whether the buffer matches what was last written.
+    pub fn saved(&self) -> bool {
+        self.editor.buffer.data == self.saved_buffer
     }
 
     pub fn mark_saved(&mut self) {
         self.saved_buffer.clone_from(&self.editor.buffer.data);
-        self.saved = true;
     }
 
     pub fn handle(&mut self, input: Input) -> Vec<AppEffect> {
-        self.buffer_replaced = false;
+        self.expanded = 0;
         self.open_change(input);
         let effects = self.handle_mapped(input, 0);
         self.close_change();
-        if self.buffer_replaced {
-            self.saved_buffer.clone_from(&self.editor.buffer.data);
-        }
-        self.saved = self.editor.buffer.data == self.saved_buffer;
         // Invariants every key path, mapped or replayed, has to leave behind:
         // the buffer is whole, at most one pane is up and its cursor names an
         // entry, the prompt cursor is inside the prompt, Insert-only state
@@ -295,6 +307,14 @@ impl App {
     /// The arming is read before the key runs, so the Ctrl-O that set it is
     /// not itself mistaken for the command it was waiting for.
     fn handle_mapped(&mut self, input: Input, depth: usize) -> Vec<AppEffect> {
+        self.expanded = self.expanded.saturating_add(1);
+        if self.expanded > MAX_EXPANSION {
+            // Say so once, on the key that crossed the line.
+            if self.expanded == MAX_EXPANSION + 1 {
+                self.set_message("Recursive key map");
+            }
+            return Vec::new();
+        }
         let armed = self.insert_normal;
         let effects = self.dispatch(input, depth);
         if armed && !self.collecting_command() {
@@ -377,12 +397,22 @@ impl App {
             self.set_message("Recursive repeat");
             return Vec::new();
         }
+        // A `.` met while replaying would repeat the change it is part of,
+        // and nesting that multiplies the keys replayed rather than adding
+        // to them.  A replayed key sequence can reach one: it runs against
+        // the state it finds, not the state it was recorded in, so a `.`
+        // typed into Insert mode can come back as a Normal-mode repeat.
+        if self.repeating {
+            return Vec::new();
+        }
         let mut effects = Vec::new();
         // The replay runs underneath `handle`, which is where recording
         // happens, so `last_change` survives it and `.` can be pressed again.
+        self.repeating = true;
         for input in self.last_change.clone() {
             effects.extend(self.handle_mapped(input, depth + 1));
         }
+        self.repeating = false;
         effects
     }
 
@@ -405,7 +435,7 @@ impl App {
             return Vec::new();
         }
         if input == Input::Control(17) {
-            if self.saved {
+            if self.saved() {
                 return vec![AppEffect::Quit];
             }
             self.set_message("No write since last change (add ! to override)");
@@ -1099,7 +1129,7 @@ impl App {
             // guard as `q`; `q!` remains the explicit override.
             Ok(action)
                 if matches!(&action, Action::Quit { force: false } | Action::Exit)
-                    && !self.saved =>
+                    && !self.saved() =>
             {
                 self.set_message("No write since last change (add ! to override)");
                 Vec::new()
@@ -1151,6 +1181,10 @@ impl App {
     fn clear_prompt(&mut self) {
         self.prompt.clear();
         self.prompt_cursor = 0;
+        // The walk belongs to the prompt being cleared.  Kept, it would index
+        // the other prompt's history on the next `Up`, which is shorter as
+        // often as not.
+        self.history_browse = None;
     }
 
     fn prompt_insert(&mut self, byte: u8) {
@@ -1269,7 +1303,6 @@ impl App {
             (Some(index), true) => index.saturating_sub(1),
             (Some(index), false) if index.saturating_add(1) < entries.len() => index + 1,
             (Some(_), false) => {
-                self.history_browse = None;
                 self.clear_prompt();
                 return;
             }
@@ -1378,9 +1411,11 @@ impl App {
         for option in split_options(spec) {
             if let Err(error) = self.set_option(&option) {
                 self.set_message(error);
-                return;
+                break;
             }
         }
+        // The options before the failed one were applied, so the editor's
+        // copy of the indent is refreshed either way.
         self.editor.indent = self.commands.indent.max(0) as usize;
     }
 
@@ -1884,7 +1919,7 @@ impl App {
             MouseKind::Press => {
                 self.drag_anchor = self.viewport.byte_at(&self.editor, mouse.column, mouse.row);
                 if let Some(byte) = self.drag_anchor {
-                    self.editor.buffer.cursor = byte;
+                    self.editor.place_cursor(byte);
                     self.editor.refresh_visual();
                 }
             }
@@ -1898,7 +1933,7 @@ impl App {
                 if self.drag_anchor.take().is_some() && self.editor.mode == Mode::Normal {
                     self.editor.start_visual(VisualKind::Charwise);
                 }
-                self.editor.buffer.cursor = byte;
+                self.editor.place_cursor(byte);
                 self.editor.refresh_visual();
             }
             MouseKind::ScrollUp => {
@@ -2050,7 +2085,10 @@ impl App {
         let rows = self.editor.buffer.rows.len();
         let column = self.editor.buffer.cursor_column().unwrap_or(0);
         let bounds = self.editor.buffer.rows[row.min(rows - 1)];
-        self.editor.buffer.cursor = bounds.start.saturating_add(column).min(bounds.end);
+        // The wheel scrolls in Insert mode too, and moving the cursor there
+        // is not typing.
+        self.editor
+            .place_cursor(bounds.start.saturating_add(column).min(bounds.end));
         self.editor.refresh_visual();
         // Post: the cursor landed on the row asked for, clamped to the file.
         debug_assert_eq!(self.editor.buffer.cursor_row(), Some(row.min(rows - 1)));
@@ -2115,7 +2153,7 @@ impl App {
             .checked_div(rows)
             .unwrap_or(0);
         let name = self.filename.display();
-        let modified = if self.saved { "" } else { " [Modified]" };
+        let modified = if self.saved() { "" } else { " [Modified]" };
         let readonly = if self.readonly { " [RO]" } else { "" };
         self.set_message(format!(
             "\"{name}\"{modified}{readonly} {rows} lines --{percent}%--"
@@ -2172,7 +2210,7 @@ impl App {
             self.close_panes();
             return;
         }
-        if self.saved {
+        if self.saved() {
             self.open_pane(pane);
         } else {
             self.save_prompt = Some(pane);
@@ -2210,7 +2248,7 @@ impl App {
         let Some(pane) = self.pending_pane.take() else {
             return;
         };
-        if self.saved {
+        if self.saved() {
             self.open_pane(pane);
         }
     }
@@ -2292,8 +2330,7 @@ impl App {
                 self.filename = path.to_path_buf();
                 self.commands.output.clear();
                 self.explorer = None;
-                self.saved = true;
-                self.buffer_replaced = true;
+                self.mark_saved();
                 // A file opened from the explorer or the picker is the user's
                 // own, even when the session started on a read-only help page.
                 self.readonly = false;
@@ -2845,11 +2882,162 @@ mod tests {
         assert!(app.handle(Input::Escape).is_empty());
     }
 
+    #[test]
+    fn walking_the_history_starts_again_for_each_prompt() {
+        let mut app = App::new(b"alpha\n".to_vec(), PathBuf::from("file"));
+        for line in ["a", "b", "c"] {
+            assert!(app.handle(Input::Byte(b':')).is_empty());
+            for byte in line.bytes() {
+                assert!(app.handle(Input::Byte(byte)).is_empty());
+            }
+            assert!(app.handle(Input::Enter).is_empty());
+        }
+        assert!(app.handle(Input::Byte(b'/')).is_empty());
+        assert!(app.handle(Input::Byte(b'x')).is_empty());
+        assert!(app.handle(Input::Enter).is_empty());
+
+        // Walk back into the command history, then abandon the prompt.
+        assert!(app.handle(Input::Byte(b':')).is_empty());
+        assert!(app.handle(Input::Up).is_empty());
+        assert_eq!(app.prompt, b"c");
+        assert!(app.handle(Input::Escape).is_empty());
+
+        // The search history is shorter, and the walk starts from its own
+        // newest entry rather than where the other prompt had got to.
+        assert!(app.handle(Input::Byte(b'/')).is_empty());
+        assert!(app.handle(Input::Up).is_empty());
+        assert_eq!(app.prompt, b"x");
+    }
+
+    #[test]
+    fn a_click_in_insert_mode_closes_the_insertion_it_leaves() {
+        let mut app = App::new(b"hello world".to_vec(), PathBuf::from("file"));
+        app.viewport = Viewport {
+            row: 0,
+            column: 0,
+            rows: 4,
+            content_x: 0,
+            content_width: 40,
+            first_item: 0,
+            scrollbar_x: None,
+        };
+        app.mark_rendered();
+        for input in [Input::Byte(b'i'), Input::Byte(b'a'), Input::Byte(b'b')] {
+            assert!(app.handle(input).is_empty());
+        }
+        assert_eq!(app.editor.buffer.data, b"abhello world");
+
+        // Clicking is not typing, so the record ends where the typing did.
+        // Left open, it would claim the bytes the click passed over and undo
+        // would take text that was there before the insertion.
+        assert!(
+            app.handle(Input::Mouse(Mouse {
+                kind: MouseKind::Press,
+                column: 8,
+                row: 0,
+            }))
+            .is_empty()
+        );
+        assert!(app.handle(Input::Escape).is_empty());
+        assert!(app.handle(Input::Byte(b'u')).is_empty());
+        assert_eq!(app.editor.buffer.data, b"hello world");
+    }
+
+    #[test]
+    fn a_failed_set_keeps_the_options_that_came_before_it() {
+        let mut app = App::new(b"x\n".to_vec(), PathBuf::from("file"));
+        app.run_command(b"set sw=2 bogus");
+
+        assert_eq!(app.commands.indent, 2);
+        // The editor's copy has to move with it, or the next `Tab` indents by
+        // the width the buffer no longer uses.
+        assert_eq!(app.editor.indent, 2);
+        assert!(app.commands.message.is_some());
+    }
+
+    #[test]
+    fn a_mapping_that_edits_before_quitting_is_still_refused() {
+        let mut app = App::new(b"text".to_vec(), PathBuf::from("file"));
+        app.commands.maps.push(KeyMap {
+            key: i32::from(b'Q'),
+            expansion: b"x:q\n\0".to_vec(),
+        });
+
+        // The edit and the `:q` are one keypress, so the guard has to see the
+        // edit that has just happened rather than the state it started in.
+        assert!(app.handle(Input::Byte(b'Q')).is_empty());
+        assert_eq!(app.editor.buffer.data, b"ext");
+        assert!(!app.saved());
+        assert!(!app.commands.quit);
+    }
+
+    /// Runs `work` on its own thread, so a expansion that no longer stops
+    /// fails the test instead of hanging the suite.
+    fn bounded<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(work());
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the expansion is bounded")
+    }
+
+    #[test]
+    fn a_mapping_that_expands_to_itself_stops_instead_of_spinning() {
+        // `Q` maps to `QQ`, so every level doubles the keys replayed.  The
+        // depth cap does not bound that on its own: 64 levels of doubling
+        // never finish.
+        let message = bounded(|| {
+            let mut app = App::new(b"hello\n".to_vec(), PathBuf::from("file"));
+            app.commands.maps.push(KeyMap {
+                key: i32::from(b'Q'),
+                expansion: b"QQ\0".to_vec(),
+            });
+            app.handle(Input::Byte(b'Q'));
+            app.commands.message.clone()
+        });
+
+        assert_eq!(message.as_deref(), Some("Recursive key map"));
+    }
+
+    #[test]
+    fn a_repeat_met_while_repeating_is_not_another_repeat() {
+        let data = bounded(|| {
+            let mut app = App::new(b"hello world\n".to_vec(), PathBuf::from("file"));
+            // Record an insertion that types two dots.
+            for key in [
+                Input::Byte(b'i'),
+                Input::Byte(b'.'),
+                Input::Byte(b'.'),
+                Input::Escape,
+            ] {
+                app.handle(key);
+            }
+            // A replay runs against the state it finds, not the one it was
+            // recorded in: mapping `i` away leaves the recorded dots to be
+            // read in Normal mode, where each would repeat this very change.
+            app.commands.maps.push(KeyMap {
+                key: i32::from(b'i'),
+                expansion: b"l\0".to_vec(),
+            });
+            app.handle(Input::Byte(b'.'));
+            (app.editor.buffer.data.clone(), app.commands.message.clone())
+        });
+
+        // The dots inside the replay did nothing, so the text is what the
+        // original insertion left.
+        assert_eq!(data.0, b"..hello world\n");
+        // And they were turned away as they were met, rather than nesting
+        // until the expansion budget stopped them.
+        assert_ne!(data.1.as_deref(), Some("Recursive key map"));
+    }
+
     fn make_dirty(app: &mut App) {
         assert!(app.handle(Input::Byte(b'i')).is_empty());
         assert!(app.handle(Input::Byte(b'X')).is_empty());
         assert!(app.handle(Input::Escape).is_empty());
-        assert!(!app.saved);
+        assert!(!app.saved());
     }
 
     #[test]
@@ -2875,7 +3063,7 @@ mod tests {
         let mut dirty = App::new(b"text".to_vec(), PathBuf::from("file"));
         make_dirty(&mut dirty);
         assert!(ex(&mut dirty, b"q").is_empty());
-        assert!(!dirty.saved);
+        assert!(!dirty.saved());
         assert!(!dirty.commands.quit);
         assert_eq!(
             dirty.commands.message.as_deref(),
@@ -2898,7 +3086,7 @@ mod tests {
         make_dirty(&mut app);
 
         assert_eq!(ex(&mut app, b"q!"), [AppEffect::Quit]);
-        assert!(!app.saved);
+        assert!(!app.saved());
         assert_eq!(app.editor.buffer.data, b"Xtext");
     }
 
@@ -2909,7 +3097,7 @@ mod tests {
 
         assert!(app.handle(Input::Byte(b'u')).is_empty());
         assert_eq!(app.editor.buffer.data, b"text");
-        assert!(app.saved);
+        assert!(app.saved());
         assert_eq!(ex(&mut app, b"q"), [AppEffect::Quit]);
     }
 
@@ -3026,7 +3214,7 @@ mod tests {
         }
         assert_eq!(app.editor.buffer.data, b"buffer");
         assert_eq!(app.editor.mode, Mode::Normal);
-        assert!(app.saved);
+        assert!(app.saved());
 
         assert!(app.handle(Input::Escape).is_empty());
         assert!(app.explorer.is_none());
@@ -3038,14 +3226,14 @@ mod tests {
         let mut app = App::new(b"text".to_vec(), PathBuf::from("f"));
         assert_eq!(app.handle(Input::Control(26)), [AppEffect::Suspend]);
         assert_eq!(app.editor.buffer.data, b"text");
-        assert!(app.saved);
+        assert!(app.saved());
         assert_eq!(app.editor.mode, Mode::Normal);
 
         // Unsaved work is no reason to refuse: suspending is not leaving, and
         // the buffer is still here on the way back.
         make_dirty(&mut app);
         assert_eq!(app.handle(Input::Control(26)), [AppEffect::Suspend]);
-        assert!(!app.saved);
+        assert!(!app.saved());
 
         // Insert mode types rather than suspends, as it does in vim.
         assert!(app.handle(Input::Byte(b'i')).is_empty());
@@ -3075,7 +3263,6 @@ mod tests {
         assert!(!app.commands.quit);
 
         app.mark_saved();
-        app.saved = true;
         assert_eq!(ex(&mut app, b"e"), [AppEffect::Quit]);
     }
 
@@ -3138,7 +3325,7 @@ mod tests {
         // so the same key has to work through both spellings.
         assert!(plain.handle(Input::Enter).is_empty());
         assert!(!plain.markdown);
-        assert!(plain.saved);
+        assert!(plain.saved());
 
         assert!(App::new(Vec::new(), PathBuf::from("README.MD")).markdown);
         assert!(App::new(Vec::new(), PathBuf::from("a/b/notes.markdown")).markdown);
@@ -3175,7 +3362,7 @@ mod tests {
         assert_eq!(app.editor.buffer.cursor, 1);
         assert!(app.jump.is_none());
         // A jump is a motion, so it must not dirty the buffer.
-        assert!(app.saved);
+        assert!(app.saved());
     }
 
     #[test]
@@ -3272,7 +3459,7 @@ o"
         // Yanking proves the selection really covers 1..=5.
         assert!(app.handle(Input::Byte(b'y')).is_empty());
         assert_eq!(app.editor.clipboard, b"o..o.");
-        assert!(app.saved);
+        assert!(app.saved());
     }
 
     #[test]
@@ -3320,12 +3507,12 @@ o"
         assert!(app.handle(Input::Byte(b'a')).is_empty());
         assert_eq!(app.editor.buffer.data, b"o.o.o");
         assert_eq!(app.editor.buffer.cursor, 2);
-        assert!(app.saved);
+        assert!(app.saved());
 
         // With the jump over, the same key reaches its mapping again.
         assert!(app.handle(Input::Byte(b'a')).is_empty());
         assert_eq!(app.editor.buffer.data, b"o..o");
-        assert!(!app.saved);
+        assert!(!app.saved());
     }
 
     #[test]
@@ -3356,7 +3543,7 @@ o"
         let mut star = App::new(b"the fox and the".to_vec(), PathBuf::from("f"));
         assert!(star.handle(Input::Byte(b'*')).is_empty());
         assert_eq!(star.editor.buffer.cursor, 12);
-        assert!(star.saved);
+        assert!(star.saved());
     }
 
     #[test]
@@ -3366,7 +3553,7 @@ o"
         // `x` would delete a byte if the leader had let it through.
         assert!(app.handle(Input::Byte(b'x')).is_empty());
         assert_eq!(app.editor.buffer.data, b"abc");
-        assert!(app.saved);
+        assert!(app.saved());
     }
 
     #[test]
@@ -3410,7 +3597,7 @@ o"
         assert!(app.handle(Input::Byte(b'N')).is_empty());
         assert_eq!(app.editor.buffer.cursor, 2);
         assert_eq!(app.editor.buffer.data, b"a x b x c x");
-        assert!(app.saved);
+        assert!(app.saved());
     }
 
     #[test]
@@ -3497,7 +3684,7 @@ b"
         assert!(!app.recent_open);
         assert_eq!(app.editor.buffer.data, b"older body");
         assert_eq!(app.filename, older);
-        assert!(app.saved);
+        assert!(app.saved());
         // Opening it makes it the most recent entry in turn.
         assert_eq!(
             app.recent.paths.first(),
@@ -3609,13 +3796,13 @@ b"
         assert!(app.handle(Input::Escape).is_empty());
         assert!(app.save_prompt.is_none());
         assert!(app.explorer.is_none());
-        assert!(!app.saved);
+        assert!(!app.saved());
 
         // `n` discards and opens the pane without writing anything.
         assert!(app.handle(Input::Control(14)).is_empty());
         assert!(app.handle(Input::Byte(b'n')).is_empty());
         assert!(app.explorer.is_some());
-        assert!(!app.saved);
+        assert!(!app.saved());
         assert_eq!(std::fs::read(&path).unwrap(), b"disk");
 
         // `y` asks for the write, and the pane waits for it to land.
@@ -3685,7 +3872,7 @@ b"
         assert_eq!(app.editor.buffer.cursor, 8);
         assert_eq!(app.editor.mode, Mode::Normal);
         // Positioning the cursor is a motion, not an edit.
-        assert!(app.saved);
+        assert!(app.saved());
 
         // The first drag turns the press into the anchor of a selection.
         assert!(app.handle(click(MouseKind::Drag, 8, 2)).is_empty());
@@ -3728,7 +3915,7 @@ b"
         }
         assert_eq!(app.viewport.row, 0);
         assert_eq!(app.editor.buffer.cursor_row(), Some(2));
-        assert!(app.saved);
+        assert!(app.saved());
     }
 
     #[test]
@@ -3760,7 +3947,7 @@ b"
                 .cursor_row()
                 .is_some_and(|row| row >= scrolled)
         );
-        assert!(app.saved);
+        assert!(app.saved());
 
         // A drag keeps following the bar even once the pointer leaves the
         // column, which is what makes the thumb usable.
@@ -3904,12 +4091,12 @@ b"
             app.commands.message.as_deref(),
             Some("4 substitutions on 3 lines")
         );
-        assert!(!app.saved);
+        assert!(!app.saved());
 
         // One command is one undo step, and one redo step.
         assert!(app.handle(Input::Byte(b'u')).is_empty());
         assert_eq!(app.editor.buffer.data, b"foo bar foo\nfoobar\nlast foo");
-        assert!(app.saved);
+        assert!(app.saved());
         assert!(app.handle(Input::Byte(b'U')).is_empty());
         assert_eq!(app.editor.buffer.data, b"XX bar XX\nXXbar\nlast XX");
         assert!(app.editor.buffer.invariants_hold());
@@ -4006,7 +4193,7 @@ b"
             refused.commands.message.as_deref(),
             Some("No substitutions")
         );
-        assert!(refused.saved);
+        assert!(refused.saved());
     }
 
     #[test]
@@ -4059,7 +4246,7 @@ b"
         assert_eq!(chars.space, Some('\u{b7}'));
         // Setting the glyphs does not turn `list` on by itself.
         assert_eq!(app.commands.list, 0);
-        assert!(app.saved);
+        assert!(app.saved());
     }
 
     #[test]
@@ -4081,7 +4268,7 @@ b"
         assert!(app.handle(Input::Byte(b' ')).is_empty());
         assert!(app.handle(Input::Byte(b'l')).is_empty());
         assert_eq!(app.commands.list, 1);
-        assert!(app.saved);
+        assert!(app.saved());
     }
 
     #[test]
@@ -4169,13 +4356,13 @@ b"
             b"f() {\n    let x = 1;\n    if x {\n        body;\n    }\n}\n"
         );
         assert_eq!(app.commands.message.as_deref(), Some("Formatted 4 lines"));
-        assert!(!app.saved);
+        assert!(!app.saved());
         assert!(app.editor.buffer.invariants_hold());
 
         // The whole rewrite is one step, and one step back.
         assert!(app.handle(Input::Byte(b'u')).is_empty());
         assert_eq!(app.editor.buffer.data, messy);
-        assert!(app.saved);
+        assert!(app.saved());
         assert!(app.handle(Input::Byte(b'U')).is_empty());
         assert_eq!(
             app.editor.buffer.data,
@@ -4204,7 +4391,7 @@ b"
         // It is the same one undo step the command produces.
         assert!(app.handle(Input::Byte(b'u')).is_empty());
         assert_eq!(app.editor.buffer.data, messy);
-        assert!(app.saved);
+        assert!(app.saved());
     }
 
     #[test]
@@ -4223,7 +4410,7 @@ b"
 
         assert!(app.handle(Input::Byte(b'u')).is_empty());
         assert_eq!(app.editor.buffer.data, compact);
-        assert!(app.saved);
+        assert!(app.saved());
     }
 
     #[test]
@@ -4237,7 +4424,7 @@ b"
             app.commands.message.as_deref(),
             Some("Invalid JSON: expected value at line 1 column 12")
         );
-        assert!(app.saved);
+        assert!(app.saved());
     }
 
     #[test]
@@ -4262,7 +4449,7 @@ b"
 
         // Still one undo step.
         assert!(app.handle(Input::Byte(b'u')).is_empty());
-        assert!(app.saved);
+        assert!(app.saved());
     }
 
     #[test]
@@ -4540,7 +4727,7 @@ b"
         std::fs::write(&opened, b"from disk").unwrap();
 
         let mut app = App::new(b"dirty old data".to_vec(), PathBuf::from("old.md"));
-        app.saved = false;
+        make_dirty(&mut app);
         app.open_explorer(&root).unwrap();
         app.explorer.as_mut().unwrap().cursor = app
             .explorer
@@ -4554,7 +4741,7 @@ b"
         assert!(app.handle(Input::Enter).is_empty());
         assert_eq!(app.editor.buffer.data, b"from disk");
         assert_eq!(app.filename, opened);
-        assert!(app.saved);
+        assert!(app.saved());
         // Enter still opens the selection instead of toggling markdown, and
         // the new file decides the display for itself.
         assert!(!app.markdown);

@@ -107,9 +107,15 @@ fn run() -> Result<u8, String> {
             "Exiting as specified in the configuration, message: {}",
             exit.message
         );
-        // Exit statuses are one byte; wide codes saturate instead of
-        // silently wrapping (256 would otherwise report success).
-        return Ok(exit.code.clamp(0, 255) as u8);
+        // Exit statuses are one byte.  A negative code is taken the way C
+        // takes it, as its low byte, so `cano.exit(-1)` still reports
+        // failure; a code wider than a byte saturates instead of silently
+        // wrapping (256 would otherwise report success).
+        return Ok(if exit.code < 0 {
+            exit.code as u8
+        } else {
+            exit.code.min(255) as u8
+        });
     }
     // Only slots the configuration actually set override the editor's
     // built-in defaults.
@@ -200,7 +206,7 @@ fn run() -> Result<u8, String> {
                         markdown: app.markdown,
                         message: app.commands.message.as_deref(),
                         filename: &filename,
-                        saved: app.saved,
+                        saved: app.saved(),
                     },
                     &mut viewport,
                 );
@@ -378,7 +384,7 @@ mod tests {
         app.handle(Input::Byte(b'i'));
         app.handle(Input::Byte(b'X'));
         app.handle(Input::Escape);
-        assert!(!app.saved);
+        assert!(!app.saved());
     }
 
     fn ex(app: &mut App, command: &[u8]) -> Vec<AppEffect> {
@@ -515,7 +521,7 @@ mod tests {
         );
 
         assert!(quit);
-        assert!(app.saved);
+        assert!(app.saved());
         assert_eq!(std::fs::read(path).unwrap(), b"Xtext");
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -534,7 +540,7 @@ mod tests {
         let quit = apply_effects(&mut app, effects);
 
         assert!(!quit);
-        assert!(!app.saved);
+        assert!(!app.saved());
         assert!(!app.commands.quit);
         assert!(app.message_pending);
         assert!(

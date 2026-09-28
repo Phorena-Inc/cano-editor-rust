@@ -153,6 +153,13 @@ impl Editor {
     /// Pushes the active insertion record when it covers at least one byte.
     /// Empty records would consume an undo press without changing anything.
     fn push_active_insert(&mut self) {
+        // Pre: the record covers what was typed, forwards.  An inverted one
+        // means the cursor left the insertion without closing it.
+        debug_assert!(
+            self.active_insert.start <= self.active_insert.end,
+            "{:?}",
+            self.active_insert
+        );
         if self.active_insert.start != self.active_insert.end {
             self.history.push_undo(self.active_insert.clone());
         }
@@ -274,6 +281,24 @@ impl Editor {
         }
         self.active_insert.end = self.buffer.cursor;
         true
+    }
+
+    /// Puts the cursor at `at`, closing any insertion in flight first.
+    ///
+    /// An Insert-mode record derives its end from the cursor, so a jump that
+    /// is not itself typing has to close the record out and start a fresh one
+    /// at the new position.  Without that, the record would claim every byte
+    /// between the two positions, and undo would delete text that was there
+    /// before the insertion started.
+    pub fn place_cursor(&mut self, at: usize) {
+        if self.mode != Mode::Insert {
+            self.buffer.cursor = at;
+            return;
+        }
+        self.active_insert.end = self.buffer.cursor;
+        self.push_active_insert();
+        self.buffer.cursor = at;
+        self.begin_insert_record();
     }
 
     pub fn insert_move(&mut self, direction: MoveDirection) -> bool {
@@ -481,7 +506,9 @@ impl Editor {
         for _ in 0..count.max(1).min(available) {
             self.delete_current_row();
         }
-        self.leader = Leader::None;
+        // An object armed by `d i` has to go too, or the key after a counted
+        // `dd` is read as the object of an operator that has already run.
+        self.cancel_pending();
     }
 
     /// The byte range a motion covers when an operator is waiting on it.
@@ -1357,6 +1384,22 @@ mod tests {
         assert_eq!(editor.buffer.cursor, 3);
         editor.insert_newline();
         assert_eq!(&editor.buffer.data[2..], b"{\n\t\n}value");
+    }
+
+    #[test]
+    fn a_counted_delete_disarms_the_object_it_never_used() {
+        let mut editor = Editor::new(b"one\ntwo\nthree\nfour\n".to_vec());
+        // `d` `i` arms an object; the count that follows turns the command
+        // into `3dd` instead, and the object is never used.
+        assert!(editor.normal_key(b'd'));
+        assert!(editor.normal_key(b'i'));
+        editor.delete_rows(3);
+        assert_eq!(editor.buffer.data, b"four\n");
+
+        // So the next key is a command again, not the object of an operator
+        // that has already run.
+        assert!(editor.normal_key(b'x'));
+        assert_eq!(editor.buffer.data, b"our\n");
     }
 
     #[test]

@@ -46,11 +46,6 @@ pub enum Language {
 }
 
 impl Language {
-    /// Maps a file extension to its language, case-insensitively.
-    ///
-    /// `.h` is claimed by C: it is shared with C++, and the C lists are the
-    /// subset, so a C++ header loses a few keyword colors rather than
-    /// coloring C code with words that are not reserved in it.
     /// Picks the language for a whole path.
     ///
     /// Dotfiles like `.vimrc` and `.bashrc` have no extension at all, so the
@@ -80,6 +75,11 @@ impl Language {
         }
     }
 
+    /// Maps a file extension to its language, case-insensitively.
+    ///
+    /// `.h` is claimed by C: it is shared with C++, and the C lists are the
+    /// subset, so a C++ header loses a few keyword colors rather than
+    /// coloring C code with words that are not reserved in it.
     pub fn for_extension(extension: &str) -> Option<Self> {
         match extension.to_ascii_lowercase().as_str() {
             "c" | "h" => Some(Self::C),
@@ -814,7 +814,7 @@ fn vim_scan(source: &[u8], at: usize) -> Option<Scan> {
                 Scan::colored(SyntaxKind::Comment, limit)
             }
         }
-        b'\'' => line_literal(source, at, b'\''),
+        b'\'' => vim_literal(source, at),
         // `<CR>`, `<leader>` and `<C-x>` are vim's notation for keys.
         b'<' => {
             let limit = line_end(source, at);
@@ -832,6 +832,28 @@ fn vim_scan(source: &[u8], at: usize) -> Option<Scan> {
         }
         _ => None,
     }
+}
+
+/// Vim's single-quoted string, which has no escapes at all: a backslash is
+/// an ordinary byte, and a doubled `''` is one quote inside the literal.
+/// Reading `\` as an escape would leave `'C:\'` looking unterminated.
+fn vim_literal(source: &[u8], at: usize) -> Option<Scan> {
+    let limit = line_end(source, at);
+    let mut scan = at + 1;
+    while scan < limit {
+        if source[scan] != b'\'' {
+            scan += 1;
+            continue;
+        }
+        if source.get(scan + 1) == Some(&b'\'') && scan + 1 < limit {
+            scan += 2;
+            continue;
+        }
+        return Scan::colored(SyntaxKind::String, scan + 1);
+    }
+    // Unterminated on its line: not a literal, the way the other scanners
+    // treat one.
+    None
 }
 
 fn lua_scan(source: &[u8], at: usize) -> Option<Scan> {
@@ -1339,6 +1361,13 @@ mod tests {
         // A quote that never closes is a trailing comment, which is how most
         // of a vimrc is annotated.
         assert_eq!(tags("set number \" why", Language::Vim), "KKK.TTTTTT.CCCCC");
+        // A backslash is an ordinary byte in a vim literal, so the string
+        // ends at the next quote rather than running past an "escaped" one.
+        assert_eq!(tags(r"let p = 'C:\'", Language::Vim), "KKK.....SSSSS");
+        // A doubled quote is one quote inside the literal, not the end of it.
+        assert_eq!(tags("let q = 'a''b'", Language::Vim), "KKK.....SSSSSS");
+        // Unterminated on its line, it is not a literal at all.
+        assert_eq!(tags("let r = 'open", Language::Vim), "KKK..........");
         // Key notation is its own thing, and `a < b` is not key notation.
         assert_eq!(tags("map <leader>i *", Language::Vim), "KKK.PPPPPPPP...");
         assert_eq!(tags("if a < b", Language::Vim), "KK......");

@@ -45,6 +45,25 @@ pub struct LuaConfig {
     pub exit: Option<ExitRequest>,
 }
 
+impl LuaConfig {
+    /// Fills in the slots `update` set, leaving the others as they are.
+    fn merge(&mut self, update: Self) {
+        for (slot, value) in [
+            (&mut self.syntax, update.syntax),
+            (&mut self.relative, update.relative),
+            (&mut self.auto_indent, update.auto_indent),
+            (&mut self.indent, update.indent),
+            (&mut self.undo_size, update.undo_size),
+            (&mut self.cursorline, update.cursorline),
+            (&mut self.mouse, update.mouse),
+            (&mut self.backup, update.backup),
+            (&mut self.list, update.list),
+        ] {
+            *slot = value.or(*slot);
+        }
+    }
+}
+
 /// A failure to read or execute a Lua configuration.
 #[derive(Debug)]
 pub enum ConfigError {
@@ -102,22 +121,23 @@ fn evaluate_named(source: &[u8], name: &str) -> Result<LuaConfig, ConfigError> {
     let setup_state = Arc::clone(&state);
 
     let setup = lua.create_function(move |lua, table: Table| {
-        with_config(&setup_state, |config| {
-            for (name, slot) in [
-                ("syntax", &mut config.syntax),
-                ("relative", &mut config.relative),
-                ("auto_indent", &mut config.auto_indent),
-                ("indent", &mut config.indent),
-                ("undo_size", &mut config.undo_size),
-                ("cursorline", &mut config.cursorline),
-                ("mouse", &mut config.mouse),
-                ("backup", &mut config.backup),
-                ("list", &mut config.list),
-            ] {
-                *slot = boolean_slot(&table, name)?.or(*slot);
-            }
-            Ok::<_, mlua::Error>(())
-        })??;
+        // Every slot is read before the lock is taken.  Reading one runs
+        // arbitrary Lua -- a table with an `__index` metamethod that calls
+        // `setup`, `cano.command` or `cano.exit` would take the same lock
+        // again on this thread and hang forever.
+        let update = LuaConfig {
+            syntax: boolean_slot(&table, "syntax")?,
+            relative: boolean_slot(&table, "relative")?,
+            auto_indent: boolean_slot(&table, "auto_indent")?,
+            indent: boolean_slot(&table, "indent")?,
+            undo_size: boolean_slot(&table, "undo_size")?,
+            cursorline: boolean_slot(&table, "cursorline")?,
+            mouse: boolean_slot(&table, "mouse")?,
+            backup: boolean_slot(&table, "backup")?,
+            list: boolean_slot(&table, "list")?,
+            ..LuaConfig::default()
+        };
+        with_config(&setup_state, |config| config.merge(update))?;
 
         let api = lua.create_table()?;
         let exit_state = Arc::clone(&setup_state);
@@ -195,6 +215,35 @@ pub fn load_or_default(path: &Path) -> Result<LuaConfig, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_metamethod_that_calls_back_into_the_api_does_not_hang() {
+        // Reading a slot runs Lua, and this table answers every read by
+        // calling back into the API.  Holding the configuration lock across
+        // that read would take it twice on one thread and hang forever.
+        let source = br#"
+            local cano = setup({})
+            local probe = setmetatable({}, {
+                __index = function(_, _) cano.command("set list") return nil end,
+            })
+            setup(probe)
+        "#;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // `ConfigError` carries a Lua error, which is not `Send`.
+            let result = evaluate(source)
+                .map(|config| config.commands.len())
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+
+        // A hang is the failure this guards against, so the wait is bounded.
+        let commands = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("configuration evaluated without deadlocking");
+        // One `cano.command` call per slot the setup table was asked for.
+        assert_eq!(commands.expect("valid configuration"), 9);
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]

@@ -92,10 +92,28 @@ fn prune(directory: &Path, name: &OsStr) {
     if existing.len() <= KEEP {
         return;
     }
-    existing.sort();
+    existing.sort_by_key(|candidate| order(candidate, name));
     for stale in &existing[..existing.len() - KEEP] {
         let _ = fs::remove_file(directory.join(stale));
     }
+}
+
+/// Sorts a backup by its stamp and then its counter, oldest first.
+///
+/// The counter is compared as a number: as text `.10` sorts before `.2`, and
+/// pruning would take the newer copy.  Only names `is_backup_of` accepted
+/// reach this, so the stamp is where it is expected to be.
+fn order(candidate: &OsStr, name: &OsStr) -> (Vec<u8>, u32) {
+    let rest = candidate
+        .as_encoded_bytes()
+        .get(name.as_encoded_bytes().len() + 1..)
+        .unwrap_or_default();
+    let (stamp, tail) = rest.split_at(STAMP_LEN.min(rest.len()));
+    let counter = std::str::from_utf8(tail.strip_prefix(b".").unwrap_or_default())
+        .ok()
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or(0);
+    (stamp.to_vec(), counter)
 }
 
 /// Whether `candidate` is a backup this module made of `name`.
@@ -270,6 +288,40 @@ mod tests {
         );
         assert!(directory.join("doc.txt.orig.20260101-000000").exists());
         assert!(directory.join("notes.txt.20260101-000000").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn counters_are_pruned_in_numeric_order() {
+        let root = fixture("prune-counters");
+        let directory = root.join(DIRECTORY);
+        fs::create_dir_all(&directory).unwrap();
+        // Saves within one second share a stamp and are told apart by the
+        // counter.  As text `.10` sorts before `.2`, so a text sort would
+        // prune the newest copies and keep older ones.
+        fs::write(directory.join("doc.txt.20260101-000000"), b"x").unwrap();
+        for counter in 1..=KEEP + 2 {
+            fs::write(
+                directory.join(format!("doc.txt.20260101-000000.{counter}")),
+                b"x",
+            )
+            .unwrap();
+        }
+
+        prune(&directory, OsStr::new("doc.txt"));
+
+        let kept: Vec<String> = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(kept.len(), KEEP);
+        // The three oldest go: the bare stamp, `.1` and `.2`.
+        assert!(!kept.contains(&"doc.txt.20260101-000000".to_owned()));
+        assert!(!kept.contains(&"doc.txt.20260101-000000.1".to_owned()));
+        assert!(!kept.contains(&"doc.txt.20260101-000000.2".to_owned()));
+        assert!(kept.contains(&"doc.txt.20260101-000000.10".to_owned()));
+        assert!(kept.contains(&format!("doc.txt.20260101-000000.{}", KEEP + 2)));
 
         fs::remove_dir_all(root).unwrap();
     }

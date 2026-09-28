@@ -65,6 +65,20 @@ fn startup_errors_are_reported_before_a_terminal_is_required() {
 }
 
 #[test]
+fn a_negative_lua_exit_code_still_reports_failure() {
+    let fixture = Fixture::new();
+    let file = fixture.path("file.txt");
+    let config = fixture.path("exit.lua");
+    std::fs::write(&file, b"text\n").unwrap();
+    // C takes an exit code as its low byte, so `exit(-1)` is 255.  Clamping
+    // it to zero would report success for a configuration that failed.
+    std::fs::write(&config, br#"local cano = setup({}); cano.exit(-1, "no")"#).unwrap();
+
+    let output = fixture.run(&[Path::new("--config"), &config, &file]);
+    assert_eq!(output.status.code(), Some(255));
+}
+
+#[test]
 fn lua_exit_propagates_without_initializing_the_terminal() {
     let fixture = Fixture::new();
     let file = fixture.path("file.txt");

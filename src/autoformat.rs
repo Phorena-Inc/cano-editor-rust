@@ -145,6 +145,12 @@ fn push_json_line(out: &mut Vec<u8>, depth: usize, indent: usize) {
 /// Carries a byte region across a rewrite by counting lines rather than
 /// bytes, since a rewrite moves bytes but never moves a line.
 fn moved(before: &[u8], after: &[u8], region: (usize, usize)) -> (usize, usize) {
+    // A region that starts past the end names no line at all.  Counting its
+    // newlines would land it on the last one and format a line the caller
+    // never asked about.
+    if region.0 > before.len() {
+        return (after.len() + 1, after.len() + 1);
+    }
     let first = line_count(&before[..region.0.min(before.len())]);
     let last = line_count(&before[..region.1.min(before.len())]);
     let mut bounds = (after.len(), after.len());
@@ -431,8 +437,10 @@ mod tests {
             format(source, (6, 6), ALL, 4).unwrap(),
             b"f() {\n    bad;\n  worse;\nalso bad;\n}\n"
         );
-        // A region outside everything changes nothing.
+        // A region outside everything changes nothing -- including the last
+        // line, which counting lines would otherwise drag it onto.
         assert_eq!(format(source, (1000, 1000), ALL, 4), None);
+        assert_eq!(format(b"a  ", (1000, 1000), ALL, 4), None);
     }
 
     #[test]
