@@ -44,13 +44,13 @@ Mouse
 Autoformat
   :autoformat (or :Autoformat) validates and pretty-prints a .json file. For
   other files it tidies whitespace as vim-autoformat does when no external
-  formatter is set: re-indent from the
-  bracket nesting, retab leading whitespace to match indent, then strip
-  trailing spaces. Each step has a switch -- autoformat_autoindent,
-  autoformat_retab, autoformat_remove_trailing_spaces -- all on by default;
-  :set noautoformat_retab matters for a Makefile. [space] f runs it on the
-  whole buffer; = in Visual mode runs it on the selected lines, taking every
-  line the selection touches whole.
+  formatter is set: re-indent from the bracket nesting, retab leading
+  whitespace to match indent, then strip trailing spaces. Each step has a
+  switch -- autoformat_autoindent, autoformat_retab,
+  autoformat_remove_trailing_spaces -- all on by default; :set
+  noautoformat_retab matters for a Makefile. [space] f runs it on the whole
+  buffer; = in Visual mode runs it on the selected lines, taking every line
+  the selection touches whole.
   Brackets inside strings are ignored and the whole rewrite is one undo step.
   JSON formatting follows indent, preserves value spellings and a final
   newline, and leaves malformed JSON untouched with an error message. Visual
@@ -170,10 +170,10 @@ File commands
   :s       substitute; see Search and replace above
 
 Syntax highlighting
-  C, C++, Rust and Python are highlighted out of the box, chosen by the file
-  extension (c h / cc cpp cxx c++ hh hpp hxx h++ ipp tpp / rs / py pyi pyw /
-  sh bash zsh ksh / vim / lua), or by name for the dotfiles that have no
-  extension, such as .vimrc, .bashrc and .zshrc.
+  C, C++, Rust, Python, shell, Vim script and Lua are highlighted out of the
+  box, chosen by the file extension (c h / cc cpp cxx c++ hh hpp hxx h++ ipp
+  tpp / rs / py pyi pyw / sh bash zsh ksh / vim / lua), or by name for the
+  dotfiles that have no extension, such as .vimrc, .bashrc and .zshrc.
   The language selects the scanner as well as the word lists, so // is a
   comment in C but floor division in Python, 'a is a Rust lifetime, and # is
   a directive, an attribute or a comment depending on the language. Any other
@@ -187,5 +187,7 @@ Configuration
   must be a table when called. syntax, auto_indent, relative, indent and
   undo_size retain the documented Boolean compatibility behavior. cursorline
   marks the cursor's line by underlining it, the way vim's own terminal
-  default for CursorLine does; it is off unless set. setup
-  returns exit(code[, message]).
+  default for CursorLine does; it is off unless set. setup returns the cano
+  table: cano.command runs a command (see Options), and
+  cano.exit(code[, message]) stops Cano before the editor opens, printing
+  the message and exiting with that status.

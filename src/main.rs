@@ -6,7 +6,7 @@ use cano_fresh::app::{App, AppEffect, Jump};
 use cano_fresh::backup;
 use cano_fresh::cli::{CliError, parse};
 use cano_fresh::config::{load as load_config, load_or_default};
-use cano_fresh::io::{help_directories, help_page, load_buffer, save_buffer};
+use cano_fresh::io::{GENERAL_HELP, help_directories, help_page, load_buffer, save_buffer};
 use cano_fresh::process::run_shell;
 use cano_fresh::recent::Recent;
 use cano_fresh::render::{RenderOptions, draw};
@@ -42,7 +42,7 @@ fn run() -> Result<u8, String> {
     }
 
     let showing_help = cli.help_page.is_some();
-    let filename = if showing_help {
+    let (filename, bytes) = if showing_help {
         // The runtime environment wins so an installed binary can be pointed
         // at relocated help pages; the remaining candidates cover installed
         // and development builds wherever they are run from.
@@ -53,30 +53,27 @@ fn run() -> Result<u8, String> {
             option_env!("CANO_HELP_DIR"),
             executable.as_deref(),
         );
-        directories
+        match directories
             .iter()
             .find_map(|directory| help_page(directory, "general"))
-            .ok_or_else(|| {
-                // Naming the directories searched turns "check for typos" into
-                // something the reader can act on: set CANO_HELP_DIR, or put
-                // the pages where one of these points.
-                let searched = directories
-                    .iter()
-                    .map(|directory| format!("\n  {}", directory.display()))
-                    .collect::<String>();
-                format!(
-                    "Failed to open help page. Check for typos or if you installed cano \
-                     properly. Searched:{searched}"
-                )
-            })?
+        {
+            Some(path) => {
+                let bytes = load_buffer(&path)
+                    .map_err(|error| format!("Could not open {}: {error}", path.display()))?;
+                (path, bytes)
+            }
+            // No page on disk: fall back to the copy built into the binary.
+            None => (PathBuf::from("general"), GENERAL_HELP.to_vec()),
+        }
     } else {
-        PathBuf::from(cli.filename.as_deref().unwrap_or("out.txt"))
-    };
-    let bytes = match load_buffer(&filename) {
-        Ok(bytes) => bytes,
-        // A missing file starts as an empty buffer and is created on save.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !showing_help => Vec::new(),
-        Err(error) => return Err(format!("Could not open {}: {error}", filename.display())),
+        let filename = PathBuf::from(cli.filename.as_deref().unwrap_or("out.txt"));
+        let bytes = match load_buffer(&filename) {
+            Ok(bytes) => bytes,
+            // A missing file starts as an empty buffer and is created on save.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(format!("Could not open {}: {error}", filename.display())),
+        };
+        (filename, bytes)
     };
     let mut app = App::new(bytes, filename.clone());
     app.readonly = showing_help;

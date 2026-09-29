@@ -15,6 +15,11 @@ pub fn save_buffer(path: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::write(path, bytes)
 }
 
+/// The general help page as it was when the binary was built.  It answers
+/// when none of [`help_directories`] holds the page, so a binary copied on
+/// its own still has its help.
+pub const GENERAL_HELP: &[u8] = include_bytes!("../docs/help/general");
+
 /// Resolve a help page only when it names an existing regular file.
 pub fn help_page(help_dir: &Path, page: &str) -> Option<PathBuf> {
     let path = help_dir.join(page);

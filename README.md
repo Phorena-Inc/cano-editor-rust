@@ -37,7 +37,9 @@ location, pass it explicitly:
 ```
 
 `-h`/`--help` opens the bundled help pages in the editor, and `-v`/`--version`
-prints the version and exits.
+prints the version and exits. The general help page is built into the binary,
+so help works even when no `docs/help` directory is found; a page on disk
+(from `CANO_HELP_DIR` or an install) is preferred when present.
 
 `make` remains available as a compatibility wrapper and copies the release binary to `build/cano`.
 
