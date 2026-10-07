@@ -20,6 +20,7 @@ Global keys
   Ctrl-S   save and quit (Normal and Insert modes)
   Ctrl-N   toggle explorer in Normal mode (Escape closes it)
   Ctrl-P   toggle the recent-file list in Normal mode (Escape closes it)
+  Ctrl-K   toggle the AI assistant panel, or click AI on the status line
   Ctrl-R   redo in Normal mode (U does the same)
   Ctrl-M   toggle markdown display in Normal mode (so does Enter)
   Ctrl-C   acts as Escape in every mode
@@ -191,3 +192,18 @@ Configuration
   table: cano.command runs a command (see Options), and
   cano.exit(code[, message]) stops Cano before the editor opens, printing
   the message and exiting with that status.
+
+AI ASSISTANT
+  With ANTHROPIC_API_KEY (or OPENAI_API_KEY) set, an AI button appears at the
+  right of the status line. Click it or press Ctrl-K to open a chat panel at
+  the bottom of the screen. Ask how Cano works, or give it a task: it can read
+  and edit the buffer (each edit undoes with u), run : commands, and read
+  files. Running a shell command or writing a file asks you first: y allows,
+  n refuses, a allows that tool for the session, Esc stops the task.
+  In the panel Enter sends, Esc goes back to the editor (or stops a running
+  request), Ctrl-L starts a new chat, and the arrows, the wheel or the
+  scrollbar on the right scroll back. Click the panel to type in it, and drag
+  its top bar to resize it.
+  CANO_AI_PROVIDER=openai picks OpenAI when both keys are set; CANO_AI_MODEL
+  and CANO_AI_EFFORT override the model (claude-opus-5-5 by default) and the
+  effort level (medium).
