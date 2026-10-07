@@ -1,0 +1,65 @@
+# Builds a release binary for each supported platform.  Pull requests and
+# manual runs keep the archives as workflow artifacts; pushing a `v*` tag
+# also publishes them on a GitHub release for that tag.
+name: Release binaries
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 links against an older glibc, so the Linux binaries also
+          # run on distributions that are a few years behind.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      # The archive mirrors an install prefix: bin/cano finds its help pages
+      # in ../docs/help, the layout the binary already searches.
+      - name: Package
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          name=cano-$version-${{ matrix.target }}
+          mkdir -p "$name/bin" "$name/docs"
+          cp target/${{ matrix.target }}/release/cano* "$name/bin/"
+          rm -f "$name"/bin/*.d "$name"/bin/*.pdb
+          cp -r docs/help "$name/docs/"
+          cp LICENSE README.md "$name/"
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z a "$name.zip" "$name" >/dev/null
+          else
+            tar czf "$name.tar.gz" "$name"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: cano-*.*z*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - run: gh release create "$GITHUB_REF_NAME" cano-* --repo "$GITHUB_REPOSITORY" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
