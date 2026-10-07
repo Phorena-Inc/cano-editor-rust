@@ -19,6 +19,7 @@ const MAX_DEPTH: usize = 64;
 /// finish.  This is the ceiling on the whole expansion, not on one step.
 const MAX_EXPANSION: usize = 10_000;
 
+use crate::assistant::Assistant;
 use crate::autoformat::{self, Steps};
 use crate::buffer::Highlight;
 use crate::command::{Action, CommandState, ConfigVariable, ExternalEffect, key, lex, parse};
@@ -213,6 +214,9 @@ pub struct App {
     /// against.  It is not a cached answer: a mapping that edits and then
     /// quits within one keypress has to see the edit.
     saved_buffer: Vec<u8>,
+    /// The AI chat panel.  It starts closed and without a backend; the
+    /// binary gives it one when an API key is configured.
+    pub assistant: Assistant,
 }
 
 impl App {
@@ -261,6 +265,7 @@ impl App {
             readonly: false,
             last_search: Highlight::default(),
             saved_buffer,
+            assistant: Assistant::new(None),
         }
     }
 
@@ -274,6 +279,11 @@ impl App {
     }
 
     pub fn handle(&mut self, input: Input) -> Vec<AppEffect> {
+        // Keys typed into the assistant panel are not editor commands: they
+        // must not be recorded for `.`, mapped, or seen by any mode.
+        if self.assistant_owns(input) {
+            return self.assistant_key(input);
+        }
         self.expanded = 0;
         self.open_change(input);
         let effects = self.handle_mapped(input, 0);
@@ -1904,6 +1914,10 @@ impl App {
         if self.commands.mouse == 0 {
             return;
         }
+        // The panel and its status-bar button sit outside every pane.
+        if self.assistant_mouse(mouse) {
+            return;
+        }
         if self.history_open.is_some() {
             self.history_mouse(mouse);
             return;
@@ -2920,6 +2934,7 @@ mod tests {
             content_width: 40,
             first_item: 0,
             scrollbar_x: None,
+            ..Viewport::default()
         };
         app.mark_rendered();
         for input in [Input::Byte(b'i'), Input::Byte(b'a'), Input::Byte(b'b')] {

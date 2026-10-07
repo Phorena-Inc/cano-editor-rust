@@ -11,6 +11,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Clear;
 
+use crate::assistant::{Assistant, Role};
 use crate::buffer::Highlight;
 use crate::editor::{Editor, Mode};
 use crate::explorer::{Entry, Explorer};
@@ -77,6 +78,17 @@ pub struct Viewport {
     pub first_item: usize,
     /// Screen column of the scrollbar, when the pane was wide enough for one.
     pub scrollbar_x: Option<u16>,
+    /// The assistant panel's first row and height, while it is open.
+    pub panel: Option<(u16, u16)>,
+    /// The status-bar AI button: its columns `x0..x1` and its row.
+    pub ai_button: Option<(u16, u16, u16)>,
+    /// The transcript's scrollbar: its column, first row and height.
+    pub panel_track: Option<(u16, u16, u16)>,
+    /// How far back the wrapped transcript can scroll before its oldest line
+    /// is at the top.  Input clamps to this, so scrolling past the top does
+    /// not pile up wheel notches that then have to be scrolled away.
+    pub panel_scroll_max: usize,
+    pub screen_height: u16,
 }
 
 impl Viewport {
@@ -90,23 +102,21 @@ impl Viewport {
     /// This is the inverse of the thumb placement in the drawing code, so the
     /// thumb lands under the pointer that dragged it.
     pub fn item_from_track(&self, row: u16, total: usize) -> usize {
-        let track = Track::new(self.rows, total);
-        if track.scrollable_track == 0 {
-            return 0;
-        }
-        // The thumb is placed by truncating division, so the exact inverse is
-        // the smallest item count that still reaches this row -- rounding
-        // instead leaves the thumb a row behind the pointer that dragged it.
-        let item = usize::from(row)
-            .saturating_mul(track.scrollable_items)
-            .div_ceil(track.scrollable_track)
-            .min(track.scrollable_items);
-        // Post: the thumb drawn for `item` starts on the row that was dragged.
-        debug_assert_eq!(
-            track.thumb_start(item),
-            usize::from(row).min(track.scrollable_track)
+        Track::new(self.rows, total).item_at(row)
+    }
+
+    /// How far back the assistant transcript should scroll for its scrollbar
+    /// to be grabbed at screen row `row`.  `None` when the panel has no bar.
+    pub fn panel_scroll_from_track(&self, row: u16) -> Option<usize> {
+        let (_, top, height) = self.panel_track?;
+        // An overflowing transcript is one track's height plus how far back
+        // it scrolls; a shorter one cannot scroll, which this also says.
+        let track = Track::new(
+            usize::from(height),
+            self.panel_scroll_max + usize::from(height),
         );
-        item
+        let first = track.item_at(row.saturating_sub(top));
+        Some(self.panel_scroll_max.saturating_sub(first))
     }
 
     /// The buffer byte under a screen position, if the text is there.
@@ -224,6 +234,8 @@ pub struct RenderOptions<'a> {
     pub message: Option<&'a str>,
     pub filename: &'a str,
     pub saved: bool,
+    /// The AI panel, or `None` when no API key switched the feature on.
+    pub assistant: Option<&'a Assistant>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -239,8 +251,8 @@ struct ScreenLayout {
 }
 
 impl ScreenLayout {
-    fn new(area: Rect, line_count: usize) -> Self {
-        let editor_height = area.height.saturating_sub(STATUS_ROWS);
+    fn new(area: Rect, line_count: usize, panel_rows: u16) -> Self {
+        let editor_height = area.height.saturating_sub(STATUS_ROWS + panel_rows);
         let line_digits = u16::try_from(line_count.max(1).to_string().len()).unwrap_or(u16::MAX);
         let desired_digit_width = LINE_NUMBER_WIDTH.saturating_sub(1).max(line_digits);
         let gutter_width = area.width.min(desired_digit_width.saturating_add(1));
@@ -265,7 +277,7 @@ impl ScreenLayout {
             content_x: area.x.saturating_add(gutter_width),
             content_width,
             scrollbar_x,
-            status_y: area.y.saturating_add(editor_height),
+            status_y: area.y.saturating_add(editor_height + panel_rows),
             prompt_y: (area.height >= STATUS_ROWS)
                 .then(|| area.y.saturating_add(area.height.saturating_sub(1))),
         }
@@ -292,13 +304,17 @@ pub fn draw(
         } else {
             0
         };
-    let layout = ScreenLayout::new(area, line_count);
+    let panel_rows = options.assistant.map_or(0, |a| a.rows(area.height));
+    let layout = ScreenLayout::new(area, line_count, panel_rows);
+    scroll.screen_height = area.height;
+    scroll.panel = (panel_rows > 0).then(|| (area.y + layout.editor_height, panel_rows));
     scroll.content_x = layout.content_x;
     scroll.content_width = layout.content_width;
     scroll.scrollbar_x = layout.scrollbar_x;
     scroll.rows = usize::from(layout.editor_height);
 
     let mut first_item = 0;
+    let panel_focused;
     frame.render_widget(Clear, area);
     let cursor = {
         let buffer = frame.buffer_mut();
@@ -348,12 +364,26 @@ pub fn draw(
             draw_editor(buffer, layout, editor, &options, scroll)
         };
 
-        draw_status(buffer, layout, editor, &options);
+        scroll.ai_button = draw_status(buffer, layout, editor, &options);
+        let panel = match (options.assistant, scroll.panel) {
+            (Some(assistant), Some((top, rows))) => draw_assistant(
+                buffer,
+                Rect::new(area.x, top, area.width, rows),
+                assistant,
+                scroll,
+            ),
+            _ => None,
+        };
         let prompt = draw_prompt(buffer, layout, editor, &options);
-        // The list shows which entry is selected by putting the terminal
-        // cursor on it, so while the history picker is up it outranks the
-        // prompt it was opened from; everywhere else the prompt wins.
-        if options.history.is_some() {
+        // Focus decides whose cursor shows: the panel's input line while it
+        // has the keyboard, the editor's otherwise.
+        panel_focused = panel.is_some() && options.assistant.is_some_and(|a| a.focused);
+        if panel_focused {
+            panel
+        } else if options.history.is_some() {
+            // The list shows which entry is selected by putting the terminal
+            // cursor on it, so while the history picker is up it outranks the
+            // prompt it was opened from; everywhere else the prompt wins.
             cursor.or(prompt)
         } else {
             prompt.or(cursor)
@@ -364,7 +394,7 @@ pub fn draw(
     // Post: whichever pane placed it, the cursor is inside the frame.
     debug_assert!(cursor.is_none_or(|(x, y)| area.contains(Position::new(x, y))));
 
-    if editor.mode != Mode::Visual
+    if (panel_focused || editor.mode != Mode::Visual)
         && let Some(position) = cursor
     {
         frame.set_cursor_position(position);
@@ -967,6 +997,29 @@ impl Track {
         track
     }
 
+    /// The first item that puts the thumb at track row `row`.
+    ///
+    /// This is the inverse of [`Track::thumb_start`], so the thumb lands under
+    /// the pointer that dragged it.
+    fn item_at(&self, row: u16) -> usize {
+        if self.scrollable_track == 0 {
+            return 0;
+        }
+        // The thumb is placed by truncating division, so the exact inverse is
+        // the smallest item count that still reaches this row -- rounding
+        // instead leaves the thumb a row behind the pointer that dragged it.
+        let item = usize::from(row)
+            .saturating_mul(self.scrollable_items)
+            .div_ceil(self.scrollable_track)
+            .min(self.scrollable_items);
+        // Post: the thumb drawn for `item` starts on the row that was dragged.
+        debug_assert_eq!(
+            self.thumb_start(item),
+            usize::from(row).min(self.scrollable_track)
+        );
+        item
+    }
+
     /// The track row the thumb starts on when `first_item` is at the top.
     fn thumb_start(&self, first_item: usize) -> usize {
         first_item
@@ -986,7 +1039,25 @@ fn draw_scrollbar(
     let Some(x) = layout.scrollbar_x else {
         return;
     };
-    let track_height = usize::from(layout.editor_height);
+    draw_track(
+        buffer,
+        x,
+        layout.area.y,
+        usize::from(layout.editor_height),
+        total_items,
+        first_item,
+    );
+}
+
+/// Draws a vertical scrollbar in column `x` from row `top` down.
+fn draw_track(
+    buffer: &mut TuiBuffer,
+    x: u16,
+    top: u16,
+    track_height: usize,
+    total_items: usize,
+    first_item: usize,
+) {
     if track_height == 0 {
         return;
     }
@@ -995,7 +1066,7 @@ fn draw_scrollbar(
     let thumb_start = track.thumb_start(first_item);
 
     for row in 0..track_height {
-        let y = shifted(layout.area.y, row);
+        let y = shifted(top, row);
         let in_thumb = (thumb_start..thumb_start.saturating_add(thumb_height)).contains(&row);
         if let Some(cell) = buffer.cell_mut((x, y)) {
             if in_thumb {
@@ -1014,7 +1085,7 @@ fn draw_status(
     layout: ScreenLayout,
     editor: &Editor,
     options: &RenderOptions<'_>,
-) {
+) -> Option<(u16, u16, u16)> {
     let style = Style::default().add_modifier(Modifier::REVERSED);
     buffer.set_style(
         Rect::new(layout.area.x, layout.status_y, layout.area.width, 1),
@@ -1040,6 +1111,185 @@ fn draw_status(
         &status,
         style,
     );
+
+    // The assistant's switch sits at the right end, in a color of its own
+    // so it reads as a button rather than more status text.
+    let assistant = options.assistant?;
+    let (label, button) = if assistant.open {
+        (
+            " AI ON ",
+            Style::default().fg(Color::Black).bg(Color::Green),
+        )
+    } else {
+        (" AI ", Style::default().fg(Color::White).bg(Color::Magenta))
+    };
+    let width = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
+    if layout.area.width <= width {
+        return None;
+    }
+    let x = layout.area.x + layout.area.width - width;
+    write_text(
+        buffer,
+        x,
+        layout.status_y,
+        width,
+        label,
+        button.add_modifier(Modifier::BOLD),
+    );
+    Some((x, x + width, layout.status_y))
+}
+
+/// Draws the assistant panel into `area`: a title bar that doubles as the
+/// resize handle, the transcript, and the input line.  Returns where the
+/// input cursor is.
+fn draw_assistant(
+    buffer: &mut TuiBuffer,
+    area: Rect,
+    assistant: &Assistant,
+    scroll: &mut Viewport,
+) -> Option<(u16, u16)> {
+    scroll.panel_track = None;
+    scroll.panel_scroll_max = 0;
+    if area.height < 2 || area.width == 0 {
+        return None;
+    }
+    let width = usize::from(area.width);
+
+    let bar = Style::default().fg(Color::Black).bg(Color::Green);
+    buffer.set_style(Rect::new(area.x, area.y, area.width, 1), bar);
+    let model = assistant.backend.as_ref().map_or("", |b| b.model.as_str());
+    let status = assistant.status();
+    let mut title = format!(
+        "═ AI assistant · {model}{}{status} ═  Esc: editor  Ctrl-K: close  Ctrl-L: new chat  drag here to resize ",
+        if status.is_empty() { "" } else { " · " },
+    );
+    let fill = width.saturating_sub(title.chars().count());
+    title.extend(std::iter::repeat_n('═', fill));
+    write_text(
+        buffer,
+        area.x,
+        area.y,
+        area.width,
+        &title,
+        bar.add_modifier(Modifier::BOLD),
+    );
+
+    // The transcript, wrapped to the panel and pinned to its newest line
+    // unless the reader has scrolled back.
+    let rows = usize::from(area.height.saturating_sub(2));
+    // The rightmost column is kept for the scrollbar, so text never runs
+    // under it and does not rewrap when the bar appears.
+    let bar = area.width > 1 && rows > 0;
+    let text_width = area.width - u16::from(bar);
+    let mut lines: Vec<(String, Style)> = Vec::new();
+    for entry in &assistant.transcript {
+        let (label, style) = match entry.role {
+            Role::User => ("you › ", Style::default().fg(Color::Cyan)),
+            Role::Assistant => ("ai  › ", Style::default()),
+            Role::Tool => ("      ", Style::default().fg(Color::DarkGray)),
+            Role::Error => ("  !   ", Style::default().fg(Color::Red)),
+            Role::Info => ("      ", Style::default().fg(Color::Yellow)),
+        };
+        let indent = label.chars().count();
+        let room = usize::from(text_width).saturating_sub(indent).max(1);
+        let mut first = true;
+        for paragraph in entry.text.split('\n') {
+            let characters: Vec<char> = paragraph.chars().collect();
+            let chunks: Vec<String> = if characters.is_empty() {
+                vec![String::new()]
+            } else {
+                characters
+                    .chunks(room)
+                    .map(|c| c.iter().collect())
+                    .collect()
+            };
+            for chunk in chunks {
+                let prefix = if first { label } else { "      " };
+                first = false;
+                lines.push((format!("{prefix}{chunk}"), style));
+            }
+        }
+    }
+    let most = lines.len().saturating_sub(rows);
+    let back = assistant.scroll.min(most);
+    let start = most - back;
+    for (offset, (line, style)) in lines.iter().skip(start).take(rows).enumerate() {
+        let y = area.y + 1 + u16::try_from(offset).unwrap_or(0);
+        write_text(buffer, area.x, y, text_width, line, *style);
+    }
+    scroll.panel_scroll_max = most;
+    if bar {
+        let x = area.x + area.width - 1;
+        draw_track(buffer, x, area.y + 1, rows, lines.len(), start);
+        scroll.panel_track = Some((x, area.y + 1, area.height - 2));
+    }
+    if back > 0 {
+        let note = format!(" ↓ {back} more ");
+        let x =
+            area.x + text_width.saturating_sub(u16::try_from(note.chars().count()).unwrap_or(0));
+        write_text(
+            buffer,
+            x,
+            area.y + 1,
+            area.width,
+            &note,
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        );
+    }
+
+    let y = area.y + area.height - 1;
+    if let Some(question) = assistant.approving() {
+        let text = format!("Allow {question} ?  y: yes  n: no  a: always  Esc: stop");
+        write_text(
+            buffer,
+            area.x,
+            y,
+            area.width,
+            &text,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+        let x = area.x + u16::try_from(text.chars().count().min(width - 1)).unwrap_or(0);
+        return Some((x, y));
+    }
+    let input = String::from_utf8_lossy(&assistant.input);
+    if input.is_empty() && !assistant.focused {
+        write_text(
+            buffer,
+            area.x,
+            y,
+            area.width,
+            "> click here or press Ctrl-K to ask…",
+            Style::default().fg(Color::DarkGray),
+        );
+        return None;
+    }
+    let before = String::from_utf8_lossy(
+        &assistant.input[..assistant.input_cursor.min(assistant.input.len())],
+    )
+    .chars()
+    .count();
+    let available = width.saturating_sub(3).max(1);
+    let skip = before.saturating_sub(available);
+    write_text(
+        buffer,
+        area.x,
+        y,
+        area.width,
+        "> ",
+        Style::default().fg(Color::Green),
+    );
+    write_characters(
+        buffer,
+        area.x + 2,
+        y,
+        area.width.saturating_sub(2),
+        input.chars().skip(skip),
+        Style::default(),
+    );
+    let x = area.x + 2 + u16::try_from(before - skip).unwrap_or(0);
+    Some((x.min(area.x + area.width - 1), y))
 }
 
 fn mode_name(mode: Mode) -> &'static str {
@@ -1185,6 +1435,7 @@ mod tests {
             message: None,
             filename: "file.txt",
             saved: true,
+            assistant: None,
         }
     }
 
@@ -1703,6 +1954,7 @@ mod tests {
             content_width: 20,
             first_item: 0,
             scrollbar_x: Some(25),
+            ..Viewport::default()
         };
         let byte = |column, row| viewport.byte_at(&editor, column, row);
 

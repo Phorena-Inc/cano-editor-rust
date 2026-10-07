@@ -3,6 +3,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use cano_fresh::app::{App, AppEffect, Jump};
+use cano_fresh::assistant::Backend;
 use cano_fresh::backup;
 use cano_fresh::cli::{CliError, parse};
 use cano_fresh::config::{load as load_config, load_or_default};
@@ -77,6 +78,9 @@ fn run() -> Result<u8, String> {
     };
     let mut app = App::new(bytes, filename.clone());
     app.readonly = showing_help;
+    // The assistant exists only when an API key does; without one its
+    // button stays hidden and Ctrl-K just says how to turn it on.
+    app.assistant.backend = Backend::from_env();
 
     let explicit_config = cli.config.is_some();
     let config_path = match cli.config {
@@ -204,6 +208,7 @@ fn run() -> Result<u8, String> {
                         message: app.commands.message.as_deref(),
                         filename: &filename,
                         saved: app.saved(),
+                        assistant: app.assistant.available().then_some(&app.assistant),
                     },
                     &mut viewport,
                 );
@@ -217,19 +222,34 @@ fn run() -> Result<u8, String> {
             app.message_pending = false;
             message_deadline = Some(Instant::now() + Duration::from_secs(1));
         }
-        let input = match message_deadline {
+        // While the assistant is waiting on the network or a shell command
+        // the loop wakes up regularly to collect the result and tick the
+        // elapsed time, instead of sleeping until the next key.
+        let poll = app
+            .assistant
+            .busy()
+            .then(|| Instant::now() + Duration::from_millis(200));
+        let deadline = [message_deadline, poll].into_iter().flatten().min();
+        let input = match deadline {
             Some(deadline) => terminal
                 .read_input_before(deadline)
                 .map_err(|error| error.to_string())?,
             None => Some(terminal.read_input().map_err(|error| error.to_string())?),
         };
         let Some(input) = input else {
-            message_deadline = None;
-            app.commands.message = None;
+            if message_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                message_deadline = None;
+                app.commands.message = None;
+            }
+            let effects = app.assistant_poll();
+            if apply_effects(&mut app, effects) {
+                return Ok(0);
+            }
             continue;
         };
 
-        let effects = app.handle(input);
+        let mut effects = app.handle(input);
+        effects.extend(app.assistant_poll());
         // Suspending needs the terminal, which the effect applier does not
         // have, and it has to happen before anything is drawn again.
         if effects.contains(&AppEffect::Suspend) {
