@@ -3,11 +3,13 @@
 //! Both motions ask for one character, label every occurrence the user can
 //! see, and jump to whichever label is typed next.  The two differ in what
 //! counts as an occurrence, following vim-easymotion: `s` finds the character
-//! in both directions, while `t` is forward only and lands one byte before
-//! the match.
+//! in both directions, while `t` is forward only and lands one character
+//! before the match.
 //!
 //! Everything here is pure: the caller supplies the buffer, the visible byte
 //! range and the cursor, so the search never has to know about rendering.
+
+use crate::display;
 
 /// The label alphabet, in the order labels are handed out.
 ///
@@ -54,15 +56,23 @@ pub fn targets(
             continue;
         }
         let index = start + offset;
+        // A byte inside a multi-byte character is not somewhere the cursor
+        // can go, so it is not a match even when it equals the needle.
+        if !display::is_char_boundary(data, index) {
+            continue;
+        }
         let destination = match kind {
             // The cursor is already on this byte, so a label for it would do
             // nothing.
             Kind::Find if index == cursor => continue,
             Kind::Find => index,
             // `t` is forward only, and it has to leave room to stop short of
-            // the match: the byte right after the cursor is already adjacent.
-            Kind::Till if index > cursor.saturating_add(1) => index - 1,
-            Kind::Till => continue,
+            // the match: the character right after the cursor is already
+            // adjacent.  Stopping short means a whole character short.
+            Kind::Till => match display::previous_char(data, index) {
+                before if before > cursor => before,
+                _ => continue,
+            },
         };
         found.push((index, destination));
     }
@@ -188,6 +198,17 @@ mod tests {
         // A match immediately after the cursor would not move it at all.
         let adjacent = targets(b".o.", (0, 3), 0, Kind::Till, b'o');
         assert!(adjacent.is_empty());
+    }
+
+    #[test]
+    fn till_stops_a_whole_character_short_and_continuation_bytes_never_match() {
+        // `é` is two bytes, so stopping short of the `o` after it lands on
+        // its first byte rather than inside it.
+        let data = "xéo".as_bytes();
+        let found = targets(data, (0, data.len()), 0, Kind::Till, b'o');
+        assert_eq!(found[0].destination, 1);
+        // 0xa9 is the second byte of `é`, not a character of its own.
+        assert!(targets(data, (0, data.len()), 0, Kind::Find, 0xa9).is_empty());
     }
 
     #[test]

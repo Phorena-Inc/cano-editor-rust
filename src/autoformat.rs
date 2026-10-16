@@ -11,7 +11,7 @@
 //! line; JSON pretty-printing may also add or remove lines.
 
 use crate::buffer::Nesting;
-use crate::render::{TAB_WIDTH, display_columns};
+use crate::display::display_columns;
 use serde_json::value::RawValue;
 
 /// Which steps `:autoformat` runs, each on by default as in the plugin.
@@ -32,8 +32,18 @@ pub struct Steps {
 /// Bracket depth is still measured from the start of the buffer, because how
 /// deep the first formatted line sits depends on everything above it.
 ///
-/// `indent` is the editor's indent width, where zero means a tab.
-pub fn format(data: &[u8], region: (usize, usize), steps: Steps, indent: usize) -> Option<Vec<u8>> {
+/// `indent` is the editor's indent width, where zero means a tab, and
+/// `tabstop` is how many columns a tab is drawn across, which retab needs to
+/// keep the text where it was on screen.
+pub fn format(
+    data: &[u8],
+    region: (usize, usize),
+    steps: Steps,
+    indent: usize,
+    tabstop: usize,
+) -> Option<Vec<u8>> {
+    // Pre: a tab is at least one column, or retab would divide by zero.
+    debug_assert!(tabstop > 0);
     let mut result = data.to_vec();
     if steps.autoindent {
         result = autoindent(&result, region, indent);
@@ -43,7 +53,7 @@ pub fn format(data: &[u8], region: (usize, usize), steps: Steps, indent: usize) 
     // never which lines the region reaches.
     if steps.retab {
         let region = moved(data, &result, region);
-        result = retab(&result, region, indent);
+        result = retab(&result, region, indent, tabstop);
     }
     if steps.remove_trailing_spaces {
         let region = moved(data, &result, region);
@@ -217,17 +227,17 @@ fn autoindent(data: &[u8], region: (usize, usize), indent: usize) -> Vec<u8> {
 ///
 /// The column count is preserved rather than snapped to a multiple of the
 /// indent width, the way vim's own `:retab` preserves it.
-fn retab(data: &[u8], region: (usize, usize), indent: usize) -> Vec<u8> {
+fn retab(data: &[u8], region: (usize, usize), indent: usize, tabstop: usize) -> Vec<u8> {
     rewrite(data, region, |line, inside, out| {
         if !inside {
             out.extend_from_slice(line);
             return;
         }
         let content = leading_end(line);
-        let columns = display_columns(&line[..content]);
+        let columns = display_columns(&line[..content], tabstop);
         if indent == 0 {
-            out.extend(std::iter::repeat_n(b'\t', columns / TAB_WIDTH));
-            out.extend(std::iter::repeat_n(b' ', columns % TAB_WIDTH));
+            out.extend(std::iter::repeat_n(b'\t', columns / tabstop));
+            out.extend(std::iter::repeat_n(b' ', columns % tabstop));
         } else {
             out.extend(std::iter::repeat_n(b' ', columns));
         }
@@ -309,7 +319,7 @@ mod tests {
 
     /// Formats the whole buffer, which is what most of these cases want.
     fn whole(data: &[u8], steps: Steps, indent: usize) -> Option<Vec<u8>> {
-        format(data, (0, data.len()), steps, indent)
+        format(data, (0, data.len()), steps, indent, 4)
     }
 
     fn only(autoindent: bool, retab: bool, remove_trailing_spaces: bool) -> Steps {
@@ -375,6 +385,23 @@ mod tests {
     }
 
     #[test]
+    fn retab_measures_tabs_with_tabstop_not_a_fixed_four() {
+        let retab = only(false, true, false);
+        // With `tabstop=8` a tab is eight columns, so it becomes eight
+        // spaces, and eight spaces fold back into one tab.
+        assert_eq!(
+            format(b"\tone\n", (0, 5), retab, 4, 8).unwrap(),
+            b"        one\n"
+        );
+        assert_eq!(
+            format(b"          ten\n", (0, 14), retab, 0, 8).unwrap(),
+            b"\t  ten\n"
+        );
+        // A two-column tab: three of them are six spaces.
+        assert_eq!(format(b"\t\t\tx", (0, 4), retab, 2, 2).unwrap(), b"      x");
+    }
+
+    #[test]
     fn trailing_whitespace_goes_from_every_line() {
         assert_eq!(
             whole(b"a  \nb\t\n\t\nc", only(false, false, true), 4).unwrap(),
@@ -422,25 +449,25 @@ mod tests {
         let source = b"f() {\nbad;\n  worse;\nalso bad;\n}\n";
         // A region covering only the middle line rewrites that line whole and
         // nothing else, even where the rest is just as badly indented.
-        let middle = format(source, (11, 19), ALL, 4).unwrap();
+        let middle = format(source, (11, 19), ALL, 4, 4).unwrap();
         assert_eq!(middle, b"f() {\nbad;\n    worse;\nalso bad;\n}\n");
 
         // Depth still comes from the whole buffer: the region does not start
         // at column zero just because the formatting does.
         let deeper = b"a {\nb {\ninner;\n}\n}\n";
-        let inner = format(deeper, (8, 14), ALL, 4).unwrap();
+        let inner = format(deeper, (8, 14), ALL, 4, 4).unwrap();
         assert_eq!(inner, b"a {\nb {\n        inner;\n}\n}\n");
 
         // An empty region at a line still claims that line, since a byte
         // range of zero width sits inside one.
         assert_eq!(
-            format(source, (6, 6), ALL, 4).unwrap(),
+            format(source, (6, 6), ALL, 4, 4).unwrap(),
             b"f() {\n    bad;\n  worse;\nalso bad;\n}\n"
         );
         // A region outside everything changes nothing -- including the last
         // line, which counting lines would otherwise drag it onto.
-        assert_eq!(format(source, (1000, 1000), ALL, 4), None);
-        assert_eq!(format(b"a  ", (1000, 1000), ALL, 4), None);
+        assert_eq!(format(source, (1000, 1000), ALL, 4, 4), None);
+        assert_eq!(format(b"a  ", (1000, 1000), ALL, 4, 4), None);
     }
 
     #[test]
@@ -448,7 +475,7 @@ mod tests {
         // Re-indenting moves bytes, so a later step working from stale byte
         // offsets would strip or retab the wrong lines.
         let source = b"f() {\nkeep;   \ntrim;   \n}\n";
-        let second = format(source, (6, 14), ALL, 4).unwrap();
+        let second = format(source, (6, 14), ALL, 4, 4).unwrap();
         assert_eq!(second, b"f() {\n    keep;\ntrim;   \n}\n");
     }
 

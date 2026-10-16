@@ -8,6 +8,7 @@
 use std::error::Error;
 use std::fmt;
 
+use crate::display::{DEFAULT_TABSTOP, TABSTOP_RANGE};
 use crate::listchars::ListChars;
 
 /// A half-open byte span in the original command line.
@@ -98,6 +99,11 @@ pub enum CommandError {
     InvalidExpression,
     IntegerOverflow,
     UnknownCommand(Vec<u8>),
+    /// A value outside the range an option accepts, such as `tabstop 0`.
+    InvalidValue {
+        name: &'static str,
+        value: i64,
+    },
 }
 
 impl fmt::Display for CommandError {
@@ -116,6 +122,7 @@ impl fmt::Display for CommandError {
             Self::UnknownCommand(name) => {
                 write!(f, "Unknown command: {}", String::from_utf8_lossy(name))
             }
+            Self::InvalidValue { name, value } => write!(f, "Invalid value for {name}: {value}"),
         }
     }
 }
@@ -146,6 +153,7 @@ const CONFIGS: &[&[u8]] = &[
     b"relative",
     b"auto_indent",
     b"indent",
+    b"tabstop",
     b"undo_size",
     b"cursorline",
     b"mouse",
@@ -250,6 +258,10 @@ pub enum ConfigVariable {
     Relative,
     AutoIndent,
     Indent,
+    /// Vim's `tabstop`: how many columns a tab is drawn across.  It is a
+    /// separate option from `indent` (vim's `shiftwidth`), as in vim, so the
+    /// width a tab looks and the width `>>` indents by can differ.
+    Tabstop,
     UndoSize,
     CursorLine,
     Mouse,
@@ -268,7 +280,8 @@ impl ConfigVariable {
             b"syntax" | b"syn" => Some(Self::Syntax),
             b"relative" | b"relativenumber" | b"rnu" => Some(Self::Relative),
             b"auto_indent" | b"auto-indent" | b"autoindent" | b"ai" => Some(Self::AutoIndent),
-            b"indent" | b"shiftwidth" | b"sw" | b"tabstop" | b"ts" => Some(Self::Indent),
+            b"indent" | b"shiftwidth" | b"sw" => Some(Self::Indent),
+            b"tabstop" | b"ts" => Some(Self::Tabstop),
             b"undo_size" | b"undo-size" => Some(Self::UndoSize),
             b"cursorline" | b"cursor-line" | b"cul" => Some(Self::CursorLine),
             b"mouse" => Some(Self::Mouse),
@@ -278,6 +291,36 @@ impl ConfigVariable {
             b"autoformat_retab" => Some(Self::AutoFormatRetab),
             b"autoformat_remove_trailing_spaces" => Some(Self::AutoFormatTrailing),
             _ => None,
+        }
+    }
+
+    /// Whether the option can hold `value`.  Most are plain integers that
+    /// take anything; `tabstop` has to stay a usable tab width.
+    pub fn accepts(self, value: i64) -> bool {
+        match self {
+            Self::Tabstop => {
+                usize::try_from(value).is_ok_and(|width| TABSTOP_RANGE.contains(&width))
+            }
+            _ => true,
+        }
+    }
+
+    /// The option's canonical name, for messages about it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Syntax => "syntax",
+            Self::Relative => "relative",
+            Self::AutoIndent => "auto_indent",
+            Self::Indent => "indent",
+            Self::Tabstop => "tabstop",
+            Self::UndoSize => "undo_size",
+            Self::CursorLine => "cursorline",
+            Self::Mouse => "mouse",
+            Self::Backup => "backup",
+            Self::List => "list",
+            Self::AutoFormatIndent => "autoformat_autoindent",
+            Self::AutoFormatRetab => "autoformat_retab",
+            Self::AutoFormatTrailing => "autoformat_remove_trailing_spaces",
         }
     }
 }
@@ -641,6 +684,9 @@ pub struct CommandState {
     pub relative: i64,
     pub auto_indent: i64,
     pub indent: i64,
+    /// Vim's `tabstop`, always inside [`TABSTOP_RANGE`]: `apply` refuses
+    /// anything else, so readers can use it as a width without clamping.
+    pub tabstop: i64,
     pub undo_size: i64,
     /// Vim's `cursorline`, off by default the way vim leaves it.
     pub cursorline: i64,
@@ -680,6 +726,7 @@ impl CommandState {
             relative: 0,
             auto_indent: 1,
             indent: 4,
+            tabstop: DEFAULT_TABSTOP as i64,
             undo_size: 32,
             cursorline: 0,
             mouse: 1,
@@ -705,6 +752,7 @@ impl CommandState {
             ConfigVariable::Relative => self.relative,
             ConfigVariable::AutoIndent => self.auto_indent,
             ConfigVariable::Indent => self.indent,
+            ConfigVariable::Tabstop => self.tabstop,
             ConfigVariable::UndoSize => self.undo_size,
             ConfigVariable::CursorLine => self.cursorline,
             ConfigVariable::Mouse => self.mouse,
@@ -746,11 +794,18 @@ impl CommandState {
     pub fn apply(&mut self, action: Action) -> Result<Option<ExternalEffect>, CommandError> {
         match action {
             Action::SetVar { variable, value } => {
+                if !variable.accepts(value) {
+                    return Err(CommandError::InvalidValue {
+                        name: variable.name(),
+                        value,
+                    });
+                }
                 match variable {
                     ConfigVariable::Syntax => self.syntax = value,
                     ConfigVariable::Relative => self.relative = value,
                     ConfigVariable::AutoIndent => self.auto_indent = value,
                     ConfigVariable::Indent => self.indent = value,
+                    ConfigVariable::Tabstop => self.tabstop = value,
                     ConfigVariable::UndoSize => self.undo_size = value,
                     ConfigVariable::CursorLine => self.cursorline = value,
                     ConfigVariable::Mouse => self.mouse = value,
@@ -972,6 +1027,41 @@ mod tests {
         );
         assert_eq!(decode_special_key(b"<C-Q>").unwrap(), 17);
         assert_eq!(decode_special_key(b"<left>").unwrap(), key::LEFT);
+    }
+
+    #[test]
+    fn tabstop_is_its_own_option_and_refuses_unusable_widths() {
+        // `ts` no longer reaches `indent`: the two widths are independent,
+        // as vim's `tabstop` and `shiftwidth` are.
+        assert_eq!(ConfigVariable::parse(b"ts"), Some(ConfigVariable::Tabstop));
+        assert_eq!(
+            ConfigVariable::parse(b"tabstop"),
+            Some(ConfigVariable::Tabstop)
+        );
+        assert_eq!(ConfigVariable::parse(b"sw"), Some(ConfigVariable::Indent));
+        assert_eq!(lex(b"tabstop").unwrap()[0].kind, TokenKind::Config);
+
+        let mut state = CommandState::default();
+        assert_eq!(state.tabstop, 4);
+        state.apply(action(b"set-var tabstop 8").unwrap()).unwrap();
+        assert_eq!(state.tabstop, 8);
+        assert_eq!(state.indent, 4);
+        for value in [0, 33, -1] {
+            let error = state
+                .apply(Action::SetVar {
+                    variable: ConfigVariable::Tabstop,
+                    value,
+                })
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("Invalid value for tabstop: {value}")
+            );
+        }
+        assert_eq!(state.tabstop, 8);
+        state.apply(action(b"set-var tabstop 32").unwrap()).unwrap();
+        state.apply(action(b"set-var tabstop 1").unwrap()).unwrap();
+        assert_eq!(state.tabstop, 1);
     }
 
     #[test]

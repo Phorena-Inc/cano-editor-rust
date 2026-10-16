@@ -9,6 +9,7 @@ pub mod cli;
 pub mod command;
 pub mod comment;
 pub mod config;
+pub mod display;
 pub mod editor;
 pub mod explorer;
 pub mod history;

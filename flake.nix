@@ -20,7 +20,7 @@
       packages.${system} = rec {
         cano = pkgs.rustPlatform.buildRustPackage {
           pname = "cano";
-          version = "0.1.0";
+          version = "0.26.1016";
           src = source;
           cargoLock.lockFile = source + "/Cargo.lock";
           CANO_HELP_DIR = "${placeholder "out"}/share/cano/help";

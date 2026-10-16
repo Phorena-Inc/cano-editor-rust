@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::io::{self, Stdout, stdout};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::cursor::{SetCursorStyle, Show};
@@ -171,9 +172,65 @@ fn install_panic_hook() {
     });
 }
 
+/// The number of the SIGTERM or SIGHUP that asked this process to end, or 0.
+///
+/// The handler does nothing but store here: an atomic store is one of the few
+/// things that is safe inside a signal handler, whereas giving the terminal
+/// back means taking stdout's lock and allocating, either of which could
+/// deadlock against the code the signal interrupted.  The main loop wakes at
+/// least every [`SIZE_CHECK_INTERVAL`] and acts on it from there.
+static TERMINATION: AtomicI32 = AtomicI32::new(0);
+
+/// The signal that asked the editor to end, once one has arrived.
+///
+/// Raw mode is entered by this process and only this process can leave it,
+/// so a `kill` or a closed terminal window used to leave the user's shell
+/// unusable.  The caller is expected to drop the session -- which releases
+/// the terminal -- and exit with `128 + signal`.
+pub fn termination_signal() -> Option<i32> {
+    match TERMINATION.load(Ordering::Relaxed) {
+        0 => None,
+        signal => Some(signal),
+    }
+}
+
+#[cfg(unix)]
+extern "C" fn record_termination(signal: libc::c_int) {
+    TERMINATION.store(signal, Ordering::Relaxed);
+}
+
+/// Routes SIGTERM and SIGHUP to [`record_termination`] instead of their
+/// default action, which kills the process with the terminal still raw.
+///
+/// `SA_RESTART` keeps the interrupted system calls elsewhere in the program
+/// from failing with `EINTR`; the input poll is bounded by a timeout either
+/// way, so the flag is seen within one interval regardless.
+#[cfg(unix)]
+fn install_signal_handlers() {
+    static HANDLERS: std::sync::Once = std::sync::Once::new();
+    HANDLERS.call_once(|| {
+        for signal in [libc::SIGTERM, libc::SIGHUP] {
+            // Safety: the action is fully initialised before it is passed,
+            // and the handler it installs only performs an atomic store.
+            unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = record_termination as extern "C" fn(libc::c_int) as usize;
+                action.sa_flags = libc::SA_RESTART;
+                libc::sigemptyset(&mut action.sa_mask);
+                libc::sigaction(signal, &action, std::ptr::null_mut());
+            }
+        }
+    });
+}
+
+/// Windows has no SIGTERM or SIGHUP to catch.
+#[cfg(not(unix))]
+fn install_signal_handlers() {}
+
 impl TerminalSession {
     pub fn start() -> io::Result<Self> {
         install_panic_hook();
+        install_signal_handlers();
         enter_terminal()?;
 
         let terminal = match Terminal::new(CrosstermBackend::new(stdout())) {
@@ -265,6 +322,14 @@ impl TerminalSession {
     }
 
     fn poll_input(&mut self, timeout: Duration) -> io::Result<Option<Input>> {
+        // A termination request ends the wait for a key, which would
+        // otherwise go on for as long as nobody types.
+        if termination_signal().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "terminated by a signal",
+            ));
+        }
         // The rest of a multi-byte key comes out before anything new is read,
         // so its bytes stay adjacent -- an `:imap` run or an insertion must
         // not have another key land in the middle of one character.
@@ -369,6 +434,22 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_is_recorded_rather_than_killing_the_process() {
+        // Nothing else in this test binary reads the flag, so raising the
+        // signal here cannot disturb the tests running beside this one --
+        // and if the handler were not installed, the default action would
+        // take the whole binary down, which fails loudly too.
+        assert_eq!(termination_signal(), None);
+        install_signal_handlers();
+        // Safety: `raise` takes a signal number and touches nothing else.
+        unsafe {
+            libc::raise(libc::SIGTERM);
+        }
+        assert_eq!(termination_signal(), Some(libc::SIGTERM));
+    }
 
     #[test]
     fn translates_ascii_control_and_navigation_input() {

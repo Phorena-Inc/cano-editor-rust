@@ -372,6 +372,11 @@ pub struct Assistant {
     started: Option<Instant>,
     /// Tools the user said to allow for the rest of the session.
     always: Vec<String>,
+    /// Where the conversation is kept between runs, when there is somewhere
+    /// to keep it.
+    pub history_path: Option<PathBuf>,
+    /// The conversation changed since it was last written.
+    dirty: bool,
 }
 
 impl Assistant {
@@ -394,6 +399,8 @@ impl Assistant {
             rounds: 0,
             started: None,
             always: Vec::new(),
+            history_path: None,
+            dirty: false,
         }
     }
 
@@ -457,6 +464,7 @@ impl Assistant {
     }
 
     fn push(&mut self, role: Role, text: impl Into<String>) {
+        self.dirty = true;
         let text = text.into();
         let text = text.trim_end();
         if text.is_empty() {
@@ -479,6 +487,84 @@ impl Assistant {
         self.messages.clear();
         self.transcript.clear();
         self.scroll = 0;
+        // Clearing is the one way a chat is forgotten, so the saved copy
+        // goes with it.
+        self.dirty = false;
+        if let Some(path) = &self.history_path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// Picks the conversation up where the last run left it.
+    ///
+    /// The transcript always comes back.  The API history only comes back
+    /// for the same provider and model: each provider's messages are in its
+    /// own format, and a model is only shown its own thinking blocks.  A
+    /// file that cannot be read is left alone rather than treated as empty,
+    /// so a damaged chat is not overwritten before anyone looks at it.
+    pub fn restore(&mut self, path: PathBuf) {
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && let Ok(saved) = serde_json::from_str::<Value>(&text)
+        {
+            for entry in saved["transcript"].as_array().into_iter().flatten() {
+                let role = match entry["role"].as_str() {
+                    Some("user") => Role::User,
+                    Some("assistant") => Role::Assistant,
+                    Some("tool") => Role::Tool,
+                    Some("error") => Role::Error,
+                    _ => Role::Info,
+                };
+                if let Some(text) = entry["text"].as_str() {
+                    self.transcript.push(Entry {
+                        role,
+                        text: text.to_owned(),
+                    });
+                }
+            }
+            let same = self.backend.as_ref().is_some_and(|backend| {
+                saved["provider"] == provider_name(backend.provider)
+                    && saved["model"] == backend.model.as_str()
+            });
+            if same {
+                self.messages = saved["messages"].as_array().cloned().unwrap_or_default();
+            } else if !self.transcript.is_empty() {
+                self.push(
+                    Role::Info,
+                    "(The model changed since this chat, so it starts without the earlier \
+                     context. Ctrl-L clears.)",
+                );
+            }
+        }
+        self.history_path = Some(path);
+    }
+
+    /// Writes the conversation out once it has settled.
+    ///
+    /// Mid-round the history holds tool calls that are not answered yet,
+    /// which the API would refuse to continue from, so nothing is written
+    /// until the round is over.  The file is private to the user: a chat
+    /// carries whatever the files and commands it touched printed.
+    pub fn persist(&mut self) {
+        if !self.dirty || !matches!(self.phase, Phase::Idle) || !self.queue.is_empty() {
+            return;
+        }
+        let (Some(path), Some(backend)) = (&self.history_path, &self.backend) else {
+            return;
+        };
+        let saved = json!({
+            "version": 1,
+            "provider": provider_name(backend.provider),
+            "model": backend.model,
+            "transcript": self
+                .transcript
+                .iter()
+                .map(|entry| json!({"role": role_name(entry.role), "text": entry.text}))
+                .collect::<Vec<_>>(),
+            "messages": self.messages,
+        });
+        if write_private(path, saved.to_string().as_bytes()).is_ok() {
+            self.dirty = false;
+        }
     }
 
     /// Abandons whatever is in flight, leaving a conversation the API will
@@ -541,6 +627,43 @@ impl Assistant {
         self.started.get_or_insert_with(Instant::now);
         self.phase = Phase::Requesting { slot };
     }
+}
+
+fn provider_name(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Anthropic => "anthropic",
+        Provider::OpenAi => "openai",
+    }
+}
+
+fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+        Role::Error => "error",
+        Role::Info => "info",
+    }
+}
+
+/// Replaces `path` with `bytes` in one step, readable only by the owner.
+///
+/// The bytes go to a sibling first and are renamed over the old file, so a
+/// crash mid-write leaves the previous chat rather than half of a new one.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let temporary = path.with_extension("json.tmp");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&temporary, path)
 }
 
 fn cancelled(id: &str) -> ToolResult {
@@ -1060,6 +1183,17 @@ impl App {
         if text.is_empty() {
             return Vec::new();
         }
+        // `/clear` is Ctrl-L typed out, for anyone who reaches for the chat
+        // command every other assistant has.  It is answered here and never
+        // sent: it goes through the same `clear` as the key, so it stops
+        // whatever is in flight and forgets the saved chat just the same --
+        // which is also why it is honoured while the assistant is busy.
+        if text == "/clear" {
+            assistant.input.clear();
+            assistant.input_cursor = 0;
+            assistant.clear();
+            return Vec::new();
+        }
         if assistant.busy() {
             self.set_message("The assistant is still working; Esc stops it");
             return Vec::new();
@@ -1136,6 +1270,7 @@ impl App {
         let Some(backend) = assistant.backend.clone() else {
             return Vec::new();
         };
+        assistant.dirty = true;
         let turn = backend.parse(response);
         for text in &turn.text {
             assistant.push(Role::Assistant, text.clone());
@@ -1585,6 +1720,102 @@ mod tests {
         app.handle(mouse(MouseKind::Drag, 40, 16));
         assert_eq!(app.assistant.scroll, 0);
         assert!(!app.assistant.resizing);
+    }
+
+    #[test]
+    fn the_chat_survives_a_restart_until_it_is_cleared() {
+        let fixture = crate::test_support::Fixture::new("ai-history");
+        let path = fixture.root.join("ai-history.json");
+
+        let mut app = app_with_assistant(b"");
+        app.assistant.restore(path.clone());
+        app.handle(Input::Control(11));
+        type_text(&mut app, "hello");
+        app.handle(Input::Enter);
+        // Nothing is written while the request is still out.
+        app.assistant.persist();
+        assert!(!path.exists());
+        reply(
+            &mut app,
+            json!([{"type": "text", "text": "Hi there."}]),
+            "end_turn",
+        );
+        app.assistant.persist();
+        assert!(path.exists());
+
+        let mut next = app_with_assistant(b"");
+        next.assistant.restore(path.clone());
+        assert_eq!(next.assistant.transcript.last().unwrap().text, "Hi there.");
+        assert_eq!(
+            next.assistant.messages.len(),
+            2,
+            "the model keeps its context"
+        );
+
+        // Another model gets the transcript to read but not the context.
+        let mut other = App::new(Vec::new(), PathBuf::from("file.txt"));
+        other.assistant.backend = Backend::detect(env(&[("OPENAI_API_KEY", "k")]));
+        other.assistant.restore(path.clone());
+        assert!(other.assistant.messages.is_empty());
+        assert!(
+            other
+                .assistant
+                .transcript
+                .iter()
+                .any(|e| e.text == "Hi there.")
+        );
+
+        next.handle(Input::Control(11));
+        next.handle(Input::Control(12));
+        assert!(!path.exists(), "Ctrl-L forgets the saved chat too");
+        assert!(next.assistant.transcript.is_empty());
+    }
+
+    #[test]
+    fn typing_slash_clear_starts_a_new_chat_without_sending_anything() {
+        let fixture = crate::test_support::Fixture::new("ai-clear");
+        let path = fixture.root.join("ai-history.json");
+
+        let mut app = app_with_assistant(b"");
+        app.assistant.restore(path.clone());
+        app.handle(Input::Control(11));
+        type_text(&mut app, "hello");
+        app.handle(Input::Enter);
+        reply(
+            &mut app,
+            json!([{"type": "text", "text": "Hi there."}]),
+            "end_turn",
+        );
+        app.assistant.persist();
+        assert!(path.exists());
+
+        // Surrounding blanks are trimmed the way any prompt's are.
+        type_text(&mut app, "  /clear ");
+        app.handle(Input::Enter);
+        assert!(!app.assistant.busy(), "nothing went to the API");
+        assert!(app.assistant.transcript.is_empty());
+        assert!(app.assistant.messages.is_empty());
+        assert!(app.assistant.input.is_empty());
+        assert_eq!(app.assistant.input_cursor, 0);
+        app.assistant.persist();
+        assert!(
+            !path.exists(),
+            "/clear forgets the saved chat as Ctrl-L does"
+        );
+
+        // It also stops a request in flight, as Ctrl-L would.
+        type_text(&mut app, "again");
+        app.handle(Input::Enter);
+        assert!(app.assistant.busy());
+        type_text(&mut app, "/clear");
+        app.handle(Input::Enter);
+        assert!(!app.assistant.busy());
+        assert!(app.assistant.messages.is_empty());
+
+        // Only the whole prompt counts: a question that mentions it is sent.
+        type_text(&mut app, "what does /clear do?");
+        app.handle(Input::Enter);
+        assert!(app.assistant.busy());
     }
 
     #[test]

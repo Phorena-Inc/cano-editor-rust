@@ -1,9 +1,12 @@
 //! Ratatui rendering for Cano's byte-oriented editor state.
 //!
 //! The renderer deliberately keeps display coordinates separate from buffer
-//! indexes. A byte always occupies one display cell except for a tab, which
-//! occupies four, while selections and syntax spans continue to use byte
-//! offsets.
+//! indexes.  Bytes are laid out by [`crate::display`]: a valid UTF-8
+//! character occupies its display width (two cells for a wide one, its marks
+//! drawn in the cell of the letter they decorate), a tab occupies `tabstop`
+//! cells, and a byte that is not part of a valid character is one U+FFFD
+//! cell.  Selections, matches and syntax spans continue to use byte offsets;
+//! a cell takes its style from the bytes it was drawn from.
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer as TuiBuffer;
@@ -13,6 +16,7 @@ use ratatui::widgets::Clear;
 
 use crate::assistant::{Assistant, Role};
 use crate::buffer::Highlight;
+use crate::display::{self, Cell};
 use crate::editor::{Editor, Mode};
 use crate::explorer::{Entry, Explorer};
 use crate::jump::Target;
@@ -23,9 +27,6 @@ use crate::syntax::{Rgb, SyntaxConfig, SyntaxKind, tokens};
 
 const LINE_NUMBER_WIDTH: u16 = 5;
 const STATUS_ROWS: u16 = 2;
-/// Columns a tab occupies.  Autoformat shares it: converting between tabs
-/// and spaces has to agree with what a tab actually looks like.
-pub const TAB_WIDTH: usize = 4;
 
 /// Markdown display palette.  One color per heading level, then the shared
 /// colors for the remaining constructs.  These stay mid-toned rather than
@@ -138,22 +139,24 @@ impl Viewport {
         let index = self.row.checked_add(screen_row)?;
         let line = *editor.buffer.rows.get(index)?;
 
-        // Columns are display columns: a tab is four wide, so the byte under
-        // one has to be found by walking the row rather than by arithmetic.
+        // Columns are display columns: a tab is `tabstop` wide and a wide
+        // character two, so the byte under one has to be found by walking
+        // the row rather than by arithmetic.  Either half of a wide
+        // character is that character, and past the end of the line the
+        // cursor belongs at its end, which is where the newline sits.
         let wanted = self
             .column
             .saturating_add(usize::from(column.saturating_sub(self.content_x)));
-        let mut display = 0usize;
-        for byte in line.start..line.end {
-            let width = display_width(editor.buffer.data[byte]);
-            if wanted < display.saturating_add(width) {
-                return Some(byte);
-            }
-            display = display.saturating_add(width);
-        }
-        // Past the end of the line, the cursor belongs at its end, which is
-        // where the newline sits.
-        Some(line.end)
+        let byte = display::byte_at_column(
+            &editor.buffer.data,
+            line.start,
+            line.end,
+            wanted,
+            editor.tabstop,
+        );
+        // Post: a click never puts the cursor inside a character.
+        debug_assert!(display::is_char_boundary(&editor.buffer.data, byte));
+        Some(byte)
     }
 
     /// The index in a full-pane list under a screen position.
@@ -415,11 +418,15 @@ fn draw_editor(
     let cursor_row = editor.buffer.cursor_row().unwrap_or(0);
     let cursor_column = cursor_display_column(editor);
     scroll.row = Viewport::follow(scroll.row, cursor_row, usize::from(layout.editor_height));
+    // A wide character under the cursor is brought fully into view, its
+    // second half first so the first half wins when only one fits.
+    let content_width = usize::from(layout.content_width);
     scroll.column = Viewport::follow(
         scroll.column,
-        cursor_column,
-        usize::from(layout.content_width),
+        cursor_column.saturating_add(cursor_glyph_width(editor).saturating_sub(1)),
+        content_width,
     );
+    scroll.column = Viewport::follow(scroll.column, cursor_column, content_width);
     let first_row = scroll.row;
     let first_column = scroll.column;
     let overlays = Overlays {
@@ -492,15 +499,14 @@ fn cursor_display_column(editor: &Editor) -> usize {
     })
 }
 
-fn display_width(byte: u8) -> usize {
-    if byte == b'\t' { TAB_WIDTH } else { 1 }
-}
-
-/// The columns `bytes` take on screen, counting a tab as its full width.
-pub fn display_columns(bytes: &[u8]) -> usize {
-    bytes.iter().fold(0usize, |column, byte| {
-        column.saturating_add(display_width(*byte))
-    })
+/// The columns the character under the cursor needs to be seen whole: two
+/// for a wide one, otherwise one.  A tab only needs its first column, which
+/// is where the cursor is drawn on it.
+fn cursor_glyph_width(editor: &Editor) -> usize {
+    match display::decode(&editor.buffer.data, editor.buffer.cursor).0 {
+        Some('\t') | None => 1,
+        Some(character) => display::char_width(character).max(1),
+    }
 }
 
 /// `base + by` in screen space, saturating at the edge of a `u16`.
@@ -569,60 +575,70 @@ fn draw_buffer_row(
         return;
     }
     let row = editor.buffer.rows[row_index];
+    let data = &editor.buffer.data;
     let last_column = first_column.saturating_add(usize::from(layout.content_width));
     let mut display_column = 0usize;
     // Where this row's run of trailing whitespace begins, so `trail` can be
     // told from `space` without rescanning the row for every byte.
-    let trailing = overlays
-        .list
-        .map_or(row.end, |_| trailing_start(&editor.buffer.data, row));
+    let trailing = overlays.list.map_or(row.end, |_| trailing_start(data, row));
 
-    for byte_index in row.start..row.end {
-        let byte = editor.buffer.data[byte_index];
-        let width = display_width(byte);
-        for tab_column in 0..width {
-            let column = display_column.saturating_add(tab_column);
+    for cell in display::cells(data, row.start, row.end, editor.tabstop) {
+        if cell.column >= last_column {
+            return;
+        }
+        display_column = cell.column.saturating_add(cell.width);
+        if display_column <= first_column {
+            continue;
+        }
+        // A cell takes its style from the bytes it was drawn from: its first
+        // byte for the highlighters, any of them for a match or the
+        // selection, so a character is never half highlighted.
+        let mut style = overlays.styles.style(cell.start);
+        if overlays
+            .highlighted
+            .iter()
+            .any(|(start, end)| *start < cell.end && cell.start < *end)
+        {
+            style = style.bg(HIGHLIGHT_BACKGROUND);
+        }
+        if (cell.start..cell.end).any(|byte| is_selected(editor, row_index, byte)) {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        let glyph = Glyph::of(data, cell);
+        // A wide character cut by either edge of the text area cannot be
+        // drawn in half, so the half that is on screen is left blank.
+        let clipped = glyph.wide && (cell.column < first_column || display_column > last_column);
+        for offset in 0..cell.width {
+            let column = cell.column.saturating_add(offset);
             if column >= last_column {
-                return;
+                break;
             }
             if column < first_column {
                 continue;
             }
             let x = shifted(layout.content_x, column - first_column);
-            let listed = overlays.list.and_then(|chars| {
-                list_glyph(
-                    chars,
-                    &editor.buffer.data,
-                    byte_index,
-                    byte,
-                    tab_column,
-                    trailing,
-                )
-            });
-            let symbol = match listed {
-                Some(glyph) => glyph,
-                None if byte == b'\t' => ' ',
-                None => display_char(char::from(byte)),
+            let Some(target) = buffer.cell_mut((x, y)) else {
+                continue;
             };
-            let mut style = overlays.styles.style(byte_index);
-            if listed.is_some() {
-                style = style.fg(LISTCHAR_COLOR);
-            }
-            if overlays
-                .highlighted
-                .iter()
-                .any(|(start, end)| (*start..*end).contains(&byte_index))
-            {
-                style = style.bg(HIGHLIGHT_BACKGROUND);
-            }
-            if is_selected(editor, row_index, byte_index) {
-                style = style.add_modifier(Modifier::REVERSED);
-            }
-            if let Some(cell) = buffer.cell_mut((x, y)) {
-                cell.set_char(symbol).set_style(style);
+            let listed = overlays
+                .list
+                .and_then(|chars| list_glyph(chars, data, cell, offset, trailing));
+            match listed {
+                Some(mark) => {
+                    target.set_char(mark).set_style(style.fg(LISTCHAR_COLOR));
+                }
+                // The first column holds the character; the rest of a tab,
+                // the second half of a wide character and a clipped half are
+                // blank, carrying the style so a selection stays solid.
+                None if offset == 0 && !clipped => {
+                    glyph.draw(target, data, cell);
+                    target.set_style(style);
+                }
+                None => {
+                    target.set_char(' ').set_style(style);
+                }
             }
         }
-        display_column = display_column.saturating_add(width);
     }
 
     // Newlines and logical EOF have a cursor/selection position but no byte
@@ -925,41 +941,90 @@ fn trailing_start(data: &[u8], row: crate::buffer::Row) -> usize {
     at
 }
 
-/// The `list` glyph for one display cell, or `None` when the byte is drawn as
-/// itself.
+/// The `list` glyph for column `offset` of one laid-out character, or `None`
+/// when the character is drawn as itself.
 fn list_glyph(
     chars: &ListChars,
     data: &[u8],
-    index: usize,
-    byte: u8,
-    cell: usize,
+    cell: Cell,
+    offset: usize,
     trailing: usize,
 ) -> Option<char> {
-    match byte {
+    match display::decode(data, cell.start).0 {
         // A tab keeps its full width: the head goes in the first cell and the
         // fill in the rest, so nothing moves when `list` is switched on.
-        b'\t' => chars
+        Some('\t') => chars
             .tab
-            .map(|(head, fill)| if cell == 0 { head } else { fill }),
-        // UTF-8 spells a non-breaking space `C2 A0`. The marker goes on the
-        // first of the two bytes and the second is blanked, so it takes the
-        // width the bytes take without reading as two of them.
-        0xa0 if index > 0 && data.get(index - 1) == Some(&0xc2) => chars.nbsp.map(|_| ' '),
-        0xa0 => chars.nbsp,
-        0xc2 if data.get(index + 1) == Some(&0xa0) => chars.nbsp,
-        b' ' if index >= trailing => chars.trail.or(chars.space),
-        b' ' => chars.space,
+            .map(|(head, fill)| if offset == 0 { head } else { fill }),
+        // A non-breaking space is one character, `C2 A0` in UTF-8, or a lone
+        // `A0` in a Latin-1 file, which is not valid UTF-8 but means the same.
+        Some('\u{a0}') => chars.nbsp,
+        None if data[cell.start] == 0xa0 => chars.nbsp,
+        Some(' ') if cell.start >= trailing => chars.trail.or(chars.space),
+        Some(' ') => chars.space,
         _ => None,
     }
 }
 
-/// The display column of `index` within its row, counting a tab as its full
-/// width the way the text itself is drawn.
+/// What one laid-out character draws in its first cell.
+struct Glyph {
+    /// The first code point, or `None` for a byte that is not valid UTF-8.
+    first: Option<char>,
+    /// Whether it takes two cells, which a clipped edge cannot show half of.
+    wide: bool,
+}
+
+impl Glyph {
+    fn of(data: &[u8], cell: Cell) -> Self {
+        let first = display::decode(data, cell.start).0;
+        Self {
+            first,
+            wide: first.is_some_and(|c| c != '\t' && display::char_width(c) == 2),
+        }
+    }
+
+    /// Writes the character into `target`.
+    ///
+    /// Invalid bytes and control characters become U+FFFD so the terminal is
+    /// never handed a command (see [`display_char`]).  A character with
+    /// marks is written as one symbol so the terminal composes them, and a
+    /// mark with no letter to sit on is drawn on a space.
+    fn draw(&self, target: &mut ratatui::buffer::Cell, data: &[u8], cell: Cell) {
+        let Some(first) = self.first else {
+            target.set_char('\u{fffd}');
+            return;
+        };
+        if first == '\t' {
+            target.set_char(' ');
+            return;
+        }
+        let text = std::str::from_utf8(&data[cell.start..cell.end]).unwrap_or_default();
+        if text.len() == first.len_utf8() {
+            target.set_char(display_char(first));
+            return;
+        }
+        let mut symbol = String::with_capacity(text.len() + 1);
+        if display::is_mark(first) {
+            symbol.push(' ');
+        }
+        symbol.extend(text.chars().map(display_char));
+        target.set_symbol(&symbol);
+    }
+}
+
+/// The display column of the character holding `index` within its row,
+/// laid out the way the text itself is drawn.
 fn row_display_column(editor: &Editor, row_index: usize, index: usize) -> usize {
     let Some(row) = editor.buffer.rows.get(row_index) else {
         return 0;
     };
-    display_columns(&editor.buffer.data[row.start..index.clamp(row.start, row.end)])
+    display::column_of(
+        &editor.buffer.data,
+        row.start,
+        row.end,
+        index,
+        editor.tabstop,
+    )
 }
 
 /// The geometry of a scrollbar track.
@@ -1092,7 +1157,10 @@ fn draw_status(
         style,
     );
 
-    let column = editor.buffer.cursor_column().unwrap_or(0).saturating_add(1);
+    // The column is the 1-based display column, as vim's ruler shows its
+    // virtual column: what the eye counts, not how many bytes UTF-8 or a tab
+    // happens to take.
+    let column = cursor_display_column(editor).saturating_add(1);
     let row = editor.buffer.cursor_row().unwrap_or(0).saturating_add(1);
     let state = if options.saved { "Saved" } else { "Modified" };
     // Markdown display is not a mode of its own, so it is reported next to
@@ -1468,7 +1536,9 @@ mod tests {
         assert!(line(backend.buffer(), 1).starts_with("   1 second"));
         assert_eq!(backend.buffer().cell((3, 0)).unwrap().fg, Color::Reset);
         assert_eq!(backend.buffer().cell((3, 1)).unwrap().fg, Color::Reset);
-        assert!(line(backend.buffer(), 4).starts_with("COMMAND file.txt (3,1) Saved"));
+        // The status column is the display column: `b` is the third byte but
+        // sits in the sixth column, past the four-column tab.
+        assert!(line(backend.buffer(), 4).starts_with("COMMAND file.txt (6,1) Saved"));
         assert!(line(backend.buffer(), 5).starts_with(":write"));
         assert_eq!(backend.cursor_position(), Position::new(3, 5));
     }
@@ -1773,9 +1843,9 @@ mod tests {
         let buffer = terminal.backend().buffer();
         // A tab keeps its four columns: the head, then the fill.
         assert!(line(buffer, 0).starts_with("   1 a\u{25b8}---b\u{b7}c\u{b7}\u{b7}\u{21b2}"));
-        // The non-breaking space is two bytes, so the marker takes the first
-        // cell and the second is blank rather than a second marker.
-        assert!(line(buffer, 1).starts_with("   2 x\u{23b5} y"));
+        // The non-breaking space is two bytes but one character, so it takes
+        // one cell, and that cell is the marker.
+        assert!(line(buffer, 1).starts_with("   2 x\u{23b5}y"));
         // The final row has no line ending, so it gets no `eol`.
         assert!(!line(buffer, 1).contains('\u{21b2}'));
         // Glyphs are drawn subdued, and the text between them is not.
@@ -1941,6 +2011,146 @@ mod tests {
         assert!(line(buffer, 1).starts_with("     /tmp/two.txt"));
         assert_eq!(buffer.cell((5, 0)).unwrap().fg, Color::Cyan);
         assert_eq!(terminal.backend().cursor_position(), Position::new(5, 1));
+    }
+
+    /// Draws `editor` on a `width` by `height` terminal with the default
+    /// options, returning the terminal so its cells and cursor can be read.
+    fn drawn(editor: &Editor, width: u16, height: u16) -> Terminal<TestBackend> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, editor, options(), &mut Viewport::default()))
+            .unwrap();
+        terminal
+    }
+
+    #[test]
+    fn tabstop_sets_how_wide_a_tab_is_drawn_and_where_the_cursor_goes() {
+        let mut editor = Editor::new(b"a\tb".to_vec());
+        editor.tabstop = 8;
+        editor.buffer.cursor = 2;
+        let terminal = drawn(&editor, 32, 4);
+        let buffer = terminal.backend().buffer();
+        assert!(line(buffer, 0).starts_with("   1 a        b"));
+        // `b` is in column 9 of the text, which starts at screen column 5.
+        assert_eq!(terminal.backend().cursor_position(), Position::new(14, 0));
+        assert!(line(buffer, 2).starts_with("NORMAL file.txt (10,1)"));
+
+        // A click anywhere on the eight columns of the tab is the tab.
+        let viewport = Viewport {
+            rows: 1,
+            content_x: 5,
+            content_width: 20,
+            ..Viewport::default()
+        };
+        assert_eq!(viewport.byte_at(&editor, 6, 0), Some(1));
+        assert_eq!(viewport.byte_at(&editor, 13, 0), Some(1));
+        assert_eq!(viewport.byte_at(&editor, 14, 0), Some(2));
+
+        // `list` fills the whole width too.
+        let chars = crate::listchars::parse(b"tab:>-").unwrap();
+        let mut listed = options();
+        listed.list = Some(&chars);
+        let mut terminal = Terminal::new(TestBackend::new(32, 4)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &editor, listed, &mut Viewport::default()))
+            .unwrap();
+        assert!(line(terminal.backend().buffer(), 0).starts_with("   1 a>-------b"));
+    }
+
+    #[test]
+    fn utf8_text_is_drawn_as_characters_at_their_display_width() {
+        // The last row ends in a lone 0xff, which is not UTF-8 at all.
+        let mut text = "héllo\n日本x\ne\u{301}".as_bytes().to_vec();
+        text.extend_from_slice(b"\xff!");
+        let mut editor = Editor::new(text);
+        // On the `x`, after two wide characters: byte 13, display column 4.
+        editor.buffer.cursor = 13;
+        let terminal = drawn(&editor, 24, 6);
+        let buffer = terminal.backend().buffer();
+        assert!(line(buffer, 0).starts_with("   1 héllo "));
+        // Each wide character is one cell holding it and one blank cell it
+        // spills into, which ratatui skips when it writes to the terminal.
+        assert!(line(buffer, 1).starts_with("   2 日 本 x "));
+        assert_eq!(buffer.cell((5, 1)).unwrap().symbol(), "日");
+        assert_eq!(buffer.cell((7, 1)).unwrap().symbol(), "本");
+        // A combining mark shares the cell of the letter it decorates, and a
+        // byte that is not UTF-8 is one replacement character.
+        assert_eq!(buffer.cell((5, 2)).unwrap().symbol(), "e\u{301}");
+        assert_eq!(buffer.cell((6, 2)).unwrap().symbol(), "\u{fffd}");
+        assert_eq!(buffer.cell((7, 2)).unwrap().symbol(), "!");
+        assert_eq!(terminal.backend().cursor_position(), Position::new(9, 1));
+        assert!(line(buffer, 4).starts_with("NORMAL file.txt (5,2)"));
+    }
+
+    #[test]
+    fn a_selection_covers_every_cell_of_a_wide_character() {
+        let mut editor = Editor::new("a日b".as_bytes().to_vec());
+        editor.mode = Mode::Visual;
+        editor.visual = VisualSelection {
+            start: 1,
+            end: 1,
+            anchor: 1,
+            kind: VisualKind::Charwise,
+        };
+        editor.buffer.cursor = 1;
+        let terminal = drawn(&editor, 16, 4);
+        let buffer = terminal.backend().buffer();
+        let reversed = |x: u16| {
+            buffer
+                .cell((x, 0))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED)
+        };
+        // The terminal paints a wide character's second cell with its first
+        // one's style -- ratatui does not even send it -- so the selected
+        // character is the cell holding it, and nothing either side is.
+        assert!(!reversed(5));
+        assert_eq!(buffer.cell((6, 0)).unwrap().symbol(), "日");
+        assert!(reversed(6));
+        assert!(!reversed(8));
+    }
+
+    #[test]
+    fn a_wide_character_cut_by_the_right_edge_is_blank_not_half_drawn() {
+        // Four columns of text: `abc` and the first half of `日`.
+        let editor = Editor::new("abc日".as_bytes().to_vec());
+        let terminal = drawn(&editor, 10, 4);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.cell((7, 0)).unwrap().symbol(), "c");
+        assert_eq!(buffer.cell((8, 0)).unwrap().symbol(), " ");
+        // The scrollbar column is untouched by it.
+        assert_ne!(buffer.cell((9, 0)).unwrap().symbol(), "日");
+
+        // With the cursor on it, the view scrolls until it fits whole.
+        let mut on_it = editor.clone();
+        on_it.buffer.cursor = 3;
+        let mut scroll = Viewport::default();
+        let mut terminal = Terminal::new(TestBackend::new(10, 4)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &on_it, options(), &mut scroll))
+            .unwrap();
+        assert_eq!(scroll.column, 1);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.cell((7, 0)).unwrap().symbol(), "日");
+        assert_eq!(terminal.backend().cursor_position(), Position::new(7, 0));
+    }
+
+    #[test]
+    fn a_click_on_either_half_of_a_wide_character_lands_on_its_start() {
+        let editor = Editor::new("a日b\nxyz".as_bytes().to_vec());
+        let viewport = Viewport {
+            rows: 2,
+            content_x: 5,
+            content_width: 20,
+            ..Viewport::default()
+        };
+        let byte = |column| viewport.byte_at(&editor, column, 0);
+        assert_eq!(byte(5), Some(0));
+        assert_eq!(byte(6), Some(1));
+        assert_eq!(byte(7), Some(1));
+        assert_eq!(byte(8), Some(4));
+        assert_eq!(byte(9), Some(5));
     }
 
     #[test]

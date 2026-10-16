@@ -8,8 +8,8 @@
 //! and are found where anyone would look.
 
 use std::ffi::{OsStr, OsString};
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,10 +27,16 @@ const STAMP_LEN: usize = 15;
 /// Returns where the copy went, or `None` when there was nothing to copy
 /// because the file does not exist yet. A new file has no previous contents,
 /// and refusing to save one for want of a backup would be absurd.
+///
+/// The copy gets the original's permissions.  A backup of a private file
+/// that anyone could read would leak exactly what the original protected,
+/// and a backup of a script that has lost its executable bit is not the
+/// script back.
 pub fn write(path: &Path) -> io::Result<Option<PathBuf>> {
     let Ok(contents) = fs::read(path) else {
         return Ok(None);
     };
+    let permissions = fs::metadata(path)?.permissions();
     let Some(name) = path.file_name() else {
         return Ok(None);
     };
@@ -41,9 +47,29 @@ pub fn write(path: &Path) -> io::Result<Option<PathBuf>> {
     fs::create_dir_all(&directory)?;
 
     let destination = destination(&directory, name, &stamp(SystemTime::now()));
-    fs::write(&destination, contents)?;
+    copy_private(&destination, &contents)?;
+    // Widened to the original's only once the contents are in, so the copy
+    // is never more readable than its source, even for a moment.  If that
+    // fails it stays private, which errs the safe way.
+    let _ = fs::set_permissions(&destination, permissions);
     prune(&directory, name);
     Ok(Some(destination))
+}
+
+/// Writes `contents` to a new file only its owner can read (on unix).
+///
+/// `create_new` also means a symlink planted under the backup's name is never
+/// followed.  `destination` only ever hands out a name that was free, so the
+/// sole way this refuses is a race with something else writing there.
+fn copy_private(destination: &Path, contents: &[u8]) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(destination)?.write_all(contents)
 }
 
 /// The first free backup name for `name` at `stamp`.
@@ -218,6 +244,48 @@ mod tests {
         fs::write(&file, b"after").unwrap();
         assert_eq!(fs::read(&backup).unwrap(), b"before");
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_backup_keeps_the_originals_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = fixture("mode");
+        for mode in [0o600, 0o755, 0o640, 0o444] {
+            let file = root.join(format!("doc-{mode:o}"));
+            fs::write(&file, b"before").unwrap();
+            fs::set_permissions(&file, fs::Permissions::from_mode(mode)).unwrap();
+
+            let backup = write(&file).unwrap().expect("a backup");
+            let copied = fs::metadata(&backup).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(copied, mode, "backup of a {mode:o} file");
+            assert_eq!(fs::read(&backup).unwrap(), b"before");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_backup_of_a_read_only_file_is_read_only_too() {
+        let root = fixture("readonly");
+        let file = root.join("doc.txt");
+        fs::write(&file, b"before").unwrap();
+        let mut permissions = fs::metadata(&file).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&file, permissions).unwrap();
+
+        let backup = write(&file).unwrap().expect("a backup");
+        assert!(fs::metadata(&backup).unwrap().permissions().readonly());
+        assert_eq!(fs::read(&backup).unwrap(), b"before");
+
+        // Put write access back so the fixture can be removed everywhere.
+        for path in [&file, &backup] {
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            fs::set_permissions(path, permissions).unwrap();
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

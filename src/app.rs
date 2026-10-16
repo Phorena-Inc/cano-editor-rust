@@ -24,10 +24,11 @@ use crate::autoformat::{self, Steps};
 use crate::buffer::Highlight;
 use crate::command::{Action, CommandState, ConfigVariable, ExternalEffect, key, lex, parse};
 use crate::comment;
+use crate::display::{self, DEFAULT_TABSTOP};
 use crate::editor::{Editor, InsertEntry, Leader, Mode, MoveDirection, VisualKind};
 use crate::explorer::{Explorer, Selection};
 use crate::history::UndoRecord;
-use crate::io::load_buffer;
+use crate::io::{HelpError, help_search_directories, load_buffer, load_help};
 use crate::jump::{Kind, Target, targets};
 use crate::listchars;
 use crate::recent::{Recent, bytes_to_path};
@@ -192,6 +193,12 @@ pub struct App {
     /// counts as visible rather than none of it.
     unrendered: bool,
     pub pending_replace: bool,
+    /// How many characters the pending `r` replaces: `3rx` writes three.
+    replace_count: usize,
+    /// The bytes of a multi-byte replacement character typed so far.  A key
+    /// outside ASCII arrives as the bytes that spell it, one input each, so
+    /// `r` has to wait for the whole character before it can write it.
+    replace_bytes: Vec<u8>,
     /// Keys of the change being typed, and the completed one `.` replays.
     ///
     /// Inputs are kept rather than bytes because the arrows and the other keys
@@ -199,8 +206,9 @@ pub struct App {
     /// `set-map` expansion path cannot carry them.
     change_keys: Vec<Input>,
     last_change: Vec<Input>,
-    /// Height of the undo stack when the recording started, so a command that
-    /// turned out to change nothing does not displace the last real change.
+    /// How many edits the history had seen when the recording started, so a
+    /// command that turned out to change nothing does not displace the last
+    /// real change.  The stack's height cannot tell once it is full.
     change_mark: usize,
     pub message_pending: bool,
     /// Refuses writes; used for the built-in help pages so a save-and-quit
@@ -258,6 +266,8 @@ impl App {
             viewport: Viewport::default(),
             unrendered: true,
             pending_replace: false,
+            replace_count: 1,
+            replace_bytes: Vec::new(),
             change_keys: Vec::new(),
             last_change: Vec::new(),
             change_mark: 0,
@@ -285,6 +295,12 @@ impl App {
             return self.assistant_key(input);
         }
         self.expanded = 0;
+        // `undo_size` can change under any key (`:set`, a mapping, the
+        // config), so the history is told its cap before every one.  A
+        // non-positive size is no cap at all; see `History::limit`.
+        self.editor
+            .history
+            .set_limit(usize::try_from(self.commands.undo_size).unwrap_or(0));
         self.open_change(input);
         let effects = self.handle_mapped(input, 0);
         self.close_change();
@@ -308,6 +324,10 @@ impl App {
         debug_assert!(
             self.jump.is_none() || matches!(self.editor.mode, Mode::Normal | Mode::Visual)
         );
+        // An undo group only stays open across keys while an insertion is
+        // still being typed into the step it began; one left open anywhere
+        // else would fold every later edit into the same `u`.
+        debug_assert!(self.editor.mode == Mode::Insert || !self.editor.history.grouping());
         effects
     }
 
@@ -363,7 +383,11 @@ impl App {
             if self.editor.mode != Mode::Normal || !begins_change(input) {
                 return;
             }
-            self.change_mark = self.editor.history.undo.len();
+            self.change_mark = self.editor.history.edits;
+            // A count typed in front of the change is part of it, so `3x`
+            // repeats as three bytes rather than one.
+            self.change_keys
+                .extend(self.count.iter().map(|digit| Input::Byte(*digit)));
         }
         self.change_keys.push(input);
     }
@@ -392,13 +416,16 @@ impl App {
         // nothing both leave the undo stack where they found it.  Replaying
         // either does nothing, and letting one land would throw away the
         // change `.` should still be repeating.
-        if self.editor.history.undo.len() > self.change_mark {
+        if self.editor.history.edits > self.change_mark {
             self.last_change = keys;
         }
     }
 
     /// `.`: types the last change again.
-    fn repeat_change(&mut self, depth: usize) -> Vec<AppEffect> {
+    ///
+    /// A count given to `.` replaces the one the change was made with, as in
+    /// vim: after `3x`, `.` deletes three bytes and `5.` five.
+    fn repeat_change(&mut self, count: Option<usize>, depth: usize) -> Vec<AppEffect> {
         if self.last_change.is_empty() {
             self.set_message("No previous change");
             return Vec::new();
@@ -419,7 +446,15 @@ impl App {
         // The replay runs underneath `handle`, which is where recording
         // happens, so `last_change` survives it and `.` can be pressed again.
         self.repeating = true;
-        for input in self.last_change.clone() {
+        let keys = match count {
+            Some(count) => recount(&self.last_change, count),
+            None => self.last_change.clone(),
+        };
+        // A new count sticks, so the `.` after `2.` repeats two again.
+        if count.is_some() {
+            self.last_change.clone_from(&keys);
+        }
+        for input in keys {
             effects.extend(self.handle_mapped(input, depth + 1));
         }
         self.repeating = false;
@@ -430,17 +465,29 @@ impl App {
         // Pre: every nested call checked the bound before recursing.
         debug_assert!(depth <= MAX_DEPTH);
         if self.pending_replace {
-            self.pending_replace = false;
             // Escape, arrows, and other non-character keys cancel the pending
             // replacement instead of writing raw control bytes into the file.
-            match input {
-                Input::Byte(byte) => {
-                    self.editor.replace_next(byte);
+            let byte = match input {
+                Input::Byte(byte) => Some(byte),
+                Input::Enter => Some(b'\n'),
+                _ => None,
+            };
+            if let Some(byte) = byte {
+                self.replace_bytes.push(byte);
+                // The rest of a multi-byte character is still on its way.
+                if replacement_incomplete(&self.replace_bytes) {
+                    return Vec::new();
                 }
-                Input::Enter => {
-                    self.editor.replace_next(b'\n');
+            }
+            self.pending_replace = false;
+            let count = std::mem::replace(&mut self.replace_count, 1);
+            let text = std::mem::take(&mut self.replace_bytes);
+            if byte.is_some() {
+                if self.editor.mode == Mode::Visual {
+                    self.editor.visual_replace(&text);
+                } else if !self.editor.replace_chars(&text, count) {
+                    self.set_message("Not enough characters to replace");
                 }
-                _ => {}
             }
             return Vec::new();
         }
@@ -605,32 +652,51 @@ impl App {
                 return Vec::new();
             }
             if !self.count.is_empty() {
-                let repetitions = self.take_count();
-                if byte == b'd' {
-                    self.editor.delete_rows(repetitions);
+                let count = self.take_count();
+                // The editor owns operator counts: one in front of `d`, `y`
+                // or `c` waits for the motion and multiplies its count, and
+                // one typed after an operator belongs to its motion.  `x` and
+                // `p` take theirs as one edit rather than several.
+                if self.editor.pending_operator()
+                    || matches!(byte, b'd' | b'y' | b'c' | b'x' | b'p')
+                {
+                    self.editor.normal_counted(byte, count);
                     return Vec::new();
                 }
-                // `c` arms the operator once and the count is dropped.
-                // Repeating the key the way `dispatch_repeated` does would let
-                // the second press complete `cc`, and the motion meant for the
-                // operator would then be typed into the line it opened.
-                if byte == b'c' {
-                    self.editor.normal_key(b'c');
-                    return Vec::new();
+                match byte {
+                    b'g' => self.editor.buffer.move_file_start(count),
+                    b'G' => self.editor.buffer.move_file_end(count),
+                    b'.' => return self.repeat_change(Some(count), depth),
+                    b'r' => {
+                        self.pending_replace = true;
+                        self.replace_count = count;
+                    }
+                    // `3*` is the third match, not three searches for the
+                    // word under wherever the cursor lands next.
+                    b'*' => {
+                        let found = self
+                            .editor
+                            .buffer
+                            .word_at(self.editor.buffer.cursor)
+                            .is_some();
+                        self.search_word_under_cursor();
+                        if found {
+                            for _ in 1..count {
+                                self.move_to_next_match();
+                            }
+                        }
+                    }
+                    // A jump picks its target by label, and a prompt or the
+                    // space leader starts something a count means nothing
+                    // to, so the count is dropped and the key runs as typed.
+                    b's' | b't' | b':' | b'/' | b' ' => return self.normal_input(input, depth),
+                    _ => {
+                        for _ in 0..count {
+                            self.dispatch_repeated(byte);
+                        }
+                    }
                 }
-                if byte == b'g' && self.editor.leader != Leader::Delete {
-                    self.editor.buffer.move_file_start(repetitions);
-                    self.editor.cancel_pending();
-                    return Vec::new();
-                }
-                if byte == b'G' && self.editor.leader != Leader::Delete {
-                    self.editor.buffer.move_file_end(repetitions);
-                    self.editor.cancel_pending();
-                    return Vec::new();
-                }
-                for _ in 0..repetitions {
-                    self.dispatch_repeated(byte);
-                }
+                self.editor.cancel_pending();
                 return Vec::new();
             }
         }
@@ -670,7 +736,7 @@ impl App {
             // `.` is unbound in Cano otherwise, and an operator is never
             // waiting on it, so it can be taken before the editor sees it.
             Input::Byte(b'.') if !self.editor.pending_operator() => {
-                return self.repeat_change(depth);
+                return self.repeat_change(None, depth);
             }
             // `let mapleader = " "`: space arms the leader, and `<leader>i` /
             // `<leader>o` are `*` and `:nohl`.
@@ -995,6 +1061,19 @@ impl App {
             return Vec::new();
         }
 
+        // Counts work in Visual mode the way they do in Normal mode: they
+        // multiply a motion, and `3G` goes to line three.  Anything else
+        // drops the count, so it cannot leak into the command after.
+        if let Input::Byte(byte) = input
+            && byte.is_ascii_digit()
+            && !(byte == b'0' && self.count.is_empty())
+        {
+            self.count.push(byte);
+            return Vec::new();
+        }
+        let counted = !self.count.is_empty();
+        let count = self.take_count();
+
         match input {
             Input::Escape | Input::Control(3) => {
                 self.editor.visual_key(27);
@@ -1006,8 +1085,7 @@ impl App {
                 if self.editor.visual.kind.is_blockwise() {
                     self.editor.visual_key(27);
                 } else {
-                    self.editor.visual.kind = VisualKind::Blockwise;
-                    self.editor.refresh_visual();
+                    self.editor.set_visual_kind(VisualKind::Blockwise);
                 }
             }
             // Comment toggle, on both the leader spelling and a bare chord so
@@ -1031,20 +1109,36 @@ impl App {
                     self.autoformat_region(region);
                 }
             }
+            // `r` waits for the byte to write over the selection.
+            Input::Byte(b'r') => {
+                self.pending_replace = true;
+            }
+            Input::Byte(b'g') if counted => {
+                self.editor.buffer.move_file_start(count);
+                self.editor.refresh_visual();
+            }
+            Input::Byte(b'G') if counted => {
+                self.editor.buffer.move_file_end(count);
+                self.editor.refresh_visual();
+            }
+            Input::Byte(byte @ (b'h' | b'j' | b'k' | b'l' | b'w' | b'b' | b'e' | b'$' | b'%')) => {
+                for _ in 0..count {
+                    self.editor.visual_key(byte);
+                }
+            }
             Input::Byte(byte) => {
                 self.editor.visual_key(byte);
             }
-            Input::Left => {
-                self.editor.visual_key(b'h');
-            }
-            Input::Right => {
-                self.editor.visual_key(b'l');
-            }
-            Input::Up => {
-                self.editor.visual_key(b'k');
-            }
-            Input::Down => {
-                self.editor.visual_key(b'j');
+            Input::Left | Input::Right | Input::Up | Input::Down => {
+                let key = match input {
+                    Input::Left => b'h',
+                    Input::Right => b'l',
+                    Input::Up => b'k',
+                    _ => b'j',
+                };
+                for _ in 0..count {
+                    self.editor.visual_key(key);
+                }
             }
             _ => {}
         }
@@ -1077,17 +1171,32 @@ impl App {
 
     /// Runs the `/` prompt: moves to the next match, or rewrites it when the
     /// line is spelled `s/old/new`.
+    ///
+    /// The rewrite is an edit like any other: it is one undo step, and a
+    /// read-only buffer refuses it the way it refuses `:s`.  Anything after
+    /// a third `/` is ignored; `:s` is the command that takes flags.
     fn run_search(&mut self) {
         let searched = self.prompt.clone();
         self.record_history(Mode::Search, &searched);
-        let mut destination = self.editor.buffer.search_wrapped(&self.prompt);
-        let mut needle = self.prompt.clone();
-        if let Some(replacement) = self.prompt.strip_prefix(b"s/") {
+        let mut destination = self.editor.buffer.search_wrapped(&searched);
+        let mut needle = searched.clone();
+        if let Some(replacement) = searched.strip_prefix(b"s/") {
             let mut parts = replacement.split(|byte| *byte == b'/');
             if let (Some(old), Some(new)) = (parts.next(), parts.next()) {
+                if self.readonly {
+                    self.set_message("Buffer is read-only");
+                    self.editor.mode = Mode::Normal;
+                    return;
+                }
                 destination = self.editor.buffer.search_wrapped(old);
                 needle = old.to_vec();
-                self.editor.buffer.replace_first_after_cursor(old, new);
+                if let Some(at) = self.editor.buffer.replace_first_after_cursor(old, new) {
+                    self.editor.history.push_undo(UndoRecord::replace_region(
+                        at,
+                        at + new.len(),
+                        old.to_vec(),
+                    ));
+                }
             }
         }
         if !needle.is_empty() {
@@ -1125,6 +1234,15 @@ impl App {
         if let Some(options) = self.prompt.strip_prefix(b"set ") {
             let options = options.to_vec();
             self.set_options(&options);
+            self.clear_prompt();
+            return Vec::new();
+        }
+        // `:help [page]` and `:h` replace the buffer, which the token lexer
+        // has no effect for, and a page name is a bare word it would want
+        // quoted.  The verb has to be the whole first word, so `:helpx` is
+        // still an unknown command.
+        if let Some((force, page)) = help_command(&self.prompt) {
+            self.open_help(&page, force);
             self.clear_prompt();
             return Vec::new();
         }
@@ -1177,7 +1295,7 @@ impl App {
                 Vec::new()
             }
         };
-        self.editor.indent = self.commands.indent.max(0) as usize;
+        self.sync_widths();
         self.clear_prompt();
         effects
     }
@@ -1426,7 +1544,7 @@ impl App {
         }
         // The options before the failed one were applied, so the editor's
         // copy of the indent is refreshed either way.
-        self.editor.indent = self.commands.indent.max(0) as usize;
+        self.sync_widths();
     }
 
     /// Applies one `[no]name[!][=value]` option, or reports one with `name?`.
@@ -1455,12 +1573,16 @@ impl App {
             }
             let variable = ConfigVariable::parse(name).ok_or_else(|| unknown(name))?;
             let text = std::str::from_utf8(value).map_err(|_| unknown(name))?;
-            let number = text.parse::<i64>().map_err(|_| {
+            let invalid = || {
                 format!(
                     "Invalid value for {}: {text}",
                     String::from_utf8_lossy(name)
                 )
-            })?;
+            };
+            let number = text.parse::<i64>().map_err(|_| invalid())?;
+            if !variable.accepts(number) {
+                return Err(invalid());
+            }
             self.assign(variable, number);
             return Ok(());
         }
@@ -1477,6 +1599,17 @@ impl App {
         // Report the option as it was typed: `nosuchoption` is not a request
         // to unset something called `suchoption`.
         let variable = ConfigVariable::parse(name).ok_or_else(|| unknown(option))?;
+        // `tabstop` is a width, not a switch: vim shows it for a bare
+        // `:set ts`, and turning it off or toggling it means nothing.
+        if variable == ConfigVariable::Tabstop {
+            if toggle || off {
+                return Err(format!(
+                    "Invalid value for {}",
+                    String::from_utf8_lossy(option)
+                ));
+            }
+            return self.set_option(&[name, b"?"].concat());
+        }
         let value = if toggle {
             i64::from(self.commands.variable(variable) == 0)
         } else {
@@ -1484,6 +1617,18 @@ impl App {
         };
         self.assign(variable, value);
         Ok(())
+    }
+
+    /// Copies the indent and tab widths from the option table into the
+    /// editor, which keeps its own copies because it has no access to the
+    /// table.  Every path that can change either option ends here.
+    fn sync_widths(&mut self) {
+        self.editor.indent = self.commands.indent.max(0) as usize;
+        // `tabstop` is range-checked on the way in, but a zero width would
+        // make every tab vanish, so the editor's copy is kept usable anyway.
+        self.editor.tabstop = usize::try_from(self.commands.tabstop)
+            .unwrap_or(DEFAULT_TABSTOP)
+            .max(1);
     }
 
     fn assign(&mut self, variable: ConfigVariable, value: i64) {
@@ -1564,7 +1709,7 @@ impl App {
                 }
             }
         } else {
-            autoformat::format(before, region, steps, indent)
+            autoformat::format(before, region, steps, indent, self.editor.tabstop)
         };
         let Some(after) = after else {
             self.set_message("Already formatted");
@@ -2097,12 +2242,18 @@ impl App {
     /// Moves the cursor to `row`, keeping the column it was already in.
     fn place_cursor_on_row(&mut self, row: usize) {
         let rows = self.editor.buffer.rows.len();
-        let column = self.editor.buffer.cursor_column().unwrap_or(0);
-        let bounds = self.editor.buffer.rows[row.min(rows - 1)];
+        let buffer = &self.editor.buffer;
+        let tabstop = self.editor.tabstop;
+        let here = buffer.rows[buffer.cursor_row().unwrap_or(0)];
+        // The column is the one on screen, so the cursor stays under the
+        // same spot past a tab or a wide character.
+        let column = display::column_of(&buffer.data, here.start, here.end, buffer.cursor, tabstop);
+        let bounds = buffer.rows[row.min(rows - 1)];
+        let target =
+            display::byte_at_column(&buffer.data, bounds.start, bounds.end, column, tabstop);
         // The wheel scrolls in Insert mode too, and moving the cursor there
         // is not typing.
-        self.editor
-            .place_cursor(bounds.start.saturating_add(column).min(bounds.end));
+        self.editor.place_cursor(target);
         self.editor.refresh_visual();
         // Post: the cursor landed on the row asked for, clamped to the file.
         debug_assert_eq!(self.editor.buffer.cursor_row(), Some(row.min(rows - 1)));
@@ -2333,13 +2484,64 @@ impl App {
         }
     }
 
+    /// `:help [page]`: shows a help page read-only in place of the buffer,
+    /// the same way startup `--help` does.
+    ///
+    /// There is one buffer, so the way back is Ctrl-P.  The file being left
+    /// is recorded in the recent list first so it is there to go back to --
+    /// startup records it too, but `:help` may come long after other files
+    /// pushed it down or off.  A brand-new file that was never written is
+    /// the exception: the picker only offers files that exist, and there is
+    /// nothing in a clean, never-saved buffer to go back to anyway.
+    ///
+    /// Unsaved work is refused with the same message `:q` gives, and `!`
+    /// throws it away.  The Ctrl-N/Ctrl-P save prompt is not reused: it
+    /// carries a pane to open after the write, not a page to load.
+    fn open_help(&mut self, page: &str, force: bool) {
+        let page = if page.is_empty() { "general" } else { page };
+        let directories = help_search_directories();
+        // Resolved before the unsaved guard, so a typo is reported as a typo
+        // rather than as a reason to save.
+        let (path, bytes) = match load_help(page, &directories) {
+            Ok(found) => found,
+            Err(HelpError::UnknownPage) => {
+                self.set_message(format!("No help page named {page}"));
+                return;
+            }
+            Err(HelpError::Unreadable { path, error }) => {
+                self.set_message(format!("Could not open {}: {error}", path.display()));
+                return;
+            }
+        };
+        if !force && !self.saved() {
+            self.set_message("No write since last change (add ! to override)");
+            return;
+        }
+        if !self.readonly {
+            let current = self.filename.clone();
+            self.record_recent(&current);
+        }
+        self.editor = Editor::new(bytes);
+        self.sync_widths();
+        // Help pages are plain text with no extension, so neither display
+        // layer has anything to say about them; markdown is forced off even
+        // if a page someday lands under a `.md` name on disk.
+        self.markdown = false;
+        self.filename = path;
+        self.commands.output.clear();
+        self.close_panes();
+        self.mark_saved();
+        self.readonly = true;
+        debug_assert!(self.saved(), "a freshly opened help page is clean");
+    }
+
     /// Replaces the buffer with `path`, as both the explorer and the recent
     /// picker do when a file is chosen.
     fn open_file(&mut self, path: &Path) {
         match load_buffer(path) {
             Ok(bytes) => {
                 self.editor = Editor::new(bytes);
-                self.editor.indent = self.commands.indent.max(0) as usize;
+                self.sync_widths();
                 self.markdown = is_markdown(path);
                 self.filename = path.to_path_buf();
                 self.commands.output.clear();
@@ -2373,6 +2575,42 @@ fn changed_span(before: &[u8], after: &[u8]) -> (usize, usize, usize) {
         .position(|(before, after)| before != after)
         .unwrap_or_else(|| before.len().min(after.len()) - start);
     (start, before.len() - tail, after.len() - tail)
+}
+
+/// Recognizes `help`, `h`, `help!` and `h!`, each optionally followed by a
+/// page name, returning whether `!` was given and the page (empty for none).
+///
+/// Everything after the verb is the page, surrounding blanks trimmed, so a
+/// two-word name is reported as unknown rather than quietly cut short.
+fn help_command(line: &[u8]) -> Option<(bool, String)> {
+    let line = line.trim_ascii();
+    let split = line
+        .iter()
+        .position(u8::is_ascii_whitespace)
+        .unwrap_or(line.len());
+    let (verb, page) = line.split_at(split);
+    let force = match verb {
+        b"help" | b"h" => false,
+        b"help!" | b"h!" => true,
+        _ => return None,
+    };
+    Some((
+        force,
+        String::from_utf8_lossy(page.trim_ascii()).into_owned(),
+    ))
+}
+
+/// Whether the bytes typed after `r` are the start of a UTF-8 character
+/// that is not finished yet.  A byte that cannot continue it ends the wait:
+/// the replacement is then whatever was typed, as the bytes it is.
+fn replacement_incomplete(bytes: &[u8]) -> bool {
+    let wanted = match bytes.first() {
+        Some(0xc2..=0xdf) => 2,
+        Some(0xe0..=0xef) => 3,
+        Some(0xf0..=0xf4) => 4,
+        _ => return false,
+    };
+    bytes.len() < wanted && bytes[1..].iter().all(|byte| byte & 0xc0 == 0x80)
 }
 
 fn unknown(name: &[u8]) -> String {
@@ -2413,6 +2651,25 @@ fn is_markdown(path: &Path) -> bool {
                 "md" | "markdown" | "mdown" | "mkd" | "mkdn" | "mdx"
             )
         })
+}
+
+/// The keys of a recorded change with its count replaced by `count`.
+///
+/// The count may have been typed in front of the change (`3x`, `3dw`) or
+/// between an operator and its motion (`d3w`); either is dropped, so `2.`
+/// after `d3w` deletes two words, as it does in vim, rather than six.
+fn recount(keys: &[Input], count: usize) -> Vec<Input> {
+    let is_digit = |input: &Input| matches!(input, Input::Byte(byte) if byte.is_ascii_digit());
+    let mut rest: Vec<Input> = keys.iter().copied().skip_while(is_digit).collect();
+    if matches!(rest.first(), Some(Input::Byte(b'd' | b'c' | b'y')))
+        && !matches!(rest.get(1), Some(Input::Byte(b'0')))
+    {
+        let digits = rest[1..].iter().take_while(|input| is_digit(input)).count();
+        rest.drain(1..1 + digits);
+    }
+    let mut counted: Vec<Input> = count.to_string().bytes().map(Input::Byte).collect();
+    counted.extend(rest);
+    counted
 }
 
 /// Whether `input` begins a change that `.` should be able to repeat.
@@ -2512,18 +2769,191 @@ mod tests {
     }
 
     #[test]
-    fn a_count_in_front_of_c_is_dropped_rather_than_repeating_the_key() {
-        let mut app = repeating(b"one two three");
+    fn counts_in_front_of_operators_reach_their_motions() {
+        // `3cw` changes three words; the count used to be dropped.
+        let mut app = repeating(b"one two three four");
         typed(&mut app, b"3cw");
-        // One word, not three, and the motion reached the operator instead of
-        // being typed into a line `cc` had opened.
-        assert_eq!(app.editor.buffer.data, b" two three");
+        assert_eq!(app.editor.buffer.data, b" four");
         assert_eq!(app.editor.mode, Mode::Insert);
 
-        // `3d` still deletes three lines, which is what it always did.
+        // `3d` waits for its motion, as in vim, and a second `d` makes it
+        // three lines, with nothing left pending afterwards.
         let mut rows = repeating(b"a\nb\nc\nd\ne");
         typed(&mut rows, b"3d");
+        assert_eq!(rows.editor.buffer.data, b"a\nb\nc\nd\ne");
+        assert!(rows.editor.pending_operator());
+        typed(&mut rows, b"d");
         assert_eq!(rows.editor.buffer.data, b"d\ne");
+        assert!(!rows.collecting_command());
+        typed(&mut rows, b"u");
+        assert_eq!(rows.editor.buffer.data, b"a\nb\nc\nd\ne");
+
+        // `d3w` used to delete one word and then move two; `2d2w` is four.
+        let mut words = repeating(b"a b c d e f g h");
+        typed(&mut words, b"d3w");
+        assert_eq!(words.editor.buffer.data, b"d e f g h");
+        typed(&mut words, b"2d2w");
+        assert_eq!(words.editor.buffer.data, b"h");
+        typed(&mut words, b"3yy");
+        assert_eq!(words.editor.clipboard, b"\nh");
+        assert!(!words.collecting_command());
+    }
+
+    #[test]
+    fn dot_replays_the_count_of_the_change_and_a_new_count_replaces_it() {
+        let mut app = repeating(b"abcdefghijkl");
+        typed(&mut app, b"3x");
+        assert_eq!(app.editor.buffer.data, b"defghijkl");
+        typed(&mut app, b".");
+        assert_eq!(app.editor.buffer.data, b"ghijkl");
+        typed(&mut app, b"2.");
+        assert_eq!(app.editor.buffer.data, b"ijkl");
+        // The new count is the one `.` repeats from now on.
+        typed(&mut app, b".");
+        assert_eq!(app.editor.buffer.data, b"kl");
+
+        // A count typed after the operator is the one `2.` replaces.
+        let mut words = repeating(b"a b c d e f g");
+        typed(&mut words, b"d3w");
+        assert_eq!(words.editor.buffer.data, b"d e f g");
+        typed(&mut words, b"2.");
+        assert_eq!(words.editor.buffer.data, b"f g");
+    }
+
+    #[test]
+    fn counted_r_and_star_do_what_vim_does_with_them() {
+        let mut app = repeating(b"abcd");
+        typed(&mut app, b"3rX");
+        assert_eq!(app.editor.buffer.data, b"XXXd");
+        assert_eq!(app.editor.buffer.cursor, 2);
+        typed(&mut app, b"u");
+        assert_eq!(app.editor.buffer.data, b"abcd");
+        typed(&mut app, b"U");
+        assert_eq!(app.editor.buffer.data, b"XXXd");
+        // More than the line holds replaces nothing.
+        typed(&mut app, b"09rY");
+        assert_eq!(app.editor.buffer.data, b"XXXd");
+        assert!(!app.pending_replace);
+        typed(&mut app, b"2.");
+        assert_eq!(app.editor.buffer.data, b"XXXd");
+
+        let mut star = repeating(b"foo x foo y foo z foo");
+        typed(&mut star, b"3*");
+        assert_eq!(star.editor.buffer.cursor, 18);
+        assert!(star.count.is_empty());
+    }
+
+    #[test]
+    fn a_count_in_front_of_a_key_that_takes_none_is_dropped() {
+        let mut app = repeating(b"abc");
+        typed(&mut app, b"3:");
+        assert_eq!(app.editor.mode, Mode::Command);
+        assert!(app.count.is_empty());
+        app.handle(Input::Escape);
+        typed(&mut app, b"3/");
+        assert_eq!(app.editor.mode, Mode::Search);
+        app.handle(Input::Escape);
+        typed(&mut app, b"2 o");
+        typed(&mut app, b"4s");
+        assert!(app.jump.is_some());
+        assert!(app.count.is_empty());
+        app.handle(Input::Escape);
+        assert!(app.jump.is_none());
+
+        // None of those counts is still waiting to multiply the next key.
+        typed(&mut app, b"x");
+        assert_eq!(app.editor.buffer.data, b"bc");
+    }
+
+    #[test]
+    fn visual_mode_takes_counts_and_its_new_operators() {
+        let mut lines = repeating(b"a\nb\nc\nd\ne");
+        typed(&mut lines, b"V2jd");
+        assert_eq!(lines.editor.buffer.data, b"d\ne");
+
+        let mut chars = repeating(b"abcdef");
+        typed(&mut chars, b"v2ld");
+        assert_eq!(chars.editor.buffer.data, b"def");
+        assert_eq!(chars.editor.clipboard, b"abc");
+
+        let mut to_line = repeating(b"a\nb\nc\nd");
+        typed(&mut to_line, b"V3Gd");
+        assert_eq!(to_line.editor.buffer.data, b"d");
+
+        // `r` waits for its byte, then writes it over the selection.
+        let mut replace = repeating(b"abcdef");
+        typed(&mut replace, b"vlr");
+        assert!(replace.pending_replace);
+        assert_eq!(replace.editor.mode, Mode::Visual);
+        typed(&mut replace, b"Z");
+        assert_eq!(replace.editor.buffer.data, b"ZZcdef");
+        assert_eq!(replace.editor.mode, Mode::Normal);
+        typed(&mut replace, b"u");
+        assert_eq!(replace.editor.buffer.data, b"abcdef");
+
+        // `c` and what is typed after it are one undo step here too.
+        let mut change = repeating(b"one two");
+        typed(&mut change, b"vllcON");
+        change.handle(Input::Escape);
+        assert_eq!(change.editor.buffer.data, b"ON two");
+        typed(&mut change, b"u");
+        assert_eq!(change.editor.buffer.data, b"one two");
+        // `.` after a Visual change does not crash, and repeats nothing new.
+        typed(&mut change, b".");
+        assert!(change.editor.buffer.invariants_hold());
+    }
+
+    #[test]
+    fn the_legacy_search_replacement_is_one_undo_step_and_respects_read_only() {
+        fn search(app: &mut App, pattern: &[u8]) {
+            app.handle(Input::Byte(b'/'));
+            typed(app, pattern);
+            app.handle(Input::Enter);
+        }
+        let mut app = repeating(b"old one old two");
+        search(&mut app, b"s/old/new");
+        assert_eq!(app.editor.buffer.data, b"old one new two");
+        assert_eq!(app.editor.buffer.cursor, 8);
+        typed(&mut app, b"u");
+        assert_eq!(app.editor.buffer.data, b"old one old two");
+        typed(&mut app, b"U");
+        assert_eq!(app.editor.buffer.data, b"old one new two");
+        // Older records still apply at the right offsets afterwards.
+        typed(&mut app, b"0x");
+        search(&mut app, b"s/two/2");
+        typed(&mut app, b"uu");
+        assert_eq!(app.editor.buffer.data, b"old one new two");
+
+        let mut help = App::new(b"old old".to_vec(), PathBuf::from("general"));
+        help.readonly = true;
+        search(&mut help, b"s/old/new");
+        assert_eq!(help.editor.buffer.data, b"old old");
+        assert_eq!(help.editor.mode, Mode::Normal);
+        assert_eq!(
+            help.commands.message.as_deref(),
+            Some("Buffer is read-only")
+        );
+    }
+
+    #[test]
+    fn undo_size_caps_how_many_steps_u_can_take_back() {
+        let mut app = repeating(b"abcdef");
+        ex(&mut app, b"set undo_size=2");
+        typed(&mut app, b"xxx");
+        assert_eq!(app.editor.buffer.data, b"def");
+        typed(&mut app, b"uuu");
+        assert_eq!(app.editor.buffer.data, b"bcdef");
+
+        // A full stack does not stop `.` from noticing a new change.
+        typed(&mut app, b"rZ");
+        typed(&mut app, b"l.");
+        assert_eq!(app.editor.buffer.data, b"ZZdef");
+
+        // Zero, or anything below it, keeps every step.
+        ex(&mut app, b"set undo_size=0");
+        typed(&mut app, b"xxxx");
+        typed(&mut app, b"uuuu");
+        assert_eq!(app.editor.buffer.data, b"ZZdef");
     }
 
     #[test]
@@ -4322,6 +4752,68 @@ b"
         // `set-var` is a different command and still reaches the lexer.
         assert!(ex(&mut app, b"set-var relative 0").is_empty());
         assert_eq!(app.commands.relative, 0);
+    }
+
+    #[test]
+    fn tabstop_is_set_apart_from_the_indent_and_reaches_the_editor() {
+        let mut app = App::new(b"\tone\n".to_vec(), PathBuf::from("f"));
+
+        assert!(ex(&mut app, b"set ts=8").is_empty());
+        assert_eq!(app.commands.tabstop, 8);
+        assert_eq!(app.editor.tabstop, 8);
+        // `ts` used to be another name for `indent`; it no longer moves it.
+        assert_eq!(app.commands.indent, 4);
+        assert_eq!(app.editor.indent, 4);
+        assert!(ex(&mut app, b"set sw=2").is_empty());
+        assert_eq!(app.commands.tabstop, 8);
+
+        // A bare `:set ts` shows the width, the way `:set ts?` does.
+        assert!(ex(&mut app, b"set ts?").is_empty());
+        assert_eq!(app.commands.message.as_deref(), Some("ts=8"));
+        assert!(ex(&mut app, b"set tabstop").is_empty());
+        assert_eq!(app.commands.message.as_deref(), Some("tabstop=8"));
+
+        for (line, message) in [
+            (&b"set ts=0"[..], "Invalid value for ts: 0"),
+            (b"set tabstop=33", "Invalid value for tabstop: 33"),
+            (b"set ts=-4", "Invalid value for ts: -4"),
+            (b"set nots", "Invalid value for nots"),
+            (b"set-var tabstop 40", "Invalid value for tabstop: 40"),
+        ] {
+            assert!(ex(&mut app, line).is_empty());
+            assert_eq!(app.commands.message.as_deref(), Some(message));
+            assert_eq!(app.editor.tabstop, 8, "{}", String::from_utf8_lossy(line));
+        }
+
+        assert!(ex(&mut app, b"set-var tabstop 2").is_empty());
+        assert_eq!(app.editor.tabstop, 2);
+    }
+
+    #[test]
+    fn autoformat_retabs_with_the_tabstop_option() {
+        let mut app = App::new(b"\tone\n".to_vec(), PathBuf::from("f"));
+        // Only retab, so the line's indentation is converted and not
+        // recomputed from the brackets.
+        assert!(ex(&mut app, b"set autoformat_autoindent=0 ts=2 sw=2").is_empty());
+        assert!(ex(&mut app, b"autoformat").is_empty());
+        assert_eq!(app.editor.buffer.data, b"  one\n");
+    }
+
+    #[test]
+    fn r_waits_for_every_byte_of_a_multi_byte_replacement() {
+        let mut app = App::new("abc日".as_bytes().to_vec(), PathBuf::from("f"));
+        // `ü` arrives as its two UTF-8 bytes, one input each.
+        typed(&mut app, b"r\xc3\xbc");
+        assert_eq!(app.editor.buffer.data, "übc日".as_bytes());
+        assert!(!app.pending_replace);
+        // And a wide character is replaced whole by an ASCII one.
+        typed(&mut app, b"$hra");
+        assert_eq!(app.editor.buffer.data, "übca".as_bytes());
+        // Escape in the middle of a character cancels it.
+        typed(&mut app, b"0r\xc3");
+        assert!(app.handle(Input::Escape).is_empty());
+        assert_eq!(app.editor.buffer.data, "übca".as_bytes());
+        assert!(app.editor.buffer.invariants_hold());
     }
 
     #[test]
