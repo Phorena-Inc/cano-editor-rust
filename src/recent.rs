@@ -58,7 +58,7 @@ impl Recent {
         // An absolute path keeps the list meaningful from any working
         // directory, and makes the same file recorded under two spellings
         // collapse to one entry.
-        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let path = crate::io::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         self.paths.retain(|existing| *existing != path);
         self.paths.insert(0, path);
         self.paths.truncate(CAPACITY);
@@ -136,7 +136,7 @@ mod tests {
     fn touch(root: &Path, name: &str) -> PathBuf {
         let path = root.join(name);
         fs::write(&path, b"x").expect("fixture file");
-        path.canonicalize().expect("canonical fixture path")
+        crate::io::canonicalize(&path).expect("canonical fixture path")
     }
 
     #[test]

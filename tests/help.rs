@@ -155,7 +155,7 @@ fn the_file_left_for_help_is_in_the_recent_list_and_the_page_is_not() {
 
     app.run_command(b"help");
     app.run_command(b"help cmds");
-    let canonical = file.canonicalize().unwrap();
+    let canonical = cano_fresh::io::canonicalize(&file).unwrap();
     assert_eq!(app.recent.paths.first(), Some(&canonical));
     // Help pages are documentation, never the user's own files.
     assert!(

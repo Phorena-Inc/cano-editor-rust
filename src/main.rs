@@ -126,6 +126,7 @@ fn run() -> Result<u8, String> {
     commands.mouse = config.mouse.unwrap_or(commands.mouse);
     commands.backup = config.backup.unwrap_or(commands.backup);
     commands.list = config.list.unwrap_or(commands.list);
+    commands.wrap = config.wrap.unwrap_or(commands.wrap);
     app.editor.indent = app.commands.indent.max(0) as usize;
 
     // Anything the configuration asked to run, in the order it asked. These
@@ -211,6 +212,7 @@ fn run() -> Result<u8, String> {
                         highlight: &app.highlight,
                         cursorline: app.commands.cursorline != 0,
                         list: (app.commands.list != 0).then_some(&app.commands.listchars),
+                        wrap: app.commands.wrap != 0,
                         explorer: app.explorer.as_ref(),
                         recent: app.recent_open.then_some(&app.recent),
                         history: app

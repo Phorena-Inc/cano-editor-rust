@@ -159,6 +159,7 @@ const CONFIGS: &[&[u8]] = &[
     b"mouse",
     b"backup",
     b"list",
+    b"wrap",
     b"autoformat_autoindent",
     b"autoformat_retab",
     b"autoformat_remove_trailing_spaces",
@@ -267,6 +268,9 @@ pub enum ConfigVariable {
     Mouse,
     Backup,
     List,
+    /// Vim's `wrap`: long lines continue on the next screen row instead
+    /// of running off the right edge.
+    Wrap,
     AutoFormatIndent,
     AutoFormatRetab,
     AutoFormatTrailing,
@@ -287,6 +291,7 @@ impl ConfigVariable {
             b"mouse" => Some(Self::Mouse),
             b"backup" | b"bk" => Some(Self::Backup),
             b"list" => Some(Self::List),
+            b"wrap" => Some(Self::Wrap),
             b"autoformat_autoindent" => Some(Self::AutoFormatIndent),
             b"autoformat_retab" => Some(Self::AutoFormatRetab),
             b"autoformat_remove_trailing_spaces" => Some(Self::AutoFormatTrailing),
@@ -318,6 +323,7 @@ impl ConfigVariable {
             Self::Mouse => "mouse",
             Self::Backup => "backup",
             Self::List => "list",
+            Self::Wrap => "wrap",
             Self::AutoFormatIndent => "autoformat_autoindent",
             Self::AutoFormatRetab => "autoformat_retab",
             Self::AutoFormatTrailing => "autoformat_remove_trailing_spaces",
@@ -700,6 +706,8 @@ pub struct CommandState {
     pub list: i64,
     /// Vim's `listchars`, which decides what `list` draws.
     pub listchars: ListChars,
+    /// Vim's `wrap`: on by default, as in vim.
+    pub wrap: i64,
     /// The three steps `:autoformat` runs, each on as the plugin has them.
     pub autoformat_autoindent: i64,
     pub autoformat_retab: i64,
@@ -733,6 +741,7 @@ impl CommandState {
             backup: 1,
             list: 0,
             listchars: ListChars::default(),
+            wrap: 1,
             autoformat_autoindent: 1,
             autoformat_retab: 1,
             autoformat_remove_trailing_spaces: 1,
@@ -758,6 +767,7 @@ impl CommandState {
             ConfigVariable::Mouse => self.mouse,
             ConfigVariable::Backup => self.backup,
             ConfigVariable::List => self.list,
+            ConfigVariable::Wrap => self.wrap,
             ConfigVariable::AutoFormatIndent => self.autoformat_autoindent,
             ConfigVariable::AutoFormatRetab => self.autoformat_retab,
             ConfigVariable::AutoFormatTrailing => self.autoformat_remove_trailing_spaces,
@@ -811,6 +821,7 @@ impl CommandState {
                     ConfigVariable::Mouse => self.mouse = value,
                     ConfigVariable::Backup => self.backup = value,
                     ConfigVariable::List => self.list = value,
+                    ConfigVariable::Wrap => self.wrap = value,
                     ConfigVariable::AutoFormatIndent => self.autoformat_autoindent = value,
                     ConfigVariable::AutoFormatRetab => self.autoformat_retab = value,
                     ConfigVariable::AutoFormatTrailing => {

@@ -40,8 +40,7 @@ impl Explorer {
     pub fn scan(directory: &Path) -> io::Result<Self> {
         // Resolving the parent up front keeps repeated ascents from
         // accumulating literal `..` components in every opened file's name.
-        let parent = directory
-            .canonicalize()
+        let parent = crate::io::canonicalize(directory)
             .ok()
             .and_then(|canonical| canonical.parent().map(Path::to_path_buf))
             .unwrap_or_else(|| directory.join(".."));
@@ -153,9 +152,7 @@ mod tests {
         );
         assert_eq!(explorer.directory, fixture.root);
         assert_eq!(explorer.cursor, 0);
-        let canonical_parent = fixture
-            .root
-            .canonicalize()
+        let canonical_parent = crate::io::canonicalize(&fixture.root)
             .unwrap()
             .parent()
             .unwrap()

@@ -241,6 +241,10 @@ Text and display
   CJK and emoji); h, l, x, r and Backspace move over whole characters. Bytes
   that are not valid UTF-8, and control characters such as a CR, show as a
   replacement mark. The status line column is the display column.
+  wrap is on by default: a line longer than the screen continues on the
+  next screen row, and only its first row is numbered. A wide character
+  that does not fit at the edge moves to the next row. :set nowrap scrolls
+  the view sideways instead.
   SIGTERM or SIGHUP restores the terminal and exits with 128 + the signal,
   without saving.
 

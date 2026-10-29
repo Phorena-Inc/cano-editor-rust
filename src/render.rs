@@ -68,7 +68,14 @@ pub struct Viewport {
     /// First buffer row shown.
     pub row: usize,
     /// First display column shown, once the text is scrolled sideways.
+    /// Always zero while `wrap` is on, because nothing is off to the side.
     pub column: usize,
+    /// Screen rows of the first buffer row hidden above the top edge.  Only
+    /// `wrap` makes it nonzero, and only when the cursor's row is too long
+    /// to fit on the screen whole.
+    pub skip: usize,
+    /// Whether the frame wrapped long rows instead of scrolling sideways.
+    pub wrap: bool,
     /// Rows of buffer text the frame had room for.
     pub rows: usize,
     /// Screen column where the text begins, past the line-number gutter.
@@ -136,17 +143,22 @@ impl Viewport {
         if column >= self.content_x.saturating_add(self.content_width) {
             return None;
         }
-        let index = self.row.checked_add(screen_row)?;
-        let line = *editor.buffer.rows.get(index)?;
+        let shown = *self.lines(editor).get(screen_row)?;
+        let line = editor.buffer.rows[shown.row];
 
         // Columns are display columns: a tab is `tabstop` wide and a wide
         // character two, so the byte under one has to be found by walking
         // the row rather than by arithmetic.  Either half of a wide
         // character is that character, and past the end of the line the
         // cursor belongs at its end, which is where the newline sits.
-        let wanted = self
-            .column
+        let mut wanted = shown
+            .start
             .saturating_add(usize::from(column.saturating_sub(self.content_x)));
+        // Past the text of a wrapped row's earlier screen row is still that
+        // screen row, not the start of the next one.
+        if !shown.last {
+            wanted = wanted.min(shown.end.saturating_sub(1));
+        }
         let byte = display::byte_at_column(
             &editor.buffer.data,
             line.start,
@@ -175,6 +187,7 @@ impl Viewport {
     /// [`Viewport::follow`] will simply undo this on the next frame.
     pub fn scroll_by(&mut self, delta: isize, total_rows: usize) {
         let last = total_rows.saturating_sub(1);
+        self.skip = 0;
         self.row = if delta < 0 {
             self.row.saturating_sub(delta.unsigned_abs())
         } else {
@@ -183,8 +196,82 @@ impl Viewport {
     }
 
     /// The row range the frame showed, as buffer row indexes.
-    pub fn visible_rows(&self) -> (usize, usize) {
-        (self.row, self.row.saturating_add(self.rows))
+    ///
+    /// While `wrap` is on a row can take several screen rows, so the range
+    /// is worked out from the text.  It holds only the rows that are on
+    /// screen whole, or the first row when not even that one fits: a row
+    /// cut off at the bottom is not somewhere the cursor can be put without
+    /// the view scrolling to show it.
+    pub fn visible_rows(&self, editor: &Editor) -> (usize, usize) {
+        if !self.wrap {
+            return (self.row, self.row.saturating_add(self.rows));
+        }
+        let whole = self.lines(editor).iter().filter(|line| line.last).count();
+        (self.row, self.row.saturating_add(whole.max(1)))
+    }
+
+    /// The screen rows of text this viewport shows, top to bottom.
+    fn lines(&self, editor: &Editor) -> Vec<ScreenLine> {
+        screen_lines(
+            editor,
+            self.row,
+            self.skip,
+            self.rows,
+            self.wrap.then_some(usize::from(self.content_width)),
+            self.column,
+            usize::from(self.content_width),
+        )
+    }
+
+    /// Moves the origin just far enough for the cursor's screen row to be
+    /// on screen while `wrap` is on.
+    ///
+    /// This is [`Viewport::follow`] counted in screen rows: rows above the
+    /// cursor stay in view as long as they fit, and the top of the view is
+    /// always the start of a row unless the cursor's own row is taller than
+    /// the screen.
+    fn follow_wrapped(
+        &mut self,
+        editor: &Editor,
+        cursor_row: usize,
+        cursor_segment: usize,
+        height: usize,
+        width: usize,
+    ) {
+        if cursor_row < self.row {
+            self.row = cursor_row;
+            self.skip = 0;
+        }
+        if cursor_row > self.row {
+            // Walk up from the cursor, adding whole rows while they fit.
+            let mut used = cursor_segment.saturating_add(1);
+            let mut top = cursor_row;
+            while top > self.row {
+                let mut above = wrap_starts(editor, top - 1, width).len();
+                if top - 1 == self.row {
+                    above = above.saturating_sub(self.skip);
+                }
+                if used.saturating_add(above) > height {
+                    break;
+                }
+                used += above;
+                top -= 1;
+            }
+            if top > self.row {
+                self.row = top;
+                self.skip = 0;
+            }
+        }
+        if cursor_row == self.row {
+            self.skip = self.skip.min(cursor_segment);
+            if cursor_segment >= self.skip.saturating_add(height) {
+                self.skip = cursor_segment.saturating_add(1).saturating_sub(height);
+            }
+        } else {
+            // The text may have changed under a stale offset.
+            let rows = wrap_starts(editor, self.row, width).len();
+            self.skip = self.skip.min(rows.saturating_sub(1));
+        }
     }
 
     /// Returns the new origin on one axis: unchanged while the cursor is
@@ -203,6 +290,111 @@ impl Viewport {
         debug_assert!(origin <= cursor && cursor - origin < extent);
         origin
     }
+}
+
+/// One screen row of text: display columns `start..end` of buffer row `row`.
+///
+/// Without `wrap` every buffer row is one screen row, and the columns are
+/// the window the view is scrolled to.  With it a long row is cut into
+/// several, and the columns are the piece each one shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScreenLine {
+    row: usize,
+    start: usize,
+    end: usize,
+    /// The row's first screen row, which carries its line number.
+    first: bool,
+    /// The row's last screen row, which holds the end of the line.
+    last: bool,
+}
+
+/// The display columns where each screen row of a wrapped row begins.
+///
+/// A row breaks every `width` columns, as vim's `wrap` does.  A wide
+/// character that would be cut by the edge moves to the next screen row
+/// whole, leaving the column it did not fit in blank; a tab is split
+/// across the edge.  A row exactly as wide as the screen gets one more
+/// screen row while the cursor is at its end, so the cursor has a place
+/// to be drawn.
+fn wrap_starts(editor: &Editor, row_index: usize, width: usize) -> Vec<usize> {
+    let mut starts = vec![0];
+    let Some(row) = editor.buffer.rows.get(row_index).copied() else {
+        return starts;
+    };
+    if width == 0 {
+        return starts;
+    }
+    let data = &editor.buffer.data;
+    let mut start = 0usize;
+    let mut past = 0usize;
+    for cell in display::cells(data, row.start, row.end, editor.tabstop) {
+        past = cell.column.saturating_add(cell.width);
+        while past > start.saturating_add(width) {
+            start = if Glyph::of(data, cell).wide && cell.column > start {
+                cell.column
+            } else {
+                start.saturating_add(width)
+            };
+            starts.push(start);
+        }
+    }
+    if past > 0 && past == start.saturating_add(width) && editor.buffer.cursor == row.end {
+        starts.push(past);
+    }
+    // Post: the screen rows start in order, each past the one before.
+    debug_assert!(starts.windows(2).all(|pair| pair[0] < pair[1]));
+    starts
+}
+
+/// Up to `height` screen rows of text, starting `skip` screen rows into
+/// buffer row `first_row`.
+///
+/// `wrap` is the width to wrap at, or `None` to show columns
+/// `first_column..first_column + width` of every row instead.
+fn screen_lines(
+    editor: &Editor,
+    first_row: usize,
+    skip: usize,
+    height: usize,
+    wrap: Option<usize>,
+    first_column: usize,
+    width: usize,
+) -> Vec<ScreenLine> {
+    let mut lines = Vec::with_capacity(height);
+    let mut skip = skip;
+    let mut row = first_row;
+    while lines.len() < height && row < editor.buffer.rows.len() {
+        let Some(wrap) = wrap else {
+            lines.push(ScreenLine {
+                row,
+                start: first_column,
+                end: first_column.saturating_add(width),
+                first: true,
+                last: true,
+            });
+            row += 1;
+            continue;
+        };
+        let starts = wrap_starts(editor, row, wrap);
+        for (index, &start) in starts.iter().enumerate().skip(skip) {
+            if lines.len() == height {
+                break;
+            }
+            lines.push(ScreenLine {
+                row,
+                start,
+                end: starts
+                    .get(index + 1)
+                    .copied()
+                    .unwrap_or(start.saturating_add(wrap)),
+                first: index == 0,
+                last: index + 1 == starts.len(),
+            });
+        }
+        skip = 0;
+        row += 1;
+    }
+    lines
 }
 
 /// Transient application state needed to render one frame.
@@ -225,6 +417,9 @@ pub struct RenderOptions<'a> {
     /// Vim's `list`: the glyphs to draw for invisible characters, or `None`
     /// while `list` is off.
     pub list: Option<&'a ListChars>,
+    /// Vim's `wrap`: long rows continue on the next screen row instead of
+    /// scrolling the view sideways.
+    pub wrap: bool,
     pub explorer: Option<&'a Explorer>,
     /// The Ctrl-P recent-file picker, which takes the pane when it is open.
     pub recent: Option<&'a Recent>,
@@ -417,64 +612,71 @@ fn draw_editor(
 
     let cursor_row = editor.buffer.cursor_row().unwrap_or(0);
     let cursor_column = cursor_display_column(editor);
-    scroll.row = Viewport::follow(scroll.row, cursor_row, usize::from(layout.editor_height));
-    // A wide character under the cursor is brought fully into view, its
-    // second half first so the first half wins when only one fits.
+    let height = usize::from(layout.editor_height);
     let content_width = usize::from(layout.content_width);
-    scroll.column = Viewport::follow(
-        scroll.column,
-        cursor_column.saturating_add(cursor_glyph_width(editor).saturating_sub(1)),
-        content_width,
-    );
-    scroll.column = Viewport::follow(scroll.column, cursor_column, content_width);
+    scroll.wrap = options.wrap;
+    if options.wrap {
+        // Nothing is off to the side, so the view never scrolls sideways.
+        scroll.column = 0;
+        let starts = wrap_starts(editor, cursor_row, content_width);
+        let segment = starts
+            .iter()
+            .rposition(|start| *start <= cursor_column)
+            .unwrap_or(0);
+        scroll.follow_wrapped(editor, cursor_row, segment, height, content_width);
+    } else {
+        scroll.skip = 0;
+        scroll.row = Viewport::follow(scroll.row, cursor_row, height);
+        // A wide character under the cursor is brought fully into view, its
+        // second half first so the first half wins when only one fits.
+        scroll.column = Viewport::follow(
+            scroll.column,
+            cursor_column.saturating_add(cursor_glyph_width(editor).saturating_sub(1)),
+            content_width,
+        );
+        scroll.column = Viewport::follow(scroll.column, cursor_column, content_width);
+    }
     let first_row = scroll.row;
-    let first_column = scroll.column;
+    let lines = scroll.lines(editor);
     let overlays = Overlays {
         styles: &CellStyles::build(&editor.buffer.data, options),
         highlighted: &options.highlight.matches(&editor.buffer.data),
         list: options.list,
     };
 
-    for screen_row in 0..usize::from(layout.editor_height) {
-        let row_index = first_row.saturating_add(screen_row);
-        if row_index >= editor.buffer.rows.len() {
-            break;
-        }
+    for (screen_row, line) in lines.iter().enumerate() {
         let y = shifted(layout.area.y, screen_row);
-        draw_line_number(
-            buffer,
-            layout,
-            y,
-            row_index,
-            cursor_row,
-            options.relative_numbers,
-        );
-        draw_buffer_row(
-            buffer,
-            layout,
-            editor,
-            row_index,
-            y,
-            first_column,
-            &overlays,
-        );
+        // Only a row's first screen row is numbered, as in vim.
+        if line.first {
+            draw_line_number(
+                buffer,
+                layout,
+                y,
+                line.row,
+                cursor_row,
+                options.relative_numbers,
+            );
+        }
+        draw_buffer_row(buffer, layout, editor, line, y, &overlays);
     }
 
-    draw_jump_labels(buffer, layout, editor, options, first_row, first_column);
+    draw_jump_labels(buffer, layout, editor, options, &lines);
     if options.cursorline {
-        draw_cursor_line(buffer, layout, cursor_row, first_row);
+        draw_cursor_line(buffer, layout, cursor_row, &lines);
     }
     draw_scrollbar(buffer, layout, editor.buffer.rows.len(), first_row);
 
-    if layout.content_width == 0 || cursor_row < first_row {
+    if layout.content_width == 0 {
         return None;
     }
-    let screen_row = cursor_row - first_row;
-    if screen_row >= usize::from(layout.editor_height) || cursor_column < first_column {
-        return None;
-    }
-    let screen_column = cursor_column - first_column;
-    if screen_column >= usize::from(layout.content_width) {
+    // The cursor is on the last screen row of its row that starts at or
+    // before its column; none, when that part of the row is off screen.
+    let (screen_row, line) = lines
+        .iter()
+        .enumerate()
+        .rfind(|(_, line)| line.row == cursor_row && line.start <= cursor_column)?;
+    let screen_column = cursor_column - line.start;
+    if screen_column >= content_width {
         return None;
     }
 
@@ -566,17 +768,18 @@ fn draw_buffer_row(
     buffer: &mut TuiBuffer,
     layout: ScreenLayout,
     editor: &Editor,
-    row_index: usize,
+    line: &ScreenLine,
     y: u16,
-    first_column: usize,
     overlays: &Overlays<'_>,
 ) {
     if layout.content_width == 0 {
         return;
     }
+    let row_index = line.row;
     let row = editor.buffer.rows[row_index];
     let data = &editor.buffer.data;
-    let last_column = first_column.saturating_add(usize::from(layout.content_width));
+    let first_column = line.start;
+    let last_column = line.end;
     let mut display_column = 0usize;
     // Where this row's run of trailing whitespace begins, so `trail` can be
     // told from `space` without rescanning the row for every byte.
@@ -858,21 +1061,22 @@ fn draw_cursor_line(
     buffer: &mut TuiBuffer,
     layout: ScreenLayout,
     cursor_row: usize,
-    first_row: usize,
+    lines: &[ScreenLine],
 ) {
-    let Some(screen_row) = cursor_row.checked_sub(first_row) else {
-        return;
-    };
-    if screen_row >= usize::from(layout.editor_height) {
-        return;
-    }
-    let y = shifted(layout.area.y, screen_row);
     // The mark stops at the text's right edge; the scrollbar is past it.
     let end = layout.content_x.saturating_add(layout.content_width);
-    buffer.set_style(
-        Rect::new(layout.area.x, y, end - layout.area.x, 1),
-        Style::default().add_modifier(Modifier::UNDERLINED),
-    );
+    // A wrapped row is marked on every screen row it takes.
+    for (screen_row, _) in lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.row == cursor_row)
+    {
+        let y = shifted(layout.area.y, screen_row);
+        buffer.set_style(
+            Rect::new(layout.area.x, y, end - layout.area.x, 1),
+            Style::default().add_modifier(Modifier::UNDERLINED),
+        );
+    }
 }
 
 /// Draws the `s`/`t` labels over the text they select.
@@ -885,8 +1089,7 @@ fn draw_jump_labels(
     layout: ScreenLayout,
     editor: &Editor,
     options: &RenderOptions<'_>,
-    first_row: usize,
-    first_column: usize,
+    lines: &[ScreenLine],
 ) {
     let Some((targets, typed)) = options.jump else {
         return;
@@ -901,7 +1104,6 @@ fn draw_jump_labels(
         .bg(JUMP_BACKGROUND)
         .add_modifier(Modifier::BOLD)
         .remove_modifier(Modifier::REVERSED);
-    let last_column = first_column.saturating_add(usize::from(layout.content_width));
 
     for target in targets {
         let Some(label) = target.label.strip_prefix(typed) else {
@@ -910,21 +1112,19 @@ fn draw_jump_labels(
         let Some(row_index) = editor.buffer.row_for_index(target.match_start) else {
             continue;
         };
-        let Some(screen_row) = row_index.checked_sub(first_row) else {
-            continue;
-        };
-        if screen_row >= usize::from(layout.editor_height) {
-            continue;
-        }
-        let y = shifted(layout.area.y, screen_row);
         let start = row_display_column(editor, row_index, target.match_start);
 
         for (offset, key) in label.iter().enumerate() {
             let column = start.saturating_add(offset);
-            if column < first_column || column >= last_column {
+            // A label key goes on whichever screen row shows its column,
+            // which for a wrapped row need not be the one the label began on.
+            let Some((screen_row, line)) = lines.iter().enumerate().find(|(_, line)| {
+                line.row == row_index && line.start <= column && column < line.end
+            }) else {
                 continue;
-            }
-            let x = shifted(layout.content_x, column - first_column);
+            };
+            let y = shifted(layout.area.y, screen_row);
+            let x = shifted(layout.content_x, column - line.start);
             if let Some(cell) = buffer.cell_mut((x, y)) {
                 cell.set_char(char::from(*key)).set_style(style);
             }
@@ -1496,6 +1696,7 @@ mod tests {
             highlight: &EMPTY_HIGHLIGHT,
             cursorline: false,
             list: None,
+            wrap: false,
             explorer: None,
             recent: None,
             syntax: None,
@@ -2220,7 +2421,7 @@ mod tests {
         assert_eq!(scroll.row, 9);
         scroll.scroll_by(-99, 10);
         assert_eq!(scroll.row, 0);
-        assert_eq!(scroll.visible_rows(), (0, 3));
+        assert_eq!(scroll.visible_rows(&Editor::new(Vec::new())), (0, 3));
     }
 
     #[test]
@@ -2265,6 +2466,96 @@ mod tests {
         assert!(!viewport.on_scrollbar(58));
         // A pane too narrow to draw a bar has no bar to click.
         assert!(!Viewport::default().on_scrollbar(59));
+    }
+
+    /// Draws `editor` with `wrap` on, returning the terminal and the
+    /// viewport the frame left behind.
+    fn wrapped(editor: &Editor, width: u16, height: u16) -> (Terminal<TestBackend>, Viewport) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut viewport = Viewport::default();
+        let mut wrap = options();
+        wrap.wrap = true;
+        terminal
+            .draw(|frame| draw(frame, editor, wrap, &mut viewport))
+            .unwrap();
+        (terminal, viewport)
+    }
+
+    #[test]
+    fn wrap_continues_a_long_row_on_the_next_screen_row() {
+        // Twelve columns leave six for text past the gutter and scrollbar.
+        let mut editor = Editor::new(b"abcdefghij\nxy".to_vec());
+        editor.buffer.cursor = 8;
+        let (terminal, viewport) = wrapped(&editor, 12, 6);
+        let buffer = terminal.backend().buffer();
+        assert!(line(buffer, 0).starts_with("   1 abcdef"));
+        // Only the first screen row of a row carries its number.
+        assert!(line(buffer, 1).starts_with("     ghij  "));
+        assert!(line(buffer, 2).starts_with("   2 xy"));
+        // `i` is the third column of the second screen row.
+        assert_eq!(terminal.backend().cursor_position(), Position::new(7, 1));
+        assert_eq!((viewport.row, viewport.column, viewport.skip), (0, 0, 0));
+
+        // A click maps back through the wrapped layout.
+        let byte = |column, row| viewport.byte_at(&editor, column, row);
+        assert_eq!(byte(5, 0), Some(0));
+        assert_eq!(byte(5, 1), Some(6));
+        assert_eq!(byte(8, 1), Some(9));
+        // Past the end of the last piece is the end of the line.
+        assert_eq!(byte(10, 1), Some(10));
+        assert_eq!(byte(5, 2), Some(11));
+        assert_eq!(viewport.visible_rows(&editor), (0, 2));
+    }
+
+    #[test]
+    fn wrap_moves_a_wide_character_cut_by_the_edge_to_the_next_row() {
+        let editor = Editor::new("abcde漢x".as_bytes().to_vec());
+        let (terminal, viewport) = wrapped(&editor, 12, 6);
+        let buffer = terminal.backend().buffer();
+        // The column it did not fit in is left blank.
+        assert_eq!(buffer.cell((10, 0)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((5, 1)).unwrap().symbol(), "漢");
+        assert_eq!(buffer.cell((7, 1)).unwrap().symbol(), "x");
+        // The blank column is still the first screen row's, not the next.
+        assert_eq!(viewport.byte_at(&editor, 10, 0), Some(4));
+        assert_eq!(viewport.byte_at(&editor, 6, 1), Some(5));
+    }
+
+    #[test]
+    fn wrap_gives_a_full_row_one_more_screen_row_for_the_cursor_at_its_end() {
+        let mut editor = Editor::new(b"abcdef".to_vec());
+        editor.buffer.cursor = 6;
+        let (terminal, _) = wrapped(&editor, 12, 6);
+        assert_eq!(terminal.backend().cursor_position(), Position::new(5, 1));
+
+        // Anywhere else on the row, it takes one screen row.
+        editor.buffer.cursor = 5;
+        let (terminal, _) = wrapped(&editor, 12, 6);
+        assert_eq!(terminal.backend().cursor_position(), Position::new(10, 0));
+        assert!(line(terminal.backend().buffer(), 1).starts_with(&" ".repeat(11)));
+    }
+
+    #[test]
+    fn wrap_scrolls_by_screen_rows_and_keeps_the_cursor_on_screen() {
+        // Every row takes two screen rows, and four fit.
+        let mut editor = Editor::new(b"aaaaaaa\nbbbbbbb\nccccccc\nddddddd\n".to_vec());
+        editor.buffer.cursor = 24;
+        let (terminal, viewport) = wrapped(&editor, 12, 6);
+        assert_eq!(viewport.row, 2);
+        assert!(line(terminal.backend().buffer(), 0).starts_with("   3 cccccc"));
+        assert_eq!(terminal.backend().cursor_position(), Position::new(5, 2));
+        assert_eq!(viewport.visible_rows(&editor), (2, 4));
+
+        // A row taller than the screen scrolls inside itself.
+        let mut editor = Editor::new([b'x'; 30].to_vec());
+        editor.buffer.cursor = 29;
+        let (terminal, viewport) = wrapped(&editor, 12, 4);
+        assert_eq!((viewport.row, viewport.skip), (0, 3));
+        let buffer = terminal.backend().buffer();
+        // Neither screen row is the row's first, so neither is numbered.
+        assert!(line(buffer, 0).starts_with("     xxxxxx"));
+        assert_eq!(terminal.backend().cursor_position(), Position::new(10, 1));
+        assert_eq!(viewport.byte_at(&editor, 5, 0), Some(18));
     }
 
     #[test]

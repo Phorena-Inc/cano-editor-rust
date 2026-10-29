@@ -8,6 +8,34 @@ pub fn load_buffer(path: &Path) -> io::Result<Vec<u8>> {
     fs::read(path)
 }
 
+/// The absolute, symlink-free form of `path`, spelled the way a user would.
+///
+/// On Windows `fs::canonicalize` answers with a verbatim `\\?\` path, which
+/// then turns up in the status line and in every file opened from it.  The
+/// prefix is dropped again for ordinary drive and UNC paths.
+pub fn canonicalize(path: &Path) -> io::Result<PathBuf> {
+    fs::canonicalize(path).map(plain_path)
+}
+
+#[cfg(windows)]
+fn plain_path(path: PathBuf) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path;
+    };
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path,
+    }
+}
+
+#[cfg(not(windows))]
+fn plain_path(path: PathBuf) -> PathBuf {
+    path
+}
+
 /// Write exactly the logical buffer bytes to `path`, atomically.
 ///
 /// The bytes go to a temporary file beside the destination, are flushed to
@@ -59,6 +87,7 @@ pub fn save_buffer(path: &Path, bytes: &[u8]) -> io::Result<()> {
             fs::write(&target, bytes)
         }
         Err(Failure::Create(error) | Failure::Write(error)) => Err(error),
+        #[cfg(unix)]
         Err(Failure::Owner) => fs::write(&target, bytes),
     }
 }
@@ -118,6 +147,7 @@ enum Failure {
     /// Anything after that.
     Write(io::Error),
     /// The new file could not be given the old one's owner.
+    #[cfg(unix)]
     Owner,
 }
 
@@ -356,6 +386,29 @@ pub fn help_directories(
 mod tests {
     use super::*;
     use crate::test_support::Fixture;
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_paths_drop_the_verbatim_prefix_only_where_it_is_redundant() {
+        let plain = |text: &str| plain_path(PathBuf::from(text));
+        assert_eq!(plain(r"\\?\C:\work\a.txt"), PathBuf::from(r"C:\work\a.txt"));
+        assert_eq!(
+            plain(r"\\?\UNC\server\share\a.txt"),
+            PathBuf::from(r"\\server\share\a.txt")
+        );
+        // Device namespaces have no plain spelling, so they are left alone.
+        assert_eq!(
+            plain(r"\\?\Volume{0}\a.txt"),
+            PathBuf::from(r"\\?\Volume{0}\a.txt")
+        );
+
+        let fixture = Fixture::new("canonical");
+        let file = fixture.root.join("a.txt");
+        fs::write(&file, b"x").unwrap();
+        let canonical = canonicalize(&file).unwrap();
+        assert!(!canonical.to_string_lossy().starts_with(r"\\?\"));
+        assert!(canonical.is_file());
+    }
 
     #[test]
     fn load_returns_empty_and_binary_files_byte_for_byte() {

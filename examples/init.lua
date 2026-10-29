@@ -9,6 +9,7 @@ local cano = setup({
     mouse = true,        -- Let Cano handle the mouse; false gives it back.
     backup = true,       -- Copy what each save overwrites into .backups/.
     list = false,        -- Show invisible characters (:set listchars? for the set).
+    wrap = true,         -- Wrap long lines at the screen edge, as vim does.
     indent = false,      -- false uses tabs; true uses one-space indentation.
     auto_indent = false, -- Retained for compatibility; currently a no-op.
     undo_size = false,   -- false: unlimited undo (true would keep ONE step;

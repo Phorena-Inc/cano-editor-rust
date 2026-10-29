@@ -2034,7 +2034,7 @@ impl App {
         let (first_row, past) = if self.unrendered {
             (0, rows.len())
         } else {
-            self.viewport.visible_rows()
+            self.viewport.visible_rows(&self.editor)
         };
         if past <= first_row {
             return (0, 0);
@@ -2211,6 +2211,7 @@ impl App {
     fn scroll_to_track(&mut self, row: u16) {
         let rows = self.editor.buffer.rows.len();
         self.viewport.row = self.viewport.item_from_track(row, rows);
+        self.viewport.skip = 0;
         self.pull_cursor_into_view();
     }
 
@@ -2230,7 +2231,7 @@ impl App {
     /// left the cursor outside it would simply be undone.
     fn pull_cursor_into_view(&mut self) {
         let rows = self.editor.buffer.rows.len();
-        let (first, past) = self.viewport.visible_rows();
+        let (first, past) = self.viewport.visible_rows(&self.editor);
         let last = past.saturating_sub(1).min(rows.saturating_sub(1));
         let current = self.editor.buffer.cursor_row().unwrap_or(0);
         let wanted = current.clamp(first.min(last), last);
@@ -4133,7 +4134,7 @@ b"
         // Opening it makes it the most recent entry in turn.
         assert_eq!(
             app.recent.paths.first(),
-            Some(&older.canonicalize().unwrap())
+            Some(&crate::io::canonicalize(&older).unwrap())
         );
 
         std::fs::remove_dir_all(root).unwrap();
@@ -4692,6 +4693,18 @@ b"
         // Setting the glyphs does not turn `list` on by itself.
         assert_eq!(app.commands.list, 0);
         assert!(app.saved());
+    }
+
+    #[test]
+    fn wrap_is_on_until_it_is_turned_off() {
+        let mut app = App::new(b"text".to_vec(), PathBuf::from("f"));
+        assert_eq!(app.commands.wrap, 1);
+        assert!(ex(&mut app, b"set nowrap").is_empty());
+        assert_eq!(app.commands.wrap, 0);
+        assert!(ex(&mut app, b"set wrap!").is_empty());
+        assert_eq!(app.commands.wrap, 1);
+        assert!(ex(&mut app, b"set wrap?").is_empty());
+        assert_eq!(app.commands.message.as_deref(), Some("wrap=1"));
     }
 
     #[test]
