@@ -20,6 +20,7 @@ pub mod markdown;
 pub mod process;
 pub mod recent;
 pub mod render;
+pub(crate) mod scan;
 pub mod substitute;
 pub mod syntax;
 pub mod terminal;

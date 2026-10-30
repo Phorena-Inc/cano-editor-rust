@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::buffer::is_word;
+use crate::scan;
 
 /// An RGB color in the `.cyntax` 0–255 range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -487,8 +488,77 @@ pub struct SyntaxToken {
     pub end: usize,
 }
 
+#[cfg(test)]
 fn in_group(word: &[u8], group: &SyntaxGroup) -> bool {
     group.words.iter().any(|candidate| candidate == word)
+}
+
+/// The three word groups of one config, merged for lookup.
+///
+/// The tokenizer looks up every identifier in the source, so a linear walk
+/// over each group (about ninety slice compares for Rust) dominated a full
+/// scan.  Here the words are bucketed by length, which rejects most
+/// identifiers in one step, and sorted within a bucket for a binary search.
+/// A word of up to eight bytes is packed into a `u64`, so its search is a
+/// few integer compares; the bucket fixes the length, so the zero padding
+/// cannot make two words equal.
+struct Vocabulary<'a> {
+    short: [Vec<(u64, SyntaxKind)>; 9],
+    long: Vec<Vec<(&'a [u8], SyntaxKind)>>,
+}
+
+fn packed(word: &[u8]) -> Option<u64> {
+    let mut bytes = [0; 8];
+    bytes.get_mut(..word.len())?.copy_from_slice(word);
+    Some(u64::from_le_bytes(bytes))
+}
+
+impl<'a> Vocabulary<'a> {
+    fn new(config: &'a SyntaxConfig) -> Self {
+        let mut short: [Vec<(u64, SyntaxKind)>; 9] = Default::default();
+        let mut long: Vec<Vec<(&[u8], SyntaxKind)>> = Vec::new();
+        // Groups go in priority order; a word listed twice keeps the kind of
+        // the first group, as the old keyword-then-type-then-word test did.
+        let groups = [
+            (&config.keyword, SyntaxKind::Keyword),
+            (&config.type_name, SyntaxKind::Type),
+            (&config.word, SyntaxKind::Word),
+        ];
+        for (group, kind) in groups {
+            for word in &group.words {
+                if let Some(key) = packed(word) {
+                    short[word.len()].push((key, kind));
+                } else {
+                    if long.len() <= word.len() {
+                        long.resize_with(word.len() + 1, Vec::new);
+                    }
+                    long[word.len()].push((word.as_slice(), kind));
+                }
+            }
+        }
+        // Stable sorts, so the first of equal words is the higher priority
+        // one and survives the dedup.
+        for bucket in &mut short {
+            bucket.sort_by_key(|entry| entry.0);
+            bucket.dedup_by_key(|entry| entry.0);
+        }
+        for bucket in &mut long {
+            bucket.sort_by(|a, b| a.0.cmp(b.0));
+            bucket.dedup_by(|later, earlier| later.0 == earlier.0);
+        }
+        Self { short, long }
+    }
+
+    fn kind(&self, word: &[u8]) -> Option<SyntaxKind> {
+        if let Some(key) = packed(word) {
+            let bucket = &self.short[word.len()];
+            let index = bucket.binary_search_by_key(&key, |entry| entry.0).ok()?;
+            return Some(bucket[index].1);
+        }
+        let bucket = self.long.get(word.len())?;
+        let index = bucket.binary_search_by(|entry| entry.0.cmp(word)).ok()?;
+        Some(bucket[index].1)
+    }
 }
 
 /// One scanned span: where it ends, and the color it takes.
@@ -516,10 +586,7 @@ impl Scan {
 }
 
 fn line_end(source: &[u8], at: usize) -> usize {
-    source
-        .get(at..)
-        .and_then(|rest| rest.iter().position(|byte| *byte == b'\n'))
-        .map_or(source.len(), |offset| at + offset)
+    scan::find_byte(source, b'\n', at).unwrap_or(source.len())
 }
 
 fn word_end(source: &[u8], mut at: usize) -> usize {
@@ -964,6 +1031,7 @@ fn only_blanks_before(source: &[u8], at: usize) -> bool {
 /// including on malformed input.
 pub fn tokens(source: &[u8], config: &SyntaxConfig) -> Vec<SyntaxToken> {
     let mut result = Vec::new();
+    let vocabulary = Vocabulary::new(config);
     let mut at = 0;
     while at < source.len() {
         let scanned = match config.language {
@@ -1000,17 +1068,7 @@ pub fn tokens(source: &[u8], config: &SyntaxConfig) -> Vec<SyntaxToken> {
         if is_word(source[at]) {
             let start = at;
             at = word_end(source, at + 1);
-            let word = &source[start..at];
-            let kind = if in_group(word, &config.keyword) {
-                Some(SyntaxKind::Keyword)
-            } else if in_group(word, &config.type_name) {
-                Some(SyntaxKind::Type)
-            } else if in_group(word, &config.word) {
-                Some(SyntaxKind::Word)
-            } else {
-                None
-            };
-            if let Some(kind) = kind {
+            if let Some(kind) = vocabulary.kind(&source[start..at]) {
                 result.push(SyntaxToken {
                     kind,
                     start,
@@ -1427,5 +1485,42 @@ mod tests {
             .as_nanos();
         let missing = std::env::temp_dir().join(format!("missing-{unique}.cyntax"));
         assert!(matches!(load(&missing), Err(SyntaxError::Io { .. })));
+    }
+
+    #[test]
+    fn vocabulary_classifies_like_the_group_chain_and_keeps_group_priority() {
+        let mut config = SyntaxConfig::for_language(Language::Rust);
+        // `fn` in two groups stays a keyword; `Self` in two stays a type.
+        config.type_name.words.push(b"fn".to_vec());
+        config
+            .word
+            .words
+            .extend([b"Self".to_vec(), b"cano".to_vec()]);
+        let vocabulary = Vocabulary::new(&config);
+        let chain = |word: &[u8]| {
+            if in_group(word, &config.keyword) {
+                Some(SyntaxKind::Keyword)
+            } else if in_group(word, &config.type_name) {
+                Some(SyntaxKind::Type)
+            } else if in_group(word, &config.word) {
+                Some(SyntaxKind::Word)
+            } else {
+                None
+            }
+        };
+        let groups = [&config.keyword, &config.type_name, &config.word];
+        let listed = groups.iter().flat_map(|group| group.words.iter());
+        let unlisted: [&[u8]; 6] = [
+            b"",
+            b"f",
+            b"fnn",
+            b"selff",
+            b"cano_",
+            b"averyveryverylongword",
+        ];
+        for word in listed.map(Vec::as_slice).chain(unlisted) {
+            assert_eq!(vocabulary.kind(word), chain(word), "{word:?}");
+        }
+        assert_eq!(vocabulary.kind(b"fn"), Some(SyntaxKind::Keyword));
     }
 }

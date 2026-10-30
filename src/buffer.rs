@@ -10,6 +10,7 @@
 //! rests on the first byte of one.
 
 use crate::display;
+use crate::scan;
 
 /// Whether a byte can be part of a word, for the keys that work on words.
 ///
@@ -91,22 +92,12 @@ impl Highlight {
 
     /// The start of the first occurrence at or after `from`.
     pub fn find(&self, data: &[u8], from: usize) -> Option<usize> {
-        if self.needle.is_empty() || self.needle.len() > data.len() {
-            return None;
-        }
-        (from.min(data.len())..=data.len() - self.needle.len())
-            .find(|at| data[*at..].starts_with(&self.needle) && self.accepts(data, *at))
+        scan::find(data, &self.needle, from, |at| self.accepts(data, at))
     }
 
     /// The start of the last occurrence that begins before `before`.
     pub fn rfind(&self, data: &[u8], before: usize) -> Option<usize> {
-        if self.needle.is_empty() || self.needle.len() > data.len() {
-            return None;
-        }
-        let limit = before.min(data.len() - self.needle.len() + 1);
-        (0..limit)
-            .rev()
-            .find(|at| data[*at..].starts_with(&self.needle) && self.accepts(data, *at))
+        scan::rfind(data, &self.needle, before, |at| self.accepts(data, at))
     }
 
     /// Every occurrence in `data`, as half-open byte ranges.
@@ -122,6 +113,42 @@ impl Highlight {
         }
         found
     }
+}
+
+/// Fills `rows` with the rows of `data`, reusing its allocation.
+///
+/// A row's `end` is the index of its newline, or `data.len()` for the final
+/// row, so there is always at least one row.
+fn rows_into(data: &[u8], rows: &mut Vec<Row>) {
+    rows.clear();
+    let mut start = 0;
+    let (blocks, tail) = data.as_chunks::<{ scan::BLOCK }>();
+    for (index, block) in blocks.iter().enumerate() {
+        let base = index * scan::BLOCK;
+        let mut mask = scan::byte_mask(block, b'\n');
+        // One iteration per newline, not per byte.  The only carried values
+        // are `mask` (clear lowest bit) and `start` (one add).
+        while mask != 0 {
+            let end = base + mask.trailing_zeros() as usize;
+            rows.push(Row { start, end });
+            start = end + 1;
+            mask &= mask - 1;
+        }
+    }
+    let base = data.len() - tail.len();
+    for (offset, &byte) in tail.iter().enumerate() {
+        if byte == b'\n' {
+            rows.push(Row {
+                start,
+                end: base + offset,
+            });
+            start = base + offset + 1;
+        }
+    }
+    rows.push(Row {
+        start,
+        end: data.len(),
+    });
 }
 
 impl Default for Buffer {
@@ -143,23 +170,34 @@ impl Buffer {
 
     fn derived_rows(data: &[u8]) -> Vec<Row> {
         let mut rows = Vec::new();
-        let mut start = 0;
-        for (index, byte) in data.iter().enumerate() {
-            if *byte == b'\n' {
-                rows.push(Row { start, end: index });
-                start = index + 1;
-            }
-        }
-        rows.push(Row {
-            start,
-            end: data.len(),
-        });
+        rows_into(data, &mut rows);
         rows
     }
 
     /// Rebuilds row metadata.  Every buffer has at least one row.
+    ///
+    /// The old table's allocation is reused, so an edit does not pay for a
+    /// free, a malloc and the reallocations of a growing vector.
     pub fn calculate_rows(&mut self) {
-        self.rows = Self::derived_rows(&self.data);
+        rows_into(&self.data, &mut self.rows);
+    }
+
+    /// Moves every row boundary after the edit at `at` by `delta` bytes.
+    ///
+    /// Only valid when the edit inserted or removed bytes that hold no
+    /// newline, so the row count does not change.  The row holding `at`
+    /// keeps its start; every later row moves as a whole.
+    fn shift_rows_after(&mut self, at: usize, delta: isize) {
+        let row = self.rows.partition_point(|row| row.end < at);
+        let Some((first, rest)) = self.rows[row..].split_first_mut() else {
+            return;
+        };
+        first.end = first.end.wrapping_add_signed(delta);
+        // Independent element updates: no loop-carried dependency.
+        for row in rest {
+            row.start = row.start.wrapping_add_signed(delta);
+            row.end = row.end.wrapping_add_signed(delta);
+        }
     }
 
     pub fn validate(&self) -> Result<(), InvariantError> {
@@ -189,7 +227,9 @@ impl Buffer {
         if index > self.data.len() {
             return None;
         }
-        self.rows.iter().position(|row| index <= row.end)
+        // Row ends strictly increase and the last one is `data.len()`, so a
+        // binary search finds the same row a linear scan would, in O(log n).
+        Some(self.rows.partition_point(|row| row.end < index))
     }
 
     /// The byte range of the word `*` would search for from `index`.
@@ -284,8 +324,14 @@ impl Buffer {
     pub fn insert_byte(&mut self, byte: u8) -> usize {
         self.cursor = self.cursor.min(self.data.len());
         self.data.insert(self.cursor, byte);
+        if byte == b'\n' {
+            self.calculate_rows();
+        } else {
+            // Typing is the hot path: shift the later rows instead of
+            // rescanning the whole file for newlines.
+            self.shift_rows_after(self.cursor, 1);
+        }
         self.cursor += 1;
-        self.calculate_rows();
         debug_assert_eq!(self.validate(), Ok(()));
         self.cursor
     }
@@ -295,8 +341,11 @@ impl Buffer {
         if self.cursor >= self.data.len() {
             return false;
         }
-        self.data.remove(self.cursor);
-        self.calculate_rows();
+        if self.data.remove(self.cursor) == b'\n' {
+            self.calculate_rows();
+        } else {
+            self.shift_rows_after(self.cursor, -1);
+        }
         debug_assert_eq!(self.validate(), Ok(()));
         true
     }
@@ -974,5 +1023,55 @@ mod tests {
             buffer.validate(),
             Err(InvariantError::RowsOutOfDate { .. })
         ));
+    }
+
+    #[test]
+    fn typing_shifts_rows_like_a_full_rescan_and_lookups_match_a_linear_scan() {
+        let mut buffer = Buffer::new(b"ab\n\ncd\nef".to_vec());
+        for (cursor, byte) in [(0, b'x'), (3, b'y'), (4, b'\n'), (6, b'z'), (12, b'w')] {
+            buffer.cursor = cursor;
+            buffer.insert_byte(byte);
+            assert_eq!(buffer.validate(), Ok(()), "insert {byte} at {cursor}");
+        }
+        for cursor in [0, 2, 3, 5, 9] {
+            buffer.cursor = cursor;
+            assert!(buffer.delete_byte());
+            assert_eq!(buffer.validate(), Ok(()), "delete at {cursor}");
+        }
+        for index in 0..=buffer.data.len() {
+            let linear = buffer.rows.iter().position(|row| index <= row.end);
+            assert_eq!(buffer.row_for_index(index), linear, "index {index}");
+        }
+        assert_eq!(buffer.row_for_index(buffer.data.len() + 1), None);
+    }
+
+    #[test]
+    fn rows_match_a_byte_loop_on_every_length_around_the_block_edges() {
+        let mut seed = 1_u64;
+        for len in (0..=3 * scan::BLOCK + 1).chain([1000, 4096 + 17]) {
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    [b'\n', 0x0b, 0x8a, b'x'][(seed >> 33) as usize % 4]
+                })
+                .collect();
+            let mut expected = Vec::new();
+            let mut start = 0;
+            for (index, byte) in data.iter().enumerate() {
+                if *byte == b'\n' {
+                    expected.push(Row { start, end: index });
+                    start = index + 1;
+                }
+            }
+            expected.push(Row {
+                start,
+                end: data.len(),
+            });
+            let mut rows = vec![Row { start: 9, end: 9 }];
+            rows_into(&data, &mut rows);
+            assert_eq!(rows, expected, "len {len}");
+        }
     }
 }

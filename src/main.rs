@@ -12,7 +12,7 @@ use cano_fresh::io::{
 };
 use cano_fresh::process::{ShellJob, run_shell};
 use cano_fresh::recent::Recent;
-use cano_fresh::render::{RenderOptions, draw};
+use cano_fresh::render::{FrameCache, RenderOptions, draw};
 use cano_fresh::syntax::{Language, SyntaxConfig, load as load_syntax};
 use cano_fresh::terminal::{TerminalSession, termination_signal};
 
@@ -160,6 +160,9 @@ fn run() -> Result<u8, String> {
     }
 
     let mut palette = Palette::new(config_path);
+    // Frames that leave the text alone reuse the last highlighting and
+    // search matches.
+    let frame_cache = FrameCache::default();
 
     let mut terminal = TerminalSession::start().map_err(|error| error.to_string())?;
     let mut message_deadline = None::<Instant>;
@@ -220,6 +223,7 @@ fn run() -> Result<u8, String> {
                             .map(|_| (app.history_list.as_slice(), app.history_cursor)),
                         syntax,
                         markdown: app.markdown,
+                        cache: Some(&frame_cache),
                         message: app.commands.message.as_deref(),
                         filename: &filename,
                         saved: app.saved(),

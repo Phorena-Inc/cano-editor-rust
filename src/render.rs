@@ -8,6 +8,10 @@
 //! cell.  Selections, matches and syntax spans continue to use byte offsets;
 //! a cell takes its style from the bytes it was drawn from.
 
+use std::cell::RefCell;
+use std::fmt;
+use std::rc::Rc;
+
 use ratatui::Frame;
 use ratatui::buffer::Buffer as TuiBuffer;
 use ratatui::layout::{Position, Rect};
@@ -23,7 +27,7 @@ use crate::jump::Target;
 use crate::listchars::ListChars;
 use crate::markdown::{Face, Kind, faces};
 use crate::recent::Recent;
-use crate::syntax::{Rgb, SyntaxConfig, SyntaxKind, tokens};
+use crate::syntax::{Rgb, SyntaxConfig, SyntaxKind, SyntaxToken, tokens};
 
 const LINE_NUMBER_WIDTH: u16 = 5;
 const STATUS_ROWS: u16 = 2;
@@ -429,6 +433,9 @@ pub struct RenderOptions<'a> {
     pub syntax: Option<&'a SyntaxConfig>,
     /// Renders the buffer as formatted markdown instead of source code.
     pub markdown: bool,
+    /// Keeps the highlighters' work from one frame to the next.  `None`
+    /// builds it afresh, which is what tests want.
+    pub cache: Option<&'a FrameCache>,
     pub message: Option<&'a str>,
     pub filename: &'a str,
     pub saved: bool,
@@ -638,9 +645,13 @@ fn draw_editor(
     }
     let first_row = scroll.row;
     let lines = scroll.lines(editor);
+    let work = match options.cache {
+        Some(cache) => cache.get(&editor.buffer.data, options),
+        None => FrameWork::build(&editor.buffer.data, options),
+    };
     let overlays = Overlays {
-        styles: &CellStyles::build(&editor.buffer.data, options),
-        highlighted: &options.highlight.matches(&editor.buffer.data),
+        styles: &work.styles,
+        highlighted: &work.matches,
         list: options.list,
     };
 
@@ -797,10 +808,16 @@ fn draw_buffer_row(
         // byte for the highlighters, any of them for a match or the
         // selection, so a character is never half highlighted.
         let mut style = overlays.styles.style(cell.start);
+        // Matches are sorted and never overlap, so their ends ascend too:
+        // the first match ending past the cell is the only one that can
+        // overlap it.
+        let next = overlays
+            .highlighted
+            .partition_point(|(_, end)| *end <= cell.start);
         if overlays
             .highlighted
-            .iter()
-            .any(|(start, end)| *start < cell.end && cell.start < *end)
+            .get(next)
+            .is_some_and(|(start, _)| *start < cell.end)
         {
             style = style.bg(HIGHLIGHT_BACKGROUND);
         }
@@ -899,11 +916,19 @@ fn is_selected(editor: &Editor, row_index: usize, index: usize) -> bool {
 /// would cost several times the memory of the data it is built from.  With
 /// neither highlighter active nothing is allocated at all.
 ///
+/// Syntax colors stay as the token list, which is sorted and never overlaps,
+/// and a cell finds its token by binary search.  Expanding the tokens into a
+/// per-byte color table would allocate and fill four bytes per buffer byte
+/// on every frame, only to read the few thousand cells on screen.
+///
 /// Markdown display replaces source highlighting rather than layering over
 /// it: the two describe the same bytes and would otherwise fight.
 enum CellStyles {
     Plain,
-    Syntax(Vec<Option<Color>>),
+    Syntax {
+        tokens: Vec<SyntaxToken>,
+        colors: SyntaxColors,
+    },
     Markdown(Vec<Face>),
 }
 
@@ -915,27 +940,158 @@ impl CellStyles {
         let Some(syntax) = options.syntax else {
             return Self::Plain;
         };
-        let mut colors = vec![None; source.len()];
-
-        for token in tokens(source, syntax) {
-            colors[token.start..token.end].fill(Some(syntax_color(&token.kind, syntax)));
+        Self::Syntax {
+            tokens: tokens(source, syntax),
+            colors: SyntaxColors::new(syntax),
         }
-        Self::Syntax(colors)
     }
 
     fn style(&self, index: usize) -> Style {
         match self {
             Self::Plain => Style::default(),
-            Self::Syntax(colors) => colors
-                .get(index)
-                .copied()
-                .flatten()
-                .map_or_else(Style::default, |color| Style::default().fg(color)),
+            Self::Syntax { tokens, colors } => {
+                let next = tokens.partition_point(|token| token.end <= index);
+                tokens
+                    .get(next)
+                    .filter(|token| token.start <= index)
+                    .map_or_else(Style::default, |token| {
+                        Style::default().fg(colors.of(token.kind))
+                    })
+            }
             Self::Markdown(faces) => faces
                 .get(index)
                 .copied()
                 .map_or_else(Style::default, markdown_style),
         }
+    }
+}
+
+/// One frame's whole-buffer work, kept for the next frame while nothing it
+/// was built from changes: the style table and the `hlsearch` matches.
+///
+/// Most frames follow a key that moved the cursor, scrolled or changed mode,
+/// and those leave the text alone; re-tokenizing the whole buffer for them
+/// cost about 27 ms on a 10 MiB file, and finding every match about 2 ms
+/// more.  The cache keeps its own copy of the bytes and compares it with the
+/// buffer, one `memcmp` per frame.  An edit counter would be cheaper, but
+/// `Buffer::data` is public and written from many places, and a missed bump
+/// would leave stale colors on screen.  The copy costs one more buffer's
+/// worth of memory while highlighting or `hlsearch` is on.
+#[derive(Default)]
+pub struct FrameCache {
+    slot: RefCell<CachedFrame>,
+}
+
+/// The bytes both entries were built from, and each entry with the other
+/// inputs it was built from.  Every input of a cached result must be part of
+/// its key, or the cache serves stale work.
+#[derive(Default)]
+struct CachedFrame {
+    data: Vec<u8>,
+    styles: Option<(StyleSource, Rc<CellStyles>)>,
+    matches: Option<(Highlight, Matches)>,
+}
+
+/// The `hlsearch` matches of one frame, sorted and never overlapping.
+type Matches = Rc<Vec<(usize, usize)>>;
+
+/// What besides the bytes a style table was built from.
+enum StyleSource {
+    Markdown,
+    Syntax(SyntaxConfig),
+}
+
+/// The highlighter output one frame draws from.
+struct FrameWork {
+    styles: Rc<CellStyles>,
+    matches: Matches,
+}
+
+impl FrameWork {
+    fn build(data: &[u8], options: &RenderOptions<'_>) -> Self {
+        Self {
+            styles: Rc::new(CellStyles::build(data, options)),
+            matches: Rc::new(options.highlight.matches(data)),
+        }
+    }
+}
+
+impl FrameCache {
+    fn get(&self, data: &[u8], options: &RenderOptions<'_>) -> FrameWork {
+        let wants_styles = options.markdown || options.syntax.is_some();
+        let wants_matches = !options.highlight.is_empty();
+        let mut slot = self.slot.borrow_mut();
+        if !wants_styles && !wants_matches {
+            // Both are free to build; drop the copy nothing needs.
+            *slot = CachedFrame::default();
+            return Self::build_plain();
+        }
+        if slot.data != data {
+            slot.styles = None;
+            slot.matches = None;
+            // Refilled in place, so a miss after an edit reuses the
+            // allocation.
+            slot.data.clear();
+            slot.data.extend_from_slice(data);
+        }
+
+        let styles = if !wants_styles {
+            slot.styles = None;
+            Rc::new(CellStyles::Plain)
+        } else if let Some((source, styles)) = &slot.styles
+            && source.is(options)
+        {
+            Rc::clone(styles)
+        } else {
+            let styles = Rc::new(CellStyles::build(data, options));
+            let source = match options.syntax {
+                Some(syntax) if !options.markdown => StyleSource::Syntax(syntax.clone()),
+                _ => StyleSource::Markdown,
+            };
+            slot.styles = Some((source, Rc::clone(&styles)));
+            styles
+        };
+
+        let matches = if !wants_matches {
+            slot.matches = None;
+            Rc::default()
+        } else if let Some((highlight, matches)) = &slot.matches
+            && highlight == options.highlight
+        {
+            Rc::clone(matches)
+        } else {
+            let matches = Rc::new(options.highlight.matches(data));
+            slot.matches = Some((options.highlight.clone(), Rc::clone(&matches)));
+            matches
+        };
+        FrameWork { styles, matches }
+    }
+
+    fn build_plain() -> FrameWork {
+        FrameWork {
+            styles: Rc::new(CellStyles::Plain),
+            matches: Rc::default(),
+        }
+    }
+}
+
+impl StyleSource {
+    /// Whether `options` would build from this source, without cloning the
+    /// syntax config just to compare it.
+    fn is(&self, options: &RenderOptions<'_>) -> bool {
+        match self {
+            Self::Markdown => options.markdown,
+            Self::Syntax(syntax) => !options.markdown && options.syntax == Some(syntax),
+        }
+    }
+}
+
+impl fmt::Debug for FrameCache {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FrameCache")
+            .field("cached_bytes", &self.slot.borrow().data.len())
+            .finish()
     }
 }
 
@@ -970,14 +1126,32 @@ fn markdown_style(face: Face) -> Style {
     style
 }
 
-fn syntax_color(kind: &SyntaxKind, syntax: &SyntaxConfig) -> Color {
-    match kind {
-        SyntaxKind::Keyword => rgb_color(&syntax.keyword.color),
-        SyntaxKind::Type => rgb_color(&syntax.type_name.color),
-        SyntaxKind::Word => rgb_color(&syntax.word.color),
-        SyntaxKind::Preprocessor => rgb_color(&SyntaxConfig::PREPROCESSOR),
-        SyntaxKind::String => rgb_color(&SyntaxConfig::STRING),
-        SyntaxKind::Comment => rgb_color(&SyntaxConfig::COMMENT),
+/// The colors of the three configurable word groups, copied out of the
+/// config so a frame's style table does not borrow it.
+struct SyntaxColors {
+    keyword: Color,
+    type_name: Color,
+    word: Color,
+}
+
+impl SyntaxColors {
+    fn new(syntax: &SyntaxConfig) -> Self {
+        Self {
+            keyword: rgb_color(&syntax.keyword.color),
+            type_name: rgb_color(&syntax.type_name.color),
+            word: rgb_color(&syntax.word.color),
+        }
+    }
+
+    fn of(&self, kind: SyntaxKind) -> Color {
+        match kind {
+            SyntaxKind::Keyword => self.keyword,
+            SyntaxKind::Type => self.type_name,
+            SyntaxKind::Word => self.word,
+            SyntaxKind::Preprocessor => rgb_color(&SyntaxConfig::PREPROCESSOR),
+            SyntaxKind::String => rgb_color(&SyntaxConfig::STRING),
+            SyntaxKind::Comment => rgb_color(&SyntaxConfig::COMMENT),
+        }
     }
 }
 
@@ -1701,6 +1875,7 @@ mod tests {
             recent: None,
             syntax: None,
             markdown: false,
+            cache: None,
             message: None,
             filename: "file.txt",
             saved: true,
@@ -2571,5 +2746,130 @@ mod tests {
             assert!(cursor.x < width);
             assert!(cursor.y < height);
         }
+    }
+
+    #[test]
+    fn syntax_styles_by_token_lookup_match_a_per_byte_color_table() {
+        let source = b"fn main() {\n    // note\n    let s = \"x\"; usize\n}\n#[test]";
+        let syntax = SyntaxConfig::for_language(crate::syntax::Language::Rust);
+        let found = tokens(source, &syntax);
+        let colors = SyntaxColors::new(&syntax);
+        let mut table = vec![None; source.len()];
+        for token in &found {
+            table[token.start..token.end].fill(Some(colors.of(token.kind)));
+        }
+        let styles = CellStyles::Syntax {
+            tokens: found,
+            colors,
+        };
+        for index in 0..=source.len() {
+            let expected = table
+                .get(index)
+                .copied()
+                .flatten()
+                .map_or_else(Style::default, |color| Style::default().fg(color));
+            assert_eq!(styles.style(index), expected, "byte {index}");
+        }
+    }
+
+    #[test]
+    fn frame_cache_reuses_styles_until_the_text_or_their_source_changes() {
+        let cache = FrameCache::default();
+        let rust = SyntaxConfig::for_language(crate::syntax::Language::Rust);
+        let mut render_options = options();
+        render_options.syntax = Some(&rust);
+        let first = cache.get(b"fn main() {}", &render_options).styles;
+        let again = cache.get(b"fn main() {}", &render_options).styles;
+        assert!(Rc::ptr_eq(&first, &again));
+
+        let edited = cache.get(b"fn main() {;}", &render_options).styles;
+        assert!(!Rc::ptr_eq(&first, &edited));
+
+        let mut recolored = rust.clone();
+        recolored.keyword.color = Rgb::new(1, 2, 3);
+        render_options.syntax = Some(&recolored);
+        let other = cache.get(b"fn main() {;}", &render_options).styles;
+        assert!(!Rc::ptr_eq(&edited, &other));
+
+        render_options.markdown = true;
+        let markdown = cache.get(b"fn main() {;}", &render_options).styles;
+        assert!(matches!(*markdown, CellStyles::Markdown(_)));
+        let again = cache.get(b"fn main() {;}", &render_options).styles;
+        assert!(Rc::ptr_eq(&markdown, &again));
+
+        render_options.markdown = false;
+        render_options.syntax = None;
+        let plain = cache.get(b"x", &render_options);
+        assert!(matches!(*plain.styles, CellStyles::Plain) && plain.matches.is_empty());
+        assert!(cache.slot.borrow().data.is_empty());
+    }
+
+    #[test]
+    fn frame_cache_reuses_matches_until_the_text_or_the_pattern_changes() {
+        let cache = FrameCache::default();
+        let highlight = Highlight {
+            needle: b"ab".to_vec(),
+            whole_word: false,
+        };
+        let mut render_options = options();
+        render_options.highlight = &highlight;
+        let first = cache.get(b"ab abc", &render_options).matches;
+        assert_eq!(*first, vec![(0, 2), (3, 5)]);
+        let again = cache.get(b"ab abc", &render_options).matches;
+        assert!(Rc::ptr_eq(&first, &again));
+        // The text alone needs a copy kept even with no highlighter on.
+        assert_eq!(cache.slot.borrow().data, b"ab abc");
+
+        let edited = cache.get(b"ab xabc", &render_options).matches;
+        assert_eq!(*edited, vec![(0, 2), (4, 6)]);
+
+        let whole_word = Highlight {
+            whole_word: true,
+            ..highlight.clone()
+        };
+        render_options.highlight = &whole_word;
+        let whole = cache.get(b"ab xabc", &render_options).matches;
+        assert_eq!(*whole, vec![(0, 2)]);
+
+        // A new style source leaves the cached matches alone.
+        let rust = SyntaxConfig::for_language(crate::syntax::Language::Rust);
+        render_options.syntax = Some(&rust);
+        let styled = cache.get(b"ab xabc", &render_options).matches;
+        assert!(Rc::ptr_eq(&whole, &styled));
+
+        render_options.highlight = &EMPTY_HIGHLIGHT;
+        assert!(cache.get(b"ab xabc", &render_options).matches.is_empty());
+        assert!(cache.slot.borrow().matches.is_none());
+    }
+
+    #[test]
+    fn a_cached_frame_draws_the_same_cells_as_a_fresh_one() {
+        let rust = SyntaxConfig::for_language(crate::syntax::Language::Rust);
+        let highlight = Highlight {
+            needle: b"main".to_vec(),
+            whole_word: false,
+        };
+        let cache = FrameCache::default();
+        let mut editor = Editor::new(b"fn main() {\n    // main\n    let s = \"x\";\n}".to_vec());
+        let frame = |editor: &Editor, cache: Option<&FrameCache>| {
+            let mut render_options = options();
+            render_options.syntax = Some(&rust);
+            render_options.highlight = &highlight;
+            render_options.cache = cache;
+            let mut terminal = Terminal::new(TestBackend::new(30, 6)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, editor, render_options, &mut Viewport::default()))
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let fresh = frame(&editor, None);
+        assert_eq!(frame(&editor, Some(&cache)), fresh);
+        // The second cached frame is a hit and must still match.
+        assert_eq!(frame(&editor, Some(&cache)), fresh);
+        // An edit through the public field, with no method to notice it.
+        editor.buffer.data[3] = b'x';
+        editor.buffer.calculate_rows();
+        assert_eq!(frame(&editor, Some(&cache)), frame(&editor, None));
+        assert_ne!(frame(&editor, Some(&cache)), fresh);
     }
 }
