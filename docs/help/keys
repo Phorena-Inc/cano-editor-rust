@@ -2,14 +2,16 @@ Normal
   h j k l       move left/down/up/right (arrow keys also work)
   0 $ w b e     line and word motions
   g G %         file start/end and matching brace
-  N motion      count prefix repeats a motion (also n, N, u, U)
+  N motion      count prefix repeats a motion (also n N u U x p r * .)
   N g / N G     go to line N
-  N d           delete N lines
+  N dd / d N w  delete N lines / N words (counts reach the motion)
   i I a A       enter Insert mode
   o O           open line below/above
   x dd yy p     delete, delete line, yank line, paste
-  d motion      delete over the next motion
+  d y c motion  delete / yank / change over a motion or text object
+  .             repeat the last change (N. replaces its count)
   v V           character/line Visual mode
+  :help         open a help page (general, keys, cmds)
   u U           undo/redo (Ctrl-R also redoes)
   / n N         search, next match, previous match
   :             Command mode
@@ -48,7 +50,7 @@ Insert
   Escape        return to Normal
   arrows        move and split insertion history
   Tab           insert the configured indentation
-  Backspace     delete byte before cursor
+  Backspace     delete the character before the cursor
   Ctrl-H        the same as Backspace
   Enter         newline plus brace-depth indentation
   Ctrl-W        delete the word before the cursor
@@ -61,6 +63,11 @@ Visual
   motions       extend selection (h j k l 0 $ w b e g G % and arrows)
   s char        extend the selection to an EasyMotion label
   d/x y         delete or yank
+  c             change the selection, then type
+  p             put the clipboard over the selection
+  o             go to the other end of the selection
+  r char        overwrite every selected character
+  v V           switch kind, or leave when pressed in its own kind
   > <           indent or unindent selected rows
   =             autoformat the selected lines
   <c-e> space e toggle line comments over the selected lines

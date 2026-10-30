@@ -103,6 +103,20 @@ class PtySession:
             drain(self.master, 0.05)
         raise AssertionError("child did not exit")
 
+    def wait_code(self, timeout=3.0):
+        """Waits for the child and returns its exit code, whatever it is,
+        along with everything it wrote on the way out."""
+        deadline = time.monotonic() + timeout
+        output = []
+        while time.monotonic() < deadline:
+            done, status = os.waitpid(self.pid, os.WNOHANG)
+            if done:
+                self.status = status
+                output.append(drain(self.master, 0.1))
+                return os.waitstatus_to_exitcode(status), b"".join(output)
+            output.append(drain(self.master, 0.05))
+        raise AssertionError("child did not exit")
+
     def is_alive(self):
         done, status = os.waitpid(self.pid, os.WNOHANG)
         if done:
@@ -210,6 +224,51 @@ def vim_keys(binary, home, work):
         session.wait_exit()
 
 
+def shell_and_signals(binary, home, work):
+    """`:!` in the background, and SIGTERM / SIGHUP giving the terminal back.
+
+    Both are about the terminal rather than the buffer: a shell command must
+    not freeze the screen while it runs, and a signal must not leave the
+    user's shell in raw mode on the alternate screen.
+    """
+    target = os.path.join(work, "signals.txt")
+
+    write_target(target)
+    with PtySession(binary, home, work, target) as session:
+        read_until(session.master, (b"signals.txt", b"alpha"))
+        command(session, b"!sleep 1; echo boom >&2; exit 2")
+        read_until(session.master, b"Running:")
+        # The editor keeps taking keys while the command runs.
+        session.send(b"ilive \x1b")
+        read_until(session.master, b"Modified")
+        read_until(session.master, (b"[exit", b"2]", b"boom"))
+        command(session, b"q!")
+        session.wait_exit()
+    wait_file(target, ORIGINAL)
+
+    for name, number in (("SIGTERM", signal.SIGTERM), ("SIGHUP", signal.SIGHUP)):
+        write_target(target)
+        with PtySession(binary, home, work, target) as session:
+            read_until(session.master, (b"signals.txt", b"alpha"))
+            session.send(b"iunsaved \x1b")
+            read_until(session.master, b"Modified")
+            drain(session.master)
+            os.kill(session.pid, number)
+            code, output = session.wait_code()
+            if code != 128 + number:
+                raise AssertionError(f"{name} exited with {code}, expected {128 + number}")
+            # Leaving the alternate screen is the last thing the release
+            # writes; without the handler the process died before it.
+            if b"\x1b[?1049l" not in output:
+                raise AssertionError(f"{name} left the alternate screen up: {output[-200:]!r}")
+            # Raw mode is off again: the PTY echoes and translates newlines.
+            attributes = termios.tcgetattr(session.master)
+            if not attributes[3] & termios.ICANON:
+                raise AssertionError(f"{name} left the terminal in raw mode")
+        # A signal is not a request to write.
+        wait_file(target, ORIGINAL)
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit("usage: pty_smoke.py /path/to/cano")
@@ -274,6 +333,17 @@ def main():
                     command(session, b"q")
                     session.wait_exit()
 
+        # `--help=<page>` chooses a page and `:help <page>` switches to
+        # another; neither depends on the pages being on disk, since every
+        # page is also built into the binary.
+        with PtySession(binary, home, work, "--help=cmds") as session:
+            read_until(session.master, (b"cmds", b"Commands", b"set-output"))
+            command(session, b"help keys")
+            # Only the keys page says "suspend", so this cannot match cmds.
+            read_until(session.master, b"suspend")
+            command(session, b"q")
+            session.wait_exit()
+
         # The comment toggle on both spellings, round-tripped: the second
         # pass has to put the buffer back exactly as the first found it.
         source = os.path.join(work, "block.rs")
@@ -302,10 +372,11 @@ def main():
             wait_file(discard, ORIGINAL)
 
         vim_keys(binary, home, work)
+        shell_and_signals(binary, home, work)
 
     print(
-        "PASS: resize, :q refusal, :w, :wq, :q!, -h/--help help page,"
-        " comment toggle, vim Control keys"
+        "PASS: resize, :q refusal, :w, :wq, :q!, -h/--help help page, --help=/:help,"
+        " comment toggle, vim Control keys, background :!, SIGTERM/SIGHUP"
     )
 
 

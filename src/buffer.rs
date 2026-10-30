@@ -4,6 +4,13 @@
 //! index of its newline, or `data.len()` for the final row.  Consequently the
 //! newline belongs to the preceding row for cursor movement, while
 //! `start..end` is the visible row body.
+//!
+//! The cursor is still a byte index, but the motions step whole UTF-8
+//! characters (see [`crate::display`]), so outside Insert mode it only ever
+//! rests on the first byte of one.
+
+use crate::display;
+use crate::scan;
 
 /// Whether a byte can be part of a word, for the keys that work on words.
 ///
@@ -30,14 +37,6 @@ impl Row {
     pub fn is_empty(self) -> bool {
         self.start == self.end
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SelectionDeletion {
-    /// The legacy clipboard uses `start..=end` (with a synthetic NUL at EOF).
-    pub clipboard: Vec<u8>,
-    /// Undo data uses the deletion's half-open `start..end` range.
-    pub undo: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -93,22 +92,12 @@ impl Highlight {
 
     /// The start of the first occurrence at or after `from`.
     pub fn find(&self, data: &[u8], from: usize) -> Option<usize> {
-        if self.needle.is_empty() || self.needle.len() > data.len() {
-            return None;
-        }
-        (from.min(data.len())..=data.len() - self.needle.len())
-            .find(|at| data[*at..].starts_with(&self.needle) && self.accepts(data, *at))
+        scan::find(data, &self.needle, from, |at| self.accepts(data, at))
     }
 
     /// The start of the last occurrence that begins before `before`.
     pub fn rfind(&self, data: &[u8], before: usize) -> Option<usize> {
-        if self.needle.is_empty() || self.needle.len() > data.len() {
-            return None;
-        }
-        let limit = before.min(data.len() - self.needle.len() + 1);
-        (0..limit)
-            .rev()
-            .find(|at| data[*at..].starts_with(&self.needle) && self.accepts(data, *at))
+        scan::rfind(data, &self.needle, before, |at| self.accepts(data, at))
     }
 
     /// Every occurrence in `data`, as half-open byte ranges.
@@ -124,6 +113,42 @@ impl Highlight {
         }
         found
     }
+}
+
+/// Fills `rows` with the rows of `data`, reusing its allocation.
+///
+/// A row's `end` is the index of its newline, or `data.len()` for the final
+/// row, so there is always at least one row.
+fn rows_into(data: &[u8], rows: &mut Vec<Row>) {
+    rows.clear();
+    let mut start = 0;
+    let (blocks, tail) = data.as_chunks::<{ scan::BLOCK }>();
+    for (index, block) in blocks.iter().enumerate() {
+        let base = index * scan::BLOCK;
+        let mut mask = scan::byte_mask(block, b'\n');
+        // One iteration per newline, not per byte.  The only carried values
+        // are `mask` (clear lowest bit) and `start` (one add).
+        while mask != 0 {
+            let end = base + mask.trailing_zeros() as usize;
+            rows.push(Row { start, end });
+            start = end + 1;
+            mask &= mask - 1;
+        }
+    }
+    let base = data.len() - tail.len();
+    for (offset, &byte) in tail.iter().enumerate() {
+        if byte == b'\n' {
+            rows.push(Row {
+                start,
+                end: base + offset,
+            });
+            start = base + offset + 1;
+        }
+    }
+    rows.push(Row {
+        start,
+        end: data.len(),
+    });
 }
 
 impl Default for Buffer {
@@ -145,23 +170,34 @@ impl Buffer {
 
     fn derived_rows(data: &[u8]) -> Vec<Row> {
         let mut rows = Vec::new();
-        let mut start = 0;
-        for (index, byte) in data.iter().enumerate() {
-            if *byte == b'\n' {
-                rows.push(Row { start, end: index });
-                start = index + 1;
-            }
-        }
-        rows.push(Row {
-            start,
-            end: data.len(),
-        });
+        rows_into(data, &mut rows);
         rows
     }
 
     /// Rebuilds row metadata.  Every buffer has at least one row.
+    ///
+    /// The old table's allocation is reused, so an edit does not pay for a
+    /// free, a malloc and the reallocations of a growing vector.
     pub fn calculate_rows(&mut self) {
-        self.rows = Self::derived_rows(&self.data);
+        rows_into(&self.data, &mut self.rows);
+    }
+
+    /// Moves every row boundary after the edit at `at` by `delta` bytes.
+    ///
+    /// Only valid when the edit inserted or removed bytes that hold no
+    /// newline, so the row count does not change.  The row holding `at`
+    /// keeps its start; every later row moves as a whole.
+    fn shift_rows_after(&mut self, at: usize, delta: isize) {
+        let row = self.rows.partition_point(|row| row.end < at);
+        let Some((first, rest)) = self.rows[row..].split_first_mut() else {
+            return;
+        };
+        first.end = first.end.wrapping_add_signed(delta);
+        // Independent element updates: no loop-carried dependency.
+        for row in rest {
+            row.start = row.start.wrapping_add_signed(delta);
+            row.end = row.end.wrapping_add_signed(delta);
+        }
     }
 
     pub fn validate(&self) -> Result<(), InvariantError> {
@@ -191,7 +227,9 @@ impl Buffer {
         if index > self.data.len() {
             return None;
         }
-        self.rows.iter().position(|row| index <= row.end)
+        // Row ends strictly increase and the last one is `data.len()`, so a
+        // binary search finds the same row a linear scan would, in O(log n).
+        Some(self.rows.partition_point(|row| row.end < index))
     }
 
     /// The byte range of the word `*` would search for from `index`.
@@ -286,8 +324,14 @@ impl Buffer {
     pub fn insert_byte(&mut self, byte: u8) -> usize {
         self.cursor = self.cursor.min(self.data.len());
         self.data.insert(self.cursor, byte);
+        if byte == b'\n' {
+            self.calculate_rows();
+        } else {
+            // Typing is the hot path: shift the later rows instead of
+            // rescanning the whole file for newlines.
+            self.shift_rows_after(self.cursor, 1);
+        }
         self.cursor += 1;
-        self.calculate_rows();
         debug_assert_eq!(self.validate(), Ok(()));
         self.cursor
     }
@@ -297,34 +341,41 @@ impl Buffer {
         if self.cursor >= self.data.len() {
             return false;
         }
-        self.data.remove(self.cursor);
-        self.calculate_rows();
+        if self.data.remove(self.cursor) == b'\n' {
+            self.calculate_rows();
+        } else {
+            self.shift_rows_after(self.cursor, -1);
+        }
         debug_assert_eq!(self.validate(), Ok(()));
         true
     }
 
-    /// Copies a visual selection using Cano's inclusive clipboard endpoint.
-    /// At logical EOF the old spare byte was zero-filled, so a synthetic NUL
-    /// is retained for compatibility.
+    /// Copies the half-open range `start..end`.
+    ///
+    /// The C editor copied one byte more than it deleted (a synthetic NUL at
+    /// EOF), so `x` on `abcd` put `bc` in the clipboard.  What is copied is
+    /// now exactly what the range names, the same bytes a deletion of it
+    /// removes.
     pub fn copy_selection(&self, start: usize, end: usize) -> Option<Vec<u8>> {
         if start > end || end > self.data.len() {
             return None;
         }
-        let mut bytes = self.data.get(start..end)?.to_vec();
-        bytes.push(self.data.get(end).copied().unwrap_or(0));
-        Some(bytes)
+        Some(self.data[start..end].to_vec())
     }
 
-    /// Deletes `start..end`, but reports clipboard bytes from `start..=end`.
-    /// Reversed and out-of-bounds ranges are rejected instead of invoking the
-    /// legacy implementation's undefined memory behavior.
-    pub fn delete_selection(&mut self, start: usize, end: usize) -> Option<SelectionDeletion> {
-        let clipboard = self.copy_selection(start, end)?;
+    /// Deletes `start..end` and returns the bytes it took, which serve both
+    /// as the clipboard and as the undo data.  Reversed and out-of-bounds
+    /// ranges are rejected instead of invoking the legacy implementation's
+    /// undefined memory behavior.
+    pub fn delete_selection(&mut self, start: usize, end: usize) -> Option<Vec<u8>> {
+        if start > end || end > self.data.len() {
+            return None;
+        }
         self.cursor = start;
-        let undo = self.data.drain(start..end).collect();
+        let deleted = self.data.drain(start..end).collect();
         self.calculate_rows();
         debug_assert_eq!(self.validate(), Ok(()));
-        Some(SelectionDeletion { clipboard, undo })
+        Some(deleted)
     }
 
     /// Replaces `start..end` with `bytes`, returning what was taken out.
@@ -359,38 +410,74 @@ impl Buffer {
         true
     }
 
-    pub fn move_up(&mut self) {
+    /// `k`: the row above, at the character drawn in the same display
+    /// column, so a cursor after a tab or a wide character lands under the
+    /// same spot on screen rather than the same byte offset.  There is no
+    /// sticky column; each move rederives it from where the cursor is.
+    pub fn move_up(&mut self, tabstop: usize) {
         let Some(row_index) = self.cursor_row() else {
             return;
         };
         if row_index == 0 {
             return;
         }
-        let column = self.cursor - self.rows[row_index].start;
-        let target = self.rows[row_index - 1];
-        self.cursor = (target.start + column).min(target.end);
-        debug_assert_eq!(self.cursor_row(), Some(row_index - 1));
+        self.move_to_row(row_index, row_index - 1, tabstop);
     }
 
-    pub fn move_down(&mut self) {
+    /// `j`, the same way [`Buffer::move_up`] goes up.
+    pub fn move_down(&mut self, tabstop: usize) {
         let Some(row_index) = self.cursor_row() else {
             return;
         };
         if row_index + 1 >= self.rows.len() {
             return;
         }
-        let column = self.cursor - self.rows[row_index].start;
-        let target = self.rows[row_index + 1];
-        self.cursor = (target.start + column).min(target.end);
-        debug_assert_eq!(self.cursor_row(), Some(row_index + 1));
+        self.move_to_row(row_index, row_index + 1, tabstop);
     }
 
+    /// Moves from row `from` to row `to`, keeping the display column.
+    fn move_to_row(&mut self, from: usize, to: usize, tabstop: usize) {
+        let (here, target) = (self.rows[from], self.rows[to]);
+        let column = display::column_of(&self.data, here.start, here.end, self.cursor, tabstop);
+        self.cursor =
+            display::byte_at_column(&self.data, target.start, target.end, column, tabstop);
+        // Post: the cursor is on the adjacent row, at a character start.
+        debug_assert_eq!(self.cursor_row(), Some(to));
+        debug_assert!(display::is_char_boundary(&self.data, self.cursor));
+    }
+
+    /// `h`: back one whole character, so a multi-byte one is never split.
     pub fn move_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        self.cursor = display::previous_char(&self.data, self.cursor);
     }
 
+    /// `l`: forward one whole character, marks included.
     pub fn move_right(&mut self) {
-        self.cursor = self.cursor.saturating_add(1).min(self.data.len());
+        self.cursor = display::next_char(&self.data, self.cursor);
+    }
+
+    /// Insert-mode Backspace's step: back one code point rather than one
+    /// whole character.  Typed text arrives a byte at a time, so a mark is
+    /// inserted after the letter it decorates and is taken back alone, and
+    /// the letter -- which may predate the insertion -- stays.
+    pub fn previous_code_point(&self) -> usize {
+        match self.cursor.min(self.data.len()).checked_sub(1) {
+            Some(before) => display::unit_start(&self.data, before),
+            None => 0,
+        }
+    }
+
+    /// Moves forward to the nearest character start, for the legacy word
+    /// motions, which step bytes and can stop inside a character.
+    fn snap_forward(&mut self) {
+        if !display::is_char_boundary(&self.data, self.cursor) {
+            self.cursor = display::next_char(&self.data, self.cursor);
+        }
+    }
+
+    /// Moves back to the start of the character the cursor is inside.
+    fn snap_back(&mut self) {
+        self.cursor = display::char_start(&self.data, self.cursor);
     }
 
     pub fn move_line_start(&mut self) {
@@ -435,6 +522,9 @@ impl Buffer {
         {
             self.cursor += 1;
         }
+        // Bytes past ASCII are separators to these rules, so a step can stop
+        // inside a character; the next one is the nearest place to rest.
+        self.snap_forward();
     }
 
     /// Legacy `w`, whose transition rules intentionally differ from Vim.
@@ -451,6 +541,7 @@ impl Buffer {
         if self.cursor < self.data.len() {
             self.cursor += 1;
         }
+        self.snap_forward();
     }
 
     /// Legacy `b`, made bounds-safe while retaining the characterized rules.
@@ -474,6 +565,7 @@ impl Buffer {
         if self.cursor == 1 {
             self.cursor = 0;
         }
+        self.snap_back();
     }
 
     /// Finds the next match without changing the buffer.  The current logical
@@ -494,16 +586,20 @@ impl Buffer {
 
     /// Searches, replaces only when the search moved, and leaves the cursor
     /// immediately after the inserted bytes.
-    pub fn replace_first_after_cursor(&mut self, old: &[u8], new: &[u8]) -> bool {
+    ///
+    /// Returns where the replacement starts, so the caller can record the
+    /// edit for undo: the replaced bytes are `old` and the inserted ones span
+    /// `new.len()` from there.
+    pub fn replace_first_after_cursor(&mut self, old: &[u8], new: &[u8]) -> Option<usize> {
         let position = self.search_wrapped(old);
         if position == self.cursor {
-            return false;
+            return None;
         }
         // `search_wrapped` only stops where `old` matches, so the range is
         // always inside the buffer.
         self.replace_region(position, position + old.len(), new);
         self.cursor = position + new.len();
-        true
+        Some(position)
     }
 
     pub fn matching_brace(byte: u8) -> Option<u8> {
@@ -758,30 +854,28 @@ mod tests {
     }
 
     #[test]
-    fn selection_copy_is_inclusive_but_deletion_and_undo_are_half_open() {
+    fn selection_copy_and_deletion_take_exactly_the_half_open_range() {
         let mut buffer = Buffer::new(b"ab\ncd".to_vec());
-        let deletion = buffer.delete_selection(0, 3).unwrap();
-        assert_eq!(deletion.clipboard, b"ab\nc");
-        assert_eq!(deletion.undo, b"ab\n");
+        assert_eq!(buffer.copy_selection(0, 3), Some(b"ab\n".to_vec()));
+        assert_eq!(buffer.delete_selection(0, 3), Some(b"ab\n".to_vec()));
         assert_eq!(buffer.data, b"cd");
         assert_eq!(buffer.cursor, 0);
 
         let mut one = Buffer::new(b"xyz".to_vec());
-        let deletion = one.delete_selection(1, 1).unwrap();
-        assert_eq!(deletion.clipboard, b"y");
-        assert!(deletion.undo.is_empty());
+        assert_eq!(one.delete_selection(1, 1), Some(Vec::new()));
         assert_eq!(one.data, b"xyz");
     }
 
     #[test]
-    fn selection_at_eof_copies_the_legacy_spare_nul() {
+    fn selection_at_eof_copies_no_spare_nul() {
+        // The C editor appended a zero byte for the slot past EOF.
         let mut buffer = Buffer::new(b"abc".to_vec());
-        let deletion = buffer.delete_selection(1, 3).unwrap();
-        assert_eq!(deletion.clipboard, b"bc\0");
-        assert_eq!(deletion.undo, b"bc");
+        assert_eq!(buffer.copy_selection(1, 3), Some(b"bc".to_vec()));
+        assert_eq!(buffer.delete_selection(1, 3), Some(b"bc".to_vec()));
         assert_eq!(buffer.data, b"a");
         assert!(buffer.delete_selection(1, 2).is_none());
         assert!(buffer.delete_selection(2, 1).is_none());
+        assert!(buffer.copy_selection(0, 2).is_none());
     }
 
     #[test]
@@ -797,15 +891,15 @@ mod tests {
     fn vertical_motion_rederives_column_and_has_no_sticky_column() {
         let mut buffer = Buffer::new(b"abcd\nx\nwxyz".to_vec());
         buffer.cursor = 3;
-        buffer.move_down();
+        buffer.move_down(4);
         assert_eq!(buffer.cursor, 6); // newline ending the short row
-        buffer.move_down();
+        buffer.move_down(4);
         assert_eq!(buffer.cursor, 8); // column one, not the original column three
-        buffer.move_up();
+        buffer.move_up(4);
         assert_eq!(buffer.cursor, 6);
-        buffer.move_up();
+        buffer.move_up(4);
         assert_eq!(buffer.cursor, 1);
-        buffer.move_up();
+        buffer.move_up(4);
         assert_eq!(buffer.cursor, 1);
     }
 
@@ -874,17 +968,20 @@ mod tests {
     #[test]
     fn replacement_requires_movement_and_places_cursor_after_new_bytes() {
         let mut shorter = Buffer::new(b"xx old yy old".to_vec());
-        assert!(shorter.replace_first_after_cursor(b"old", b"Q"));
+        assert_eq!(shorter.replace_first_after_cursor(b"old", b"Q"), Some(3));
         assert_eq!(shorter.data, b"xx Q yy old");
         assert_eq!(shorter.cursor, 4);
 
         let mut longer = Buffer::new(b"old xx old".to_vec());
-        assert!(longer.replace_first_after_cursor(b"old", b"long"));
+        assert_eq!(longer.replace_first_after_cursor(b"old", b"long"), Some(7));
         assert_eq!(longer.data, b"old xx long");
         assert_eq!(longer.cursor, 11);
 
         let mut only_current = Buffer::new(b"old".to_vec());
-        assert!(!only_current.replace_first_after_cursor(b"old", b"new"));
+        assert_eq!(
+            only_current.replace_first_after_cursor(b"old", b"new"),
+            None
+        );
         assert_eq!(only_current.data, b"old");
     }
 
@@ -926,5 +1023,55 @@ mod tests {
             buffer.validate(),
             Err(InvariantError::RowsOutOfDate { .. })
         ));
+    }
+
+    #[test]
+    fn typing_shifts_rows_like_a_full_rescan_and_lookups_match_a_linear_scan() {
+        let mut buffer = Buffer::new(b"ab\n\ncd\nef".to_vec());
+        for (cursor, byte) in [(0, b'x'), (3, b'y'), (4, b'\n'), (6, b'z'), (12, b'w')] {
+            buffer.cursor = cursor;
+            buffer.insert_byte(byte);
+            assert_eq!(buffer.validate(), Ok(()), "insert {byte} at {cursor}");
+        }
+        for cursor in [0, 2, 3, 5, 9] {
+            buffer.cursor = cursor;
+            assert!(buffer.delete_byte());
+            assert_eq!(buffer.validate(), Ok(()), "delete at {cursor}");
+        }
+        for index in 0..=buffer.data.len() {
+            let linear = buffer.rows.iter().position(|row| index <= row.end);
+            assert_eq!(buffer.row_for_index(index), linear, "index {index}");
+        }
+        assert_eq!(buffer.row_for_index(buffer.data.len() + 1), None);
+    }
+
+    #[test]
+    fn rows_match_a_byte_loop_on_every_length_around_the_block_edges() {
+        let mut seed = 1_u64;
+        for len in (0..=3 * scan::BLOCK + 1).chain([1000, 4096 + 17]) {
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    [b'\n', 0x0b, 0x8a, b'x'][(seed >> 33) as usize % 4]
+                })
+                .collect();
+            let mut expected = Vec::new();
+            let mut start = 0;
+            for (index, byte) in data.iter().enumerate() {
+                if *byte == b'\n' {
+                    expected.push(Row { start, end: index });
+                    start = index + 1;
+                }
+            }
+            expected.push(Row {
+                start,
+                end: data.len(),
+            });
+            let mut rows = vec![Row { start: 9, end: 9 }];
+            rows_into(&data, &mut rows);
+            assert_eq!(rows, expected, "len {len}");
+        }
     }
 }

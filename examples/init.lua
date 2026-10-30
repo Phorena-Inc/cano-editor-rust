@@ -9,9 +9,11 @@ local cano = setup({
     mouse = true,        -- Let Cano handle the mouse; false gives it back.
     backup = true,       -- Copy what each save overwrites into .backups/.
     list = false,        -- Show invisible characters (:set listchars? for the set).
+    wrap = true,         -- Wrap long lines at the screen edge, as vim does.
     indent = false,      -- false uses tabs; true uses one-space indentation.
     auto_indent = false, -- Retained for compatibility; currently a no-op.
-    undo_size = false,   -- Retained for compatibility; currently a no-op.
+    undo_size = false,   -- false: unlimited undo (true would keep ONE step;
+                         -- use cano.command("set undo_size=100") for a number).
 })
 
 -- The value returned by setup exposes Cano runtime functions.
@@ -22,7 +24,7 @@ local cano = setup({
 -- splits its arguments on spaces, and the one in `tab:>\ ` has to be escaped
 -- to stay part of the value, exactly as it would in a vimrc.
 --
--- cano.command([[set listchars=tab:> ,trail:.,eol:$]])
+-- cano.command([[set listchars=tab:>\ ,trail:.,eol:$]])
 -- cano.command("imap ;; <Esc>")
 -- cano.command("set cursorline nomouse")
 -- cano.command("set noautoformat_retab")   -- a Makefile needs its tabs

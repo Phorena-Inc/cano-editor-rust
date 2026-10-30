@@ -1,4 +1,5 @@
 use crate::buffer::{Buffer, Nesting, is_keyword};
+use crate::display::{self, DEFAULT_TABSTOP};
 use crate::history::{History, HistoryError, UndoRecord};
 use crate::textobject::{self, Scope};
 
@@ -85,10 +86,17 @@ pub struct Editor {
     pub clipboard: Vec<u8>,
     pub visual: VisualSelection,
     pub indent: usize,
+    /// Vim's `tabstop`: the columns a tab is drawn across.  The editor needs
+    /// it as well as the renderer, because `j` and `k` keep the display
+    /// column rather than the byte offset.
+    pub tabstop: usize,
     /// Set by the `i`/`a` of an operator-pending `diw`, and spent by the key
     /// that names the object.  It is separate from `leader` because the two
     /// are independent: every operator takes every object.
     object: Option<Scope>,
+    /// The count typed in front of a pending operator, which multiplies the
+    /// count of its motion: `2d3w` deletes six words.  One when none was.
+    operator_count: usize,
     active_insert: UndoRecord,
 }
 
@@ -102,7 +110,9 @@ impl Editor {
             clipboard: Vec::new(),
             visual: VisualSelection::default(),
             indent: 0,
+            tabstop: DEFAULT_TABSTOP,
             object: None,
+            operator_count: 1,
             active_insert: UndoRecord::default(),
         }
     }
@@ -115,6 +125,7 @@ impl Editor {
     pub fn cancel_pending(&mut self) {
         self.leader = Leader::None;
         self.object = None;
+        self.operator_count = 1;
     }
 
     /// Whether an operator is still waiting for the keys that complete it.
@@ -139,11 +150,9 @@ impl Editor {
                     self.buffer.cursor += 1;
                 }
             }
-            InsertEntry::AfterCursor => {
-                if self.buffer.cursor < self.buffer.data.len() {
-                    self.buffer.cursor += 1;
-                }
-            }
+            // After the whole character under the cursor, not after its
+            // first byte.
+            InsertEntry::AfterCursor => self.buffer.move_right(),
             InsertEntry::LineEnd => self.buffer.move_line_end(),
         }
         self.mode = Mode::Insert;
@@ -171,6 +180,9 @@ impl Editor {
         }
         self.active_insert.end = self.buffer.cursor;
         self.push_active_insert();
+        // Whatever step the insertion was part of (the deletion of a `c`,
+        // the line an `o` opened) ends with it.
+        self.history.end_group();
         self.mode = Mode::Normal;
         self.begin_insert_record();
         true
@@ -202,32 +214,39 @@ impl Editor {
         true
     }
 
+    /// Insert-mode Backspace and Ctrl-H: takes back one code point, all of
+    /// its bytes at once (see [`Buffer::previous_code_point`]).
     pub fn insert_backspace(&mut self) -> bool {
         if self.mode != Mode::Insert || self.buffer.cursor == 0 {
             return false;
         }
-        if self.buffer.cursor > self.active_insert.start {
-            // Removing a byte inserted by the active record: the record's
-            // cursor-derived endpoint shrinks with the deletion.
-            self.buffer.move_left();
-            return self.buffer.delete_byte();
+        let end = self.buffer.cursor;
+        let start = self.buffer.previous_code_point();
+        if end > self.active_insert.start {
+            // Removing bytes inserted by the active record: the record's
+            // cursor-derived endpoint shrinks with the deletion.  A sequence
+            // that began before the record (a lead byte that was already
+            // there, completed by typing) loses only the typed part, so the
+            // record never reaches back over text it did not insert.
+            let start = start.max(self.active_insert.start);
+            return self
+                .buffer
+                .delete_selection(start, end)
+                .is_some_and(|deleted| !deleted.is_empty());
         }
-        // Deleting a byte that predates the active record.  It needs its own
+        // Deleting text that predates the active record.  It needs its own
         // record, otherwise the pending record inverts (start > end) and every
         // older record applies at stale offsets.
-        self.buffer.move_left();
-        let deleted = self.buffer.data.get(self.buffer.cursor).copied();
-        let removed = self.buffer.delete_byte();
-        if removed {
-            if let Some(byte) = deleted {
-                self.history.push_undo(UndoRecord::insert_chars_exact(
-                    self.buffer.cursor,
-                    vec![byte],
-                ));
-            }
-            self.begin_insert_record();
+        let Some(deleted) = self.buffer.delete_selection(start, end) else {
+            return false;
+        };
+        if deleted.is_empty() {
+            return false;
         }
-        removed
+        self.history
+            .push_undo(UndoRecord::insert_chars(start, deleted));
+        self.begin_insert_record();
+        true
     }
 
     pub fn insert_tab(&mut self) -> bool {
@@ -272,10 +291,8 @@ impl Editor {
             let target = self.buffer.cursor;
             self.buffer.insert_byte(b'\n');
             self.add_indent(depth.saturating_sub(1));
-            self.history.push_undo(UndoRecord::delete_multiple_exact(
-                target,
-                self.buffer.cursor,
-            ));
+            self.history
+                .push_undo(UndoRecord::delete_multiple(target, self.buffer.cursor));
             self.buffer.cursor = target;
             self.begin_insert_record();
         }
@@ -297,6 +314,9 @@ impl Editor {
         }
         self.active_insert.end = self.buffer.cursor;
         self.push_active_insert();
+        // Vim starts a new undo step when the cursor moves in Insert mode, so
+        // a change is one step only up to the first move.
+        self.history.end_group();
         self.buffer.cursor = at;
         self.begin_insert_record();
     }
@@ -307,18 +327,22 @@ impl Editor {
         }
         self.active_insert.end = self.buffer.cursor;
         self.push_active_insert();
+        self.history.end_group();
         match direction {
             MoveDirection::Left => self.buffer.move_left(),
             MoveDirection::Right => self.buffer.move_right(),
-            MoveDirection::Up => self.buffer.move_up(),
-            MoveDirection::Down => self.buffer.move_down(),
+            MoveDirection::Up => self.buffer.move_up(self.tabstop),
+            MoveDirection::Down => self.buffer.move_down(self.tabstop),
         }
         self.begin_insert_record();
         true
     }
 
+    /// `o` and `O`.  The opened line and what is typed on it are one undo
+    /// step, the way vim records them.
     pub fn open_line(&mut self, below: bool) {
         let row = self.buffer.rows[self.buffer.cursor_row().unwrap_or(0)];
+        self.history.begin_group();
         self.mode = Mode::Insert;
         if below {
             self.buffer.cursor = row.end;
@@ -336,7 +360,7 @@ impl Editor {
             self.buffer.insert_byte(b'\n');
             self.buffer.cursor = row.start;
             self.add_indent(depth);
-            self.history.push_undo(UndoRecord::delete_multiple_exact(
+            self.history.push_undo(UndoRecord::delete_multiple(
                 row.start,
                 self.buffer.cursor.saturating_add(1),
             ));
@@ -346,24 +370,99 @@ impl Editor {
 
     pub fn open_line_normal(&mut self) {
         self.open_line(true);
+        self.history.end_group();
         self.mode = Mode::Normal;
         self.active_insert = UndoRecord::default();
     }
 
-    pub fn replace_next(&mut self, byte: u8) -> bool {
-        let Some(slot) = self.buffer.data.get_mut(self.buffer.cursor) else {
+    /// Vim's `r{char}` without a count: the whole character under the
+    /// cursor, marks and all, becomes `text` -- one character's bytes, or a
+    /// newline.
+    pub fn replace_next(&mut self, text: &[u8]) -> bool {
+        let start = self.buffer.cursor;
+        if start >= self.buffer.data.len() || text.is_empty() {
+            return false;
+        }
+        let end = display::char_end(&self.buffer.data, start);
+        // A byte for a byte keeps the compact record the legacy `r` always
+        // left; anything wider rewrites the character as a region.
+        if let ([byte], 1) = (text, end - start) {
+            let displaced = std::mem::replace(&mut self.buffer.data[start], *byte);
+            // Either the displaced or the written byte may be a newline, so
+            // the row table must be rederived to keep the buffer invariant.
+            self.buffer.calculate_rows();
+            self.history
+                .push_undo(UndoRecord::replace_char(start, displaced));
+            return true;
+        }
+        let Some(original) = self.buffer.replace_region(start, end, text) else {
             return false;
         };
-        let displaced = std::mem::replace(slot, byte);
-        // Either the displaced or the written byte may be a newline, so the
-        // row table must be rederived to keep the buffer invariant.
-        self.buffer.calculate_rows();
+        self.history.push_undo(UndoRecord::replace_region(
+            start,
+            start + text.len(),
+            original,
+        ));
+        self.buffer.cursor = start;
+        true
+    }
+
+    /// Vim's `{count}r{char}`: replaces `count` characters from the cursor
+    /// with `text`, one character's bytes.
+    ///
+    /// A count that reaches past the end of the line fails without changing
+    /// anything, as it does in vim, and a counted `r<CR>` puts a single line
+    /// break in place of all of them.  An uncounted `r` keeps Cano's rule of
+    /// replacing whatever character the cursor is on.  The cursor rests on
+    /// the last character written, and the whole replacement is one undo
+    /// step.
+    pub fn replace_chars(&mut self, text: &[u8], count: usize) -> bool {
+        if count <= 1 {
+            return self.replace_next(text);
+        }
+        let start = self.buffer.cursor;
+        let row = self.buffer.rows[self.buffer.cursor_row().unwrap_or(0)];
+        let mut end = start;
+        for _ in 0..count {
+            if end >= row.end {
+                return false;
+            }
+            end = display::char_end(&self.buffer.data, end);
+        }
+        let newline = text == b"\n";
+        let text = if newline {
+            vec![b'\n']
+        } else {
+            text.repeat(count)
+        };
+        let Some(original) = self.buffer.replace_region(start, end, &text) else {
+            return false;
+        };
+        let new_end = start + text.len();
         self.history
-            .push_undo(UndoRecord::replace_char(self.buffer.cursor, displaced));
+            .push_undo(UndoRecord::replace_region(start, new_end, original));
+        self.buffer.cursor = if newline {
+            new_end
+        } else {
+            display::char_start(&self.buffer.data, new_end - 1)
+        };
         true
     }
 
     pub fn normal_key(&mut self, key: u8) -> bool {
+        self.normal(key, None)
+    }
+
+    /// `key` with a count typed in front of it.
+    ///
+    /// The count of an operator and the count of its motion multiply, so
+    /// `3dw`, `d3w` and `3d` followed by `w` are all the same command; a
+    /// doubled operator (`3dd`, `3yy`, `3cc`) takes that many lines.
+    pub fn normal_counted(&mut self, key: u8, count: usize) -> bool {
+        self.normal(key, Some(count.max(1)))
+    }
+
+    fn normal(&mut self, key: u8, count: Option<usize>) -> bool {
         if self.mode != Mode::Normal {
             return false;
         }
@@ -372,12 +471,12 @@ impl Editor {
         // `i` and open Insert mode in the middle of a delete.
         if let Some(scope) = self.object.take() {
             let leader = self.leader;
-            self.leader = Leader::None;
+            let total = self.operator_count.saturating_mul(count.unwrap_or(1));
+            self.cancel_pending();
             if !leader.is_operator() {
                 return false;
             }
-            let found = textobject::range(&self.buffer, self.buffer.cursor, scope, key);
-            if let Some((start, end)) = found {
+            if let Some((start, end)) = self.object_range(scope, key, total) {
                 self.apply_operator(leader, start, end);
             }
             return true;
@@ -391,6 +490,7 @@ impl Editor {
         };
         if self.leader == Leader::None && operator.is_operator() {
             self.leader = operator;
+            self.operator_count = count.unwrap_or(1);
             return true;
         }
 
@@ -400,6 +500,7 @@ impl Editor {
             } else {
                 Scope::Around
             });
+            self.operator_count = self.operator_count.saturating_mul(count.unwrap_or(1));
             return true;
         }
 
@@ -407,19 +508,36 @@ impl Editor {
             && matches!(key, b'0' | b'$' | b'w' | b'b' | b'e' | b'g' | b'G')
         {
             let leader = self.leader;
-            self.leader = Leader::None;
-            if let Some((start, end)) = self.motion_range(leader, key) {
+            // An uncounted `g`/`G` is the whole way to the first or last
+            // line, and a counted one goes to that line, so whether there
+            // was a count at all matters, not just its value.
+            let total = match count {
+                Some(count) => Some(count.saturating_mul(self.operator_count)),
+                None => (self.operator_count > 1).then_some(self.operator_count),
+            };
+            self.cancel_pending();
+            if let Some((start, end)) = self.motion_range(leader, key, total) {
                 self.apply_operator(leader, start, end);
             }
             return true;
         }
 
+        // A doubled operator works on whole lines, as many as were counted.
+        if operator.is_operator() && operator == self.leader {
+            let rows = self.operator_count.saturating_mul(count.unwrap_or(1));
+            self.cancel_pending();
+            match operator {
+                Leader::Delete => self.delete_rows(rows),
+                Leader::Yank => self.yank_rows(rows),
+                _ => self.change_rows(rows),
+            }
+            return true;
+        }
+
+        let repeat = count.unwrap_or(1);
         match key {
-            b'x' => self.delete_character(),
-            b'd' if self.leader == Leader::Delete => self.delete_current_row(),
-            b'y' if self.leader == Leader::Yank => self.yank_current_row(),
-            b'c' if self.leader == Leader::Change => self.change_current_row(),
-            b'p' if !self.clipboard.is_empty() => self.paste(),
+            b'x' => self.delete_characters(repeat),
+            b'p' if !self.clipboard.is_empty() => self.paste(repeat),
             b'i' => self.enter_insert(InsertEntry::Cursor),
             b'I' => self.enter_insert(InsertEntry::FirstNonBlank),
             b'a' => self.enter_insert(InsertEntry::AfterCursor),
@@ -429,95 +547,145 @@ impl Editor {
             b'v' => self.start_visual(VisualKind::Charwise),
             b'V' => self.start_visual(VisualKind::Linewise),
             _ => {
-                if !self.motion(key) {
-                    self.leader = Leader::None;
+                let mut moved = false;
+                for _ in 0..repeat {
+                    moved |= self.motion(key);
+                }
+                if !moved {
+                    self.cancel_pending();
                     return false;
                 }
             }
         }
-        self.leader = Leader::None;
+        self.cancel_pending();
         true
     }
 
-    fn delete_character(&mut self) {
+    /// `x`, with vim's count: that many characters, stopping at the end of
+    /// the line, as one deletion and one undo step.
+    ///
+    /// The clipboard gets exactly what was deleted.  A bare `x` still takes
+    /// the byte under the cursor whatever it is, newline included, as Cano
+    /// always has; at EOF there is nothing to take, and the clipboard is left
+    /// alone rather than emptied.
+    fn delete_characters(&mut self, count: usize) {
         let start = self.buffer.cursor;
-        if let Some(deleted) = self.buffer.data.get(start).copied() {
-            // The two-byte clipboard (with a synthetic NUL past EOF) is
-            // characterized legacy behavior; a no-op `x` at EOF must not
-            // clobber the clipboard, so it is only captured on deletion.
-            self.clipboard = self
-                .buffer
-                .copy_selection(start, start + 1)
-                .unwrap_or_default();
-            self.buffer.delete_byte();
-            self.history
-                .push_undo(UndoRecord::insert_chars_exact(start, vec![deleted]));
+        if start >= self.buffer.data.len() {
+            return;
         }
+        let row_end = self.buffer.rows[self.buffer.cursor_row().unwrap_or(0)].end;
+        // The first character goes even when it is the newline; the rest
+        // stop at the end of the line.
+        let mut end = display::char_end(&self.buffer.data, start);
+        for _ in 1..count.max(1) {
+            if end >= row_end {
+                break;
+            }
+            end = display::char_end(&self.buffer.data, end).min(row_end);
+        }
+        self.cut(start, end);
     }
 
-    fn paste(&mut self) {
-        if self.clipboard.first() == Some(&b'\n') {
+    /// `p`, putting the clipboard `count` times as one insertion.
+    fn paste(&mut self, count: usize) {
+        let text = self.clipboard.repeat(count.max(1));
+        let linewise = text.first() == Some(&b'\n');
+        if linewise {
             self.buffer.move_line_end();
         }
         let start = self.buffer.cursor;
-        let end = start.saturating_add(self.clipboard.len());
-        if self.buffer.insert_selection(start, &self.clipboard) {
+        let end = start.saturating_add(text.len());
+        if self.buffer.insert_selection(start, &text) {
             self.history
-                .push_undo(UndoRecord::delete_multiple_exact(start, end));
+                .push_undo(UndoRecord::delete_multiple(start, end));
         }
-        if self.clipboard.first() == Some(&b'\n') && self.buffer.cursor < self.buffer.data.len() {
+        if linewise && self.buffer.cursor < self.buffer.data.len() {
             self.buffer.cursor += 1;
         }
     }
 
-    fn yank_current_row(&mut self) {
-        let row = self.buffer.rows[self.buffer.cursor_row().unwrap_or(0)];
-        // Every row after the first starts after the newline that ends the
-        // one before it; the first gets one supplied.  Either way the
-        // clipboard leads with the `\n` that makes `p` paste linewise.
-        self.clipboard = [&b"\n"[..], &self.buffer.data[row.start..row.end]].concat();
-    }
-
-    fn delete_current_row(&mut self) {
-        let index = self.buffer.cursor_row().unwrap_or(0);
-        let row = self.buffer.rows[index];
-        let column = self.buffer.cursor.saturating_sub(row.start);
-        let (start, end) = if index == 0 {
-            (
-                row.start,
-                if self.buffer.rows.len() > 1 {
-                    row.end + 1
-                } else {
-                    row.end
-                },
-            )
-        } else {
-            (row.start - 1, row.end)
-        };
-        self.cut(start, end);
-        let target_index = index.min(self.buffer.rows.len().saturating_sub(1));
-        let target = self.buffer.rows[target_index];
-        self.buffer.cursor = (target.start + column).min(target.end);
-    }
-
-    pub fn delete_rows(&mut self, count: usize) {
+    /// The `count` rows from the cursor's, clipped to the end of the buffer.
+    fn counted_rows(&self, count: usize) -> (usize, usize) {
         let first = self.buffer.cursor_row().unwrap_or(0);
-        let available = self.buffer.rows.len().saturating_sub(first);
-        for _ in 0..count.max(1).min(available) {
-            self.delete_current_row();
+        let last = first
+            .saturating_add(count.max(1) - 1)
+            .min(self.buffer.rows.len() - 1);
+        (first, last)
+    }
+
+    /// The clipboard form of rows `first..=last`: their text behind the `\n`
+    /// that makes `p` put it on lines of its own.
+    fn linewise_text(&self, first: usize, last: usize) -> Vec<u8> {
+        let (start, end) = (self.buffer.rows[first].start, self.buffer.rows[last].end);
+        [&b"\n"[..], &self.buffer.data[start..end]].concat()
+    }
+
+    /// The bytes deleting rows `first..=last` removes: the rows and one line
+    /// break, the one after them unless they run to the end of the buffer.
+    fn row_span(&self, first: usize, last: usize) -> (usize, usize) {
+        let start = self.buffer.rows[first].start;
+        let end = self.buffer.rows[last].end;
+        if last + 1 < self.buffer.rows.len() {
+            (start, end + 1)
+        } else {
+            (start.saturating_sub(usize::from(first > 0)), end)
         }
+    }
+
+    fn yank_rows(&mut self, count: usize) {
+        let (first, last) = self.counted_rows(count);
+        self.clipboard = self.linewise_text(first, last);
+    }
+
+    /// `dd`, or `{count}dd`: the rows go as one deletion and one undo step,
+    /// and all of them go into the clipboard, linewise.
+    pub fn delete_rows(&mut self, count: usize) {
+        let (first, last) = self.counted_rows(count);
+        let column = self
+            .buffer
+            .cursor
+            .saturating_sub(self.buffer.rows[first].start);
+        let text = self.linewise_text(first, last);
+        let (start, end) = self.row_span(first, last);
+        self.cut(start, end);
+        self.clipboard = text;
+        let target = self.buffer.rows[first.min(self.buffer.rows.len() - 1)];
+        self.buffer.cursor = (target.start + column).min(target.end);
         // An object armed by `d i` has to go too, or the key after a counted
         // `dd` is read as the object of an operator that has already run.
         self.cancel_pending();
     }
 
+    /// The range of a text object, extended over `count` of them for the
+    /// word objects.  Other objects ignore a count.
+    fn object_range(&self, scope: Scope, key: u8, count: usize) -> Option<(usize, usize)> {
+        let (start, mut end) = textobject::range(&self.buffer, self.buffer.cursor, scope, key)?;
+        if matches!(key, b'w' | b'W') {
+            for _ in 1..count {
+                match textobject::range(&self.buffer, end, scope, key) {
+                    Some((_, next)) if next > end => end = next,
+                    _ => break,
+                }
+            }
+        }
+        Some((start, end))
+    }
+
     /// The byte range a motion covers when an operator is waiting on it.
     ///
     /// The cursor is moved to work the range out, exactly as the bare motion
-    /// would move it; the caller's operator is what decides where it ends up.
-    fn motion_range(&mut self, leader: Leader, key: u8) -> Option<(usize, usize)> {
+    /// would move it `count` times; the caller's operator is what decides
+    /// where it ends up.  `count` is `None` when none was typed, which only
+    /// `g` and `G` tell apart from a count of one.
+    fn motion_range(
+        &mut self,
+        leader: Leader,
+        key: u8,
+        count: Option<usize>,
+    ) -> Option<(usize, usize)> {
         let original = self.buffer.cursor;
         let linewise_change = leader == Leader::Change;
+        let repeat = count.unwrap_or(1).max(1);
         // Vim's one irregular operator-motion pair: `cw` on a non-blank
         // changes to the end of the word the way `ce` does, instead of taking
         // the blanks after it and leaving what you type jammed against the
@@ -540,27 +708,49 @@ impl Editor {
                 (self.buffer.cursor, original)
             }
             b'$' => {
+                // `2$` runs to the end of the next line.
+                for _ in 1..repeat {
+                    self.buffer.move_down(self.tabstop);
+                }
                 self.buffer.move_line_end();
                 (original, self.buffer.cursor)
             }
             b'w' => {
-                self.buffer.move_word_next();
+                for _ in 0..repeat {
+                    self.buffer.move_word_next();
+                }
                 (original, self.buffer.cursor)
             }
             b'b' => {
-                self.buffer.move_word_back();
+                for _ in 0..repeat {
+                    self.buffer.move_word_back();
+                }
                 (self.buffer.cursor, original)
             }
             b'e' => {
-                // `e` rests on the last byte of the word; deletion includes it.
-                self.buffer.move_word_end();
+                // `e` rests on the last character of the word; deletion
+                // includes all of it.
+                for _ in 0..repeat {
+                    self.buffer.move_word_end();
+                }
                 (
                     original,
-                    self.buffer
-                        .cursor
-                        .saturating_add(1)
+                    display::char_end(&self.buffer.data, self.buffer.cursor)
                         .min(self.buffer.data.len()),
                 )
+            }
+            b'g' | b'G' if count.is_some() => {
+                // A counted `g`/`G` is linewise to that line, in whichever
+                // direction it lies.
+                let current = self.buffer.cursor_row().unwrap_or(0);
+                let target = repeat.min(self.buffer.rows.len()) - 1;
+                let (first, last) = (current.min(target), current.max(target));
+                self.buffer.cursor = self.buffer.rows[first].start;
+                if linewise_change {
+                    (self.buffer.rows[first].start, self.buffer.rows[last].end)
+                } else {
+                    self.row_span(first, last)
+                }
             }
             b'g' => {
                 // Linewise to the first row: consume the current row's newline
@@ -608,9 +798,8 @@ impl Editor {
     ///
     /// `d` and `c` share a deletion so the buffer edit and the undo record
     /// they leave are the same one; `c` then opens Insert mode where the text
-    /// used to be.  A yank takes the range exactly, without the spare byte
-    /// [`Buffer::copy_selection`] appends for the legacy clipboard, since a
-    /// motion's range is half-open and already ends where it should.
+    /// used to be, and the deletion and everything typed before Esc are one
+    /// undo step.
     fn apply_operator(&mut self, leader: Leader, start: usize, end: usize) {
         if start > end || end > self.buffer.data.len() {
             return;
@@ -620,38 +809,42 @@ impl Editor {
                 self.clipboard = self.buffer.data[start..end].to_vec();
                 self.buffer.cursor = start;
             }
-            Leader::Delete | Leader::Change => {
+            Leader::Delete => self.cut(start, end),
+            Leader::Change => {
+                self.history.begin_group();
                 self.cut(start, end);
-                if leader == Leader::Change {
-                    self.buffer.cursor = start.min(self.buffer.data.len());
-                    self.enter_insert(InsertEntry::Cursor);
-                }
+                self.buffer.cursor = start.min(self.buffer.data.len());
+                self.enter_insert(InsertEntry::Cursor);
             }
             Leader::None => {}
         }
     }
 
-    /// Deletes `start..end` into the clipboard, recorded with the legacy
-    /// `InsertChars` inverse every cut uses.
+    /// Deletes `start..end` into the clipboard, which gets exactly the bytes
+    /// deleted.  An empty range moves the cursor there and records nothing:
+    /// an undo step that changes nothing would only waste a press of `u`.
     fn cut(&mut self, start: usize, end: usize) {
-        if let Some(deleted) = self.buffer.delete_selection(start, end) {
-            self.clipboard = deleted.clipboard;
-            self.history
-                .push_undo(UndoRecord::insert_chars(start, deleted.undo));
-        }
-    }
-
-    /// `cc`: replaces the row's contents, keeping the row itself.
-    ///
-    /// Unlike `dd` this never takes the newline, because the whole point is to
-    /// leave a line to type on.  Vim re-indents here; Cano has no `autoindent`
-    /// to consult, so the line is left empty.
-    fn change_current_row(&mut self) {
-        let Some(index) = self.buffer.cursor_row() else {
+        let Some(deleted) = self.buffer.delete_selection(start, end) else {
             return;
         };
-        let row = self.buffer.rows[index];
-        self.apply_operator(Leader::Change, row.start, row.end);
+        if deleted.is_empty() {
+            return;
+        }
+        self.history
+            .push_undo(UndoRecord::insert_chars(start, deleted.clone()));
+        self.clipboard = deleted;
+    }
+
+    /// `cc`, or `{count}cc`: replaces the rows' contents with one line to
+    /// type on.
+    ///
+    /// Unlike `dd` this never takes the last newline, because the whole point
+    /// is to leave a line to type on.  Vim re-indents here; Cano has no
+    /// `autoindent` to consult, so the line is left empty.
+    fn change_rows(&mut self, count: usize) {
+        let (first, last) = self.counted_rows(count);
+        let (start, end) = (self.buffer.rows[first].start, self.buffer.rows[last].end);
+        self.apply_operator(Leader::Change, start, end);
     }
 
     pub fn start_visual(&mut self, kind: VisualKind) {
@@ -706,15 +899,20 @@ impl Editor {
     ///
     /// A row shorter than the rectangle contributes an empty range rather
     /// than reaching into the next line.
+    ///
+    /// Both edges widen to whole characters, so a column that falls inside a
+    /// multi-byte character takes all of it rather than splitting it.
     fn block_row_range(&self, row: usize, left: usize, right: usize) -> (usize, usize) {
         let bounds = self.buffer.rows[row];
-        let start = bounds.start.saturating_add(left).min(bounds.end);
-        let end = bounds
-            .start
-            .saturating_add(right)
-            .saturating_add(1)
-            .min(bounds.end);
-        (start, end)
+        let data = &self.buffer.data;
+        let start = display::char_start(data, bounds.start.saturating_add(left).min(bounds.end));
+        let last = bounds.start.saturating_add(right);
+        let end = if last < bounds.end {
+            display::char_end(data, display::char_start(data, last)).min(bounds.end)
+        } else {
+            bounds.end
+        };
+        (start, end.max(start))
     }
 
     fn visual_bounds(&self) -> (usize, usize) {
@@ -727,10 +925,22 @@ impl Editor {
             return false;
         }
         match key {
-            3 | 27 => {
-                self.mode = Mode::Normal;
-                self.visual = VisualSelection::default();
+            3 | 27 => self.leave_visual(),
+            // Pressing the key of the selection's own shape again leaves
+            // Visual mode; the other one reshapes the selection in place.
+            b'v' | b'V' => {
+                let kind = if key == b'v' {
+                    VisualKind::Charwise
+                } else {
+                    VisualKind::Linewise
+                };
+                if self.visual.kind == kind {
+                    self.leave_visual();
+                } else {
+                    self.set_visual_kind(kind);
+                }
             }
+            b'o' => self.swap_visual_ends(),
             b'd' | b'x' if self.visual.kind.is_blockwise() => {
                 self.delete_block();
                 self.mode = Mode::Normal;
@@ -739,37 +949,44 @@ impl Editor {
                 self.yank_block();
                 self.mode = Mode::Normal;
             }
+            b'd' | b'x' if self.visual.kind.is_linewise() => {
+                // Whole rows go, with a line break, the way `dd` takes them.
+                let (first, last) = self.selected_rows();
+                let text = self.linewise_text(first, last);
+                let (start, end) = self.row_span(first, last);
+                self.cut(start, end);
+                self.clipboard = text;
+                let landing = first.min(self.buffer.rows.len() - 1);
+                self.buffer.cursor = self.buffer.rows[landing].start;
+                self.mode = Mode::Normal;
+            }
             b'd' | b'x' => {
-                let (start, end) = self.visual_bounds();
-                // Linewise deletion removes whole rows, so it consumes the
-                // trailing newline (or the preceding one on the final row).
-                let (start, end) = if self.visual.kind.is_linewise() {
-                    if end < self.buffer.data.len() {
-                        (start, end + 1)
-                    } else {
-                        (start.saturating_sub(usize::from(start > 0)), end)
-                    }
-                } else {
-                    (start, end)
-                };
+                let (start, end) = self.charwise_span();
                 self.cut(start, end);
                 self.mode = Mode::Normal;
             }
             b'y' => {
-                let (start, end) = self.visual_bounds();
-                // A selection ending past EOF yanks only the legacy NUL.
-                self.clipboard = self
-                    .buffer
-                    .copy_selection(start, end)
-                    .unwrap_or_else(|| vec![0]);
-                self.buffer.cursor = start;
+                if self.visual.kind.is_linewise() {
+                    let (first, last) = self.selected_rows();
+                    self.clipboard = self.linewise_text(first, last);
+                    self.buffer.cursor = self.buffer.rows[first].start;
+                } else {
+                    let (start, end) = self.charwise_span();
+                    self.clipboard = self.buffer.data[start..end].to_vec();
+                    self.buffer.cursor = start;
+                }
                 self.mode = Mode::Normal;
             }
+            b'c' => self.change_selection(),
+            b'p' => self.put_over_selection(),
             b'>' | b'<' => {
                 let (first, last) = self.selected_rows();
+                // One undo step for the whole selection, as in vim.
+                self.history.begin_group();
                 for row in first..=last {
                     self.shift_row(row, key == b'>');
                 }
+                self.history.end_group();
                 self.mode = Mode::Normal;
             }
             _ => {
@@ -782,12 +999,199 @@ impl Editor {
         true
     }
 
+    fn leave_visual(&mut self) {
+        self.mode = Mode::Normal;
+        self.visual = VisualSelection::default();
+    }
+
+    /// Reshapes the selection without moving either end of it.
+    ///
+    /// A linewise selection keeps its row bounds in `start`, so becoming
+    /// charwise or blockwise puts the anchor back there first.
+    pub fn set_visual_kind(&mut self, kind: VisualKind) {
+        self.visual.kind = kind;
+        if !kind.is_linewise() {
+            self.visual.start = self.visual.anchor;
+        }
+        self.refresh_visual();
+    }
+
+    /// Vim's Visual `o`: the cursor goes to the other end of the selection,
+    /// and the end it left becomes the anchor.
+    fn swap_visual_ends(&mut self) {
+        let anchor = self.visual.anchor;
+        self.visual.anchor = self.buffer.cursor;
+        if !self.visual.kind.is_linewise() {
+            self.visual.start = self.buffer.cursor;
+        }
+        self.buffer.cursor = anchor.min(self.buffer.data.len());
+    }
+
+    /// The bytes a charwise selection covers, as a half-open range.  Both
+    /// ends are inclusive in vim, so the character under the cursor is part
+    /// of it, every byte of it.
+    fn charwise_span(&self) -> (usize, usize) {
+        let (start, end) = self.visual_bounds();
+        let data = &self.buffer.data;
+        let len = data.len();
+        let end = if end < len {
+            display::char_end(data, display::char_start(data, end))
+        } else {
+            len
+        };
+        (start.min(len), end.min(len))
+    }
+
+    /// Visual `c`: the selection goes and Insert mode opens where it was.
+    ///
+    /// A linewise selection leaves one empty line to type on, as `cc` does,
+    /// and a block is simply deleted with the cursor at its top-left corner.
+    /// The deletion and what is typed after it are one undo step.
+    fn change_selection(&mut self) {
+        self.history.begin_group();
+        match self.visual.kind {
+            VisualKind::Blockwise => self.delete_block(),
+            VisualKind::Linewise => {
+                let (first, last) = self.selected_rows();
+                let text = self.linewise_text(first, last);
+                let (start, end) = (self.buffer.rows[first].start, self.buffer.rows[last].end);
+                self.cut(start, end);
+                self.clipboard = text;
+                self.buffer.cursor = start;
+            }
+            VisualKind::Charwise => {
+                let (start, end) = self.charwise_span();
+                self.cut(start, end);
+                self.buffer.cursor = start;
+            }
+        }
+        self.visual = VisualSelection::default();
+        self.enter_insert(InsertEntry::Cursor);
+    }
+
+    /// Visual `p`: the selection is replaced by the clipboard, and what it
+    /// held goes into the clipboard, which is what vim's unnamed register
+    /// does.  It is one undo step.
+    ///
+    /// Linewise text put over a charwise selection goes on lines of its own,
+    /// and charwise text put over whole lines becomes their contents.
+    fn put_over_selection(&mut self) {
+        let register = self.clipboard.clone();
+        let register_linewise = register.first() == Some(&b'\n');
+        if self.visual.kind.is_blockwise() {
+            self.history.begin_group();
+            self.delete_block();
+            let at = self.buffer.cursor;
+            if !register.is_empty() && self.buffer.insert_selection(at, &register) {
+                self.history
+                    .push_undo(UndoRecord::delete_multiple(at, at + register.len()));
+            }
+            self.history.end_group();
+            self.leave_visual();
+            return;
+        }
+        let (start, end, replaced, text) = if self.visual.kind.is_linewise() {
+            let (first, last) = self.selected_rows();
+            let text = if register_linewise {
+                register[1..].to_vec()
+            } else {
+                register
+            };
+            let (start, end) = (self.buffer.rows[first].start, self.buffer.rows[last].end);
+            (start, end, self.linewise_text(first, last), text)
+        } else {
+            let (start, end) = self.charwise_span();
+            let text = if register_linewise {
+                [&register[..], b"\n"].concat()
+            } else {
+                register
+            };
+            (start, end, self.buffer.data[start..end].to_vec(), text)
+        };
+        if let Some(original) = self.buffer.replace_region(start, end, &text) {
+            let new_end = start + text.len();
+            self.history
+                .push_undo(UndoRecord::replace_region(start, new_end, original));
+            self.clipboard = replaced;
+            // On the first byte of a line put on its own, otherwise on the
+            // last byte put, which is where vim leaves it.
+            self.buffer.cursor = if self.visual.kind.is_linewise() {
+                start
+            } else if register_linewise {
+                (start + 1).min(self.buffer.data.len())
+            } else {
+                new_end.saturating_sub(1).max(start)
+            };
+        }
+        self.leave_visual();
+    }
+
+    /// Visual `r{char}`: every selected character but the line breaks
+    /// becomes `replacement` -- one character's bytes -- as one undo step,
+    /// and the cursor goes to the selection's start.
+    pub fn visual_replace(&mut self, replacement: &[u8]) -> bool {
+        if self.mode != Mode::Visual {
+            return false;
+        }
+        let (first, last) = self.selected_rows();
+        let region_start = self.buffer.rows[first].start;
+        let region_end = self.buffer.rows[last].end;
+        let block = self.block_bounds();
+        let (span_start, span_end) = self.charwise_span();
+        let data = &self.buffer.data;
+        let mut text = Vec::with_capacity(region_end - region_start);
+        let mut copied = region_start;
+        for row in first..=last {
+            let bounds = self.buffer.rows[row];
+            let (start, end) = match (self.visual.kind, block) {
+                (VisualKind::Blockwise, Some((_, _, left, right))) => {
+                    self.block_row_range(row, left, right)
+                }
+                (VisualKind::Linewise, _) => (bounds.start, bounds.end),
+                _ => (
+                    span_start.max(bounds.start),
+                    span_end.min(bounds.end).max(span_start.max(bounds.start)),
+                ),
+            };
+            // Whatever lies between the selected spans -- line breaks, and
+            // the rest of a row outside a block -- is kept as it was.
+            text.extend_from_slice(&data[copied..start]);
+            let mut at = start;
+            while at < end {
+                text.extend_from_slice(replacement);
+                at = display::char_end(data, at).min(end);
+            }
+            copied = end;
+        }
+        text.extend_from_slice(&data[copied..region_end]);
+        let landing = match (self.visual.kind, block) {
+            (VisualKind::Blockwise, Some((_, _, left, _))) => {
+                let row = self.buffer.rows[first];
+                row.start.saturating_add(left).min(row.end)
+            }
+            (VisualKind::Linewise, _) => region_start,
+            _ => span_start,
+        };
+        if text != self.buffer.data[region_start..region_end]
+            && let Some(original) = self.buffer.replace_region(region_start, region_end, &text)
+        {
+            self.history.push_undo(UndoRecord::replace_region(
+                region_start,
+                region_start + text.len(),
+                original,
+            ));
+        }
+        self.leave_visual();
+        self.buffer.cursor = landing.min(self.buffer.data.len());
+        true
+    }
+
     /// The cursor motions Normal and Visual mode share.
     fn motion(&mut self, key: u8) -> bool {
         match key {
             b'h' => self.buffer.move_left(),
-            b'j' => self.buffer.move_down(),
-            b'k' => self.buffer.move_up(),
+            b'j' => self.buffer.move_down(self.tabstop),
+            b'k' => self.buffer.move_up(self.tabstop),
             b'l' => self.buffer.move_right(),
             b'0' => self.buffer.move_line_start(),
             b'$' => self.buffer.move_line_end(),
@@ -801,6 +1205,14 @@ impl Editor {
             }
             _ => return false,
         }
+        // Post: every motion lands on the start of a character (or the end
+        // of the file), never inside a multi-byte one.  The renderer and the
+        // character-wise edits all count on it.
+        debug_assert!(
+            display::is_char_boundary(&self.buffer.data, self.buffer.cursor),
+            "cursor {} inside a character",
+            self.buffer.cursor
+        );
         true
     }
 
@@ -859,7 +1271,7 @@ impl Editor {
             if !self.buffer.insert_selection(at, &indentation) {
                 return 0;
             }
-            self.history.push_undo(UndoRecord::delete_multiple_exact(
+            self.history.push_undo(UndoRecord::delete_multiple(
                 at,
                 at.saturating_add(indentation.len()),
             ));
@@ -888,7 +1300,7 @@ impl Editor {
                 break;
             }
             self.history
-                .push_undo(UndoRecord::insert_chars_exact(at, vec![byte]));
+                .push_undo(UndoRecord::insert_chars(at, vec![byte]));
             removed = removed.saturating_add(1);
         }
         -isize::try_from(removed).unwrap_or(0)
@@ -931,7 +1343,7 @@ impl Editor {
                 continue;
             }
             if let Some(deleted) = self.buffer.delete_selection(start, end) {
-                pieces[row - first] = deleted.undo;
+                pieces[row - first] = deleted;
             }
         }
         self.clipboard = pieces.join(&b'\n');
@@ -939,7 +1351,10 @@ impl Editor {
         self.history
             .push_undo(UndoRecord::replace_region(region_start, end, original));
         let landing = self.buffer.rows[first];
-        self.buffer.cursor = landing.start.saturating_add(left).min(landing.end);
+        self.buffer.cursor = display::char_start(
+            &self.buffer.data,
+            landing.start.saturating_add(left).min(landing.end),
+        );
     }
 
     /// Copies the rectangle a blockwise selection covers, one row per line.
@@ -963,7 +1378,10 @@ impl Editor {
         }
         self.clipboard = pieces.join(&b'\n');
         let landing = self.buffer.rows[first];
-        self.buffer.cursor = landing.start.saturating_add(left).min(landing.end);
+        self.buffer.cursor = display::char_start(
+            &self.buffer.data,
+            landing.start.saturating_add(left).min(landing.end),
+        );
     }
 
     /// Vim's `i_CTRL-W`: removes the word before the cursor.
@@ -1403,19 +1821,38 @@ mod tests {
     }
 
     #[test]
-    fn normal_and_visual_ranges_preserve_mixed_endpoint_rules() {
+    fn x_and_charwise_visual_operators_take_exactly_the_bytes_vim_does() {
+        // `x` used to put the byte after the deleted one in the clipboard too.
         let mut editor = Editor::new(b"abcd".to_vec());
         editor.buffer.cursor = 1;
         editor.normal_key(b'x');
         assert_eq!(editor.buffer.data, b"acd");
-        assert_eq!(editor.clipboard, b"bc");
+        assert_eq!(editor.clipboard, b"b");
 
+        // And a charwise selection deleted everything but the byte under the
+        // cursor, although it yanked that byte: both ends are inclusive now.
         let mut visual = Editor::new(b"abcd".to_vec());
         visual.buffer.cursor = 1;
         visual.normal_key(b'v');
         visual.visual_key(b'd');
-        assert_eq!(visual.buffer.data, b"abcd");
+        assert_eq!(visual.buffer.data, b"acd");
         assert_eq!(visual.clipboard, b"b");
+
+        let mut yanked = keys(b"abcd", 1, b"v");
+        yanked.visual_key(b'l');
+        yanked.visual_key(b'y');
+        assert_eq!(yanked.clipboard, b"bc");
+        let mut deleted = keys(b"abcd", 1, b"v");
+        deleted.visual_key(b'l');
+        deleted.visual_key(b'x');
+        assert_eq!(deleted.clipboard, b"bc");
+        assert_eq!(deleted.buffer.data, b"ad");
+
+        // A selection that runs onto EOF takes no made-up NUL with it.
+        let mut tail = keys(b"ab", 1, b"v");
+        tail.visual_key(b'l');
+        tail.visual_key(b'y');
+        assert_eq!(tail.clipboard, b"b");
     }
 
     #[test]
@@ -1425,7 +1862,7 @@ mod tests {
 
         assert!(editor.normal_key(b'x'));
         assert_eq!(editor.buffer.data, b"acd");
-        assert_eq!(editor.clipboard, b"bc");
+        assert_eq!(editor.clipboard, b"b");
         assert!(editor.buffer.invariants_hold());
 
         for _ in 0..2 {
@@ -1507,10 +1944,12 @@ mod tests {
         editor.leave_insert();
         assert_eq!(editor.buffer.data, b"old\nx");
 
-        assert!(editor.undo().unwrap()); // typed text
-        assert!(editor.undo().unwrap()); // opened line
+        // The opened line and the text typed on it are one step.
+        assert!(editor.undo().unwrap());
         assert_eq!(editor.buffer.data, b"old");
         assert!(editor.buffer.invariants_hold());
+        assert!(editor.redo().unwrap());
+        assert_eq!(editor.buffer.data, b"old\nx");
     }
 
     #[test]
@@ -1522,8 +1961,8 @@ mod tests {
         assert_eq!(editor.buffer.data, b"x\nold");
 
         assert!(editor.undo().unwrap());
-        assert!(editor.undo().unwrap());
         assert_eq!(editor.buffer.data, b"old");
+        assert!(editor.history.undo.is_empty());
         assert!(editor.buffer.invariants_hold());
     }
 
@@ -1531,7 +1970,7 @@ mod tests {
     fn replace_with_a_newline_keeps_row_metadata_valid() {
         let mut editor = Editor::new(b"abc".to_vec());
         editor.buffer.cursor = 1;
-        assert!(editor.replace_next(b'\n'));
+        assert!(editor.replace_next(b"\n"));
         assert_eq!(editor.buffer.data, b"a\nc");
         assert!(editor.buffer.invariants_hold());
         assert_eq!(editor.buffer.rows.len(), 2);
@@ -1567,9 +2006,10 @@ mod tests {
         editor.visual_key(b'>');
         assert_eq!(editor.buffer.data, b"\ta\n\tb");
 
-        assert!(editor.undo().unwrap());
+        // Every row of the selection comes back with one press.
         assert!(editor.undo().unwrap());
         assert_eq!(editor.buffer.data, b"a\nb");
+        assert!(editor.history.undo.is_empty());
         assert!(editor.buffer.invariants_hold());
     }
 
@@ -1645,6 +2085,123 @@ mod tests {
         }
         assert!(editor.buffer.invariants_hold());
         editor
+    }
+
+    #[test]
+    fn h_l_and_x_work_on_whole_utf8_characters() {
+        let text = "héllo".as_bytes();
+        // `l` from `h` steps over both bytes of `é`, and `h` comes back.
+        let moved = keys(text, 0, b"ll");
+        assert_eq!(moved.buffer.cursor, 3);
+        assert_eq!(keys(text, 3, b"h").buffer.cursor, 1);
+        assert_eq!(keys(text, 3, b"$0").buffer.cursor, 0);
+
+        // `x` takes the whole character, and the clipboard gets its bytes.
+        let cut = keys(text, 1, b"x");
+        assert_eq!(cut.buffer.data, b"hllo");
+        assert_eq!(cut.clipboard, "é".as_bytes());
+        // A count counts characters, not bytes.
+        let wide = keys("日本語x".as_bytes(), 0, b"");
+        let mut wide = wide;
+        wide.normal_counted(b'x', 2);
+        assert_eq!(wide.buffer.data, "語x".as_bytes());
+        // A letter and the mark on it are one character.
+        let marked = keys("e\u{301}z".as_bytes(), 0, b"lx");
+        assert_eq!(marked.buffer.data, "e\u{301}".as_bytes());
+    }
+
+    #[test]
+    fn j_and_k_keep_the_display_column_not_the_byte_offset() {
+        let text = "日本語\nabcdef\n\tx".as_bytes();
+        // `本` starts at byte 3 but in column 2, which on the next row is `c`.
+        let down = keys(text, 3, b"j");
+        assert_eq!(down.buffer.cursor, 12);
+        // Column 2 on the last row falls inside the tab, so it is the tab.
+        assert_eq!(keys(text, 12, b"j").buffer.cursor, 17);
+        // Column 3 is the second half of `本`, which means `本`.
+        assert_eq!(keys(text, 13, b"k").buffer.cursor, 3);
+        // With a two-column tab, `x` is in column 2 and so is `c`.
+        let mut narrow = Editor::new(text.to_vec());
+        narrow.tabstop = 2;
+        narrow.buffer.cursor = 18;
+        narrow.normal_key(b'k');
+        assert_eq!(narrow.buffer.cursor, 12);
+    }
+
+    #[test]
+    fn word_motions_never_stop_inside_a_character() {
+        let text = "héllo wörld".as_bytes();
+        let mut editor = Editor::new(text.to_vec());
+        for key in b"wwwweeebbbb" {
+            editor.normal_key(*key);
+            assert!(
+                display::is_char_boundary(&editor.buffer.data, editor.buffer.cursor),
+                "{} after {}",
+                editor.buffer.cursor,
+                char::from(*key)
+            );
+        }
+        // `de` takes the last character of the word whole.
+        let deleted = keys("aé b".as_bytes(), 0, b"de");
+        assert!(std::str::from_utf8(&deleted.buffer.data).is_ok());
+    }
+
+    #[test]
+    fn r_replaces_a_whole_character_with_a_whole_character() {
+        let mut editor = Editor::new("日x".as_bytes().to_vec());
+        assert!(editor.replace_chars(b"a", 1));
+        assert_eq!(editor.buffer.data, b"ax");
+        editor.undo().unwrap();
+        assert_eq!(editor.buffer.data, "日x".as_bytes());
+
+        let mut counted = Editor::new("日本x".as_bytes().to_vec());
+        assert!(counted.replace_chars("é".as_bytes(), 2));
+        assert_eq!(counted.buffer.data, "ééx".as_bytes());
+        // On the last character written, at its first byte.
+        assert_eq!(counted.buffer.cursor, 2);
+        assert!(!counted.replace_chars(b"z", 4));
+        counted.undo().unwrap();
+        assert_eq!(counted.buffer.data, "日本x".as_bytes());
+
+        // Visual `r` writes one replacement per selected character.
+        let mut visual = Editor::new("ab日c".as_bytes().to_vec());
+        visual.buffer.cursor = 1;
+        visual.normal_key(b'v');
+        visual.visual_key(b'l');
+        assert!(visual.visual_replace("ü".as_bytes()));
+        assert_eq!(visual.buffer.data, "aüüc".as_bytes());
+    }
+
+    #[test]
+    fn insert_backspace_and_arrows_step_over_whole_characters() {
+        // Typed a byte at a time, the way a non-ASCII key arrives.
+        let mut editor = Editor::new(b"a".to_vec());
+        editor.buffer.cursor = 1;
+        editor.enter_insert(InsertEntry::Cursor);
+        for byte in "é日".bytes() {
+            editor.insert_byte(byte);
+        }
+        assert!(editor.insert_backspace());
+        assert_eq!(editor.buffer.data, "aé".as_bytes());
+        assert!(editor.insert_move(MoveDirection::Left));
+        assert_eq!(editor.buffer.cursor, 1);
+        assert!(editor.insert_move(MoveDirection::Right));
+        assert_eq!(editor.buffer.cursor, 3);
+        // Text from before the insertion goes the same way and comes back
+        // with one undo.
+        editor.leave_insert();
+        let mut old = Editor::new("xé".as_bytes().to_vec());
+        old.buffer.cursor = 3;
+        old.enter_insert(InsertEntry::Cursor);
+        assert!(old.insert_backspace());
+        assert_eq!(old.buffer.data, b"x");
+        old.leave_insert();
+        old.undo().unwrap();
+        assert_eq!(old.buffer.data, "xé".as_bytes());
+        // `a` appends after the whole character under the cursor.
+        let mut append = Editor::new("éz".as_bytes().to_vec());
+        append.normal_key(b'a');
+        assert_eq!(append.buffer.cursor, 2);
     }
 
     #[test]
@@ -1768,11 +2325,349 @@ mod tests {
         editor.leave_insert();
         assert_eq!(editor.buffer.data, b"the cat runs");
 
-        assert!(editor.undo().unwrap());
-        assert_eq!(editor.buffer.data, b"the  runs");
-        assert!(editor.undo().unwrap());
-        assert_eq!(editor.buffer.data, b"the fox runs");
+        // The deletion and the text typed in its place come back together,
+        // and go forward again together.
+        for _ in 0..2 {
+            assert!(editor.undo().unwrap());
+            assert_eq!(editor.buffer.data, b"the fox runs");
+            assert!(editor.history.undo.is_empty());
+            assert!(editor.redo().unwrap());
+            assert_eq!(editor.buffer.data, b"the cat runs");
+            assert!(editor.history.redo.is_empty());
+        }
         assert!(editor.buffer.invariants_hold());
+    }
+
+    fn counted(text: &[u8], cursor: usize, keys: &[(u8, Option<usize>)]) -> Editor {
+        let mut editor = Editor::new(text.to_vec());
+        editor.buffer.cursor = cursor;
+        for (key, count) in keys {
+            match count {
+                Some(count) => editor.normal_counted(*key, *count),
+                None => editor.normal_key(*key),
+            };
+        }
+        assert!(editor.buffer.invariants_hold());
+        editor
+    }
+
+    #[test]
+    fn every_change_is_one_undo_step_whatever_was_typed_into_it() {
+        // `cc`, then a line break and an auto-closed bracket, each of which
+        // pushes records of its own while the insertion is being typed.
+        let mut editor = keys(b"one\ntwo\nthree", 5, b"cc");
+        for byte in b"f(" {
+            editor.insert_byte(*byte);
+        }
+        editor.insert_newline();
+        editor.insert_byte(b'x');
+        editor.leave_insert();
+        assert_eq!(editor.buffer.data, b"one\nf(\n\tx\n)\nthree");
+        assert!(editor.undo().unwrap());
+        assert_eq!(editor.buffer.data, b"one\ntwo\nthree");
+        assert!(editor.redo().unwrap());
+        assert_eq!(editor.buffer.data, b"one\nf(\n\tx\n)\nthree");
+
+        // `c$` that types nothing is still one step: the deletion alone.
+        let mut empty = keys(b"abcd", 2, b"c$");
+        empty.leave_insert();
+        assert!(empty.undo().unwrap());
+        assert_eq!(empty.buffer.data, b"abcd");
+        assert!(!empty.undo().unwrap());
+    }
+
+    #[test]
+    fn moving_the_cursor_in_insert_mode_ends_the_step_of_a_change() {
+        // Vim breaks the undo step at an arrow key, so what is typed after
+        // one is its own step and the change before it is another.
+        let mut editor = keys(b"one two", 0, b"cw");
+        editor.insert_byte(b'1');
+        editor.insert_move(MoveDirection::Right);
+        editor.insert_byte(b'!');
+        editor.leave_insert();
+        assert_eq!(editor.buffer.data, b"1 !two");
+        assert!(editor.undo().unwrap());
+        assert_eq!(editor.buffer.data, b"1 two");
+        assert!(editor.undo().unwrap());
+        assert_eq!(editor.buffer.data, b"one two");
+        assert!(!editor.history.grouping());
+    }
+
+    #[test]
+    fn a_new_edit_after_undo_cannot_redo_the_undone_one() {
+        let mut editor = keys(b"abc", 0, b"x");
+        assert!(editor.undo().unwrap());
+        editor.normal_key(b'l');
+        editor.normal_key(b'x');
+        assert!(!editor.redo().unwrap());
+        assert_eq!(editor.buffer.data, b"ac");
+    }
+
+    #[test]
+    fn a_replacement_redoes_after_it_is_undone() {
+        let mut editor = Editor::new(b"abc".to_vec());
+        assert!(editor.replace_next(b"X"));
+        for _ in 0..2 {
+            assert!(editor.undo().unwrap());
+            assert_eq!(editor.buffer.data, b"abc");
+            assert!(editor.redo().unwrap());
+            assert_eq!(editor.buffer.data, b"Xbc");
+        }
+    }
+
+    #[test]
+    fn counted_replace_writes_that_many_bytes_or_nothing() {
+        let mut editor = Editor::new(b"abcd\nef".to_vec());
+        assert!(editor.replace_chars(b"X", 3));
+        assert_eq!(editor.buffer.data, b"XXXd\nef");
+        assert_eq!(editor.buffer.cursor, 2);
+        assert!(editor.undo().unwrap());
+        assert_eq!(editor.buffer.data, b"abcd\nef");
+
+        // Five do not fit before the end of the line, so none are written.
+        editor.buffer.cursor = 0;
+        assert!(!editor.replace_chars(b"X", 5));
+        assert_eq!(editor.buffer.data, b"abcd\nef");
+
+        // A counted line break replaces them all with one.
+        assert!(editor.replace_chars(b"\n", 2));
+        assert_eq!(editor.buffer.data, b"\ncd\nef");
+        assert_eq!(editor.buffer.cursor, 1);
+    }
+
+    #[test]
+    fn counts_reach_the_motion_of_an_operator_and_multiply() {
+        let text = b"a b c d e f g h";
+        let d3w = counted(text, 0, &[(b'd', None), (b'w', Some(3))]);
+        assert_eq!(d3w.buffer.data, b"d e f g h");
+        let three_dw = counted(text, 0, &[(b'd', Some(3)), (b'w', None)]);
+        assert_eq!(three_dw.buffer.data, b"d e f g h");
+        let six = counted(text, 0, &[(b'd', Some(2)), (b'w', Some(3))]);
+        assert_eq!(six.buffer.data, b"g h");
+        assert!(!six.pending_operator());
+
+        let yank = counted(b"one two three", 0, &[(b'y', None), (b'e', Some(2))]);
+        assert_eq!(yank.clipboard, b"one two");
+        assert_eq!(yank.buffer.data, b"one two three");
+
+        // `c2w` is `c2e`, leaving the blank before the third word.
+        let change = counted(b"one two three", 0, &[(b'c', None), (b'w', Some(2))]);
+        assert_eq!(change.buffer.data, b" three");
+        assert_eq!(change.mode, Mode::Insert);
+        let change = counted(b"one two three", 0, &[(b'c', Some(3)), (b'w', None)]);
+        assert_eq!(change.buffer.data, b"");
+
+        // A count on a word object takes that many objects.
+        let objects = counted(
+            b"one two three",
+            0,
+            &[(b'd', Some(2)), (b'a', None), (b'w', None)],
+        );
+        assert_eq!(objects.buffer.data, b"three");
+    }
+
+    #[test]
+    fn a_doubled_operator_takes_the_counted_lines_and_leaves_nothing_pending() {
+        let text = b"a\nb\nc\nd\ne";
+        let dd = counted(text, 0, &[(b'd', Some(3)), (b'd', None)]);
+        assert_eq!(dd.buffer.data, b"d\ne");
+        assert_eq!(dd.clipboard, b"\na\nb\nc");
+        assert!(!dd.pending_operator());
+        let mut dd = dd;
+        assert!(dd.undo().unwrap());
+        assert_eq!(dd.buffer.data, text);
+        assert!(!dd.undo().unwrap());
+
+        // `d3d` is the same command, and a count past the end stops there.
+        assert_eq!(
+            counted(text, 2, &[(b'd', None), (b'd', Some(3))])
+                .buffer
+                .data,
+            b"a\ne"
+        );
+        assert_eq!(
+            counted(text, 6, &[(b'd', Some(9)), (b'd', None)])
+                .buffer
+                .data,
+            b"a\nb\nc"
+        );
+
+        let yy = counted(text, 2, &[(b'y', Some(2)), (b'y', None)]);
+        assert_eq!(yy.clipboard, b"\nb\nc");
+        assert!(!yy.pending_operator());
+
+        let cc = counted(text, 2, &[(b'c', Some(2)), (b'c', None)]);
+        assert_eq!(cc.buffer.data, b"a\n\nd\ne");
+        assert_eq!(cc.mode, Mode::Insert);
+        assert_eq!(cc.buffer.cursor, 2);
+    }
+
+    #[test]
+    fn counted_x_and_p_are_one_edit_each() {
+        let mut editor = counted(b"abcdef\ngh", 1, &[(b'x', Some(3))]);
+        assert_eq!(editor.buffer.data, b"aef\ngh");
+        assert_eq!(editor.clipboard, b"bcd");
+        // The count stops at the end of the line.
+        editor.normal_counted(b'x', 9);
+        assert_eq!(editor.buffer.data, b"a\ngh");
+        assert_eq!(editor.clipboard, b"ef");
+
+        editor.buffer.cursor = 0;
+        editor.normal_counted(b'p', 3);
+        assert_eq!(editor.buffer.data, b"efefefa\ngh");
+        assert!(editor.undo().unwrap());
+        assert_eq!(editor.buffer.data, b"a\ngh");
+    }
+
+    #[test]
+    fn an_operator_count_goes_to_a_counted_line() {
+        let text = b"a\nb\nc\nd";
+        assert_eq!(
+            counted(text, 0, &[(b'd', None), (b'G', Some(2))])
+                .buffer
+                .data,
+            b"c\nd"
+        );
+        assert_eq!(
+            counted(text, 6, &[(b'd', None), (b'g', Some(3))])
+                .buffer
+                .data,
+            b"a\nb"
+        );
+    }
+
+    fn visual(text: &[u8], cursor: usize, kind: VisualKind, moves: &[u8]) -> Editor {
+        let mut editor = Editor::new(text.to_vec());
+        editor.buffer.cursor = cursor;
+        editor.start_visual(kind);
+        for key in moves {
+            editor.visual_key(*key);
+        }
+        editor
+    }
+
+    #[test]
+    fn visual_c_replaces_the_selection_with_what_is_typed_in_one_step() {
+        let mut editor = visual(b"one two three", 4, VisualKind::Charwise, b"ll");
+        editor.visual_key(b'c');
+        assert_eq!(editor.mode, Mode::Insert);
+        assert_eq!(editor.buffer.data, b"one  three");
+        assert_eq!(editor.clipboard, b"two");
+        editor.insert_byte(b'2');
+        editor.leave_insert();
+        assert_eq!(editor.buffer.data, b"one 2 three");
+        assert!(editor.undo().unwrap());
+        assert_eq!(editor.buffer.data, b"one two three");
+
+        // Whole lines leave one empty line to type on.
+        let mut lines = visual(b"a\nb\nc", 0, VisualKind::Linewise, b"j");
+        lines.visual_key(b'c');
+        assert_eq!(lines.buffer.data, b"\nc");
+        assert_eq!(lines.buffer.cursor, 0);
+        assert_eq!(lines.mode, Mode::Insert);
+
+        // A block is deleted and typing starts at its top-left corner.
+        let mut block = visual(b"abcd\nefgh", 1, VisualKind::Blockwise, b"jl");
+        block.visual_key(b'c');
+        assert_eq!(block.buffer.data, b"ad\neh");
+        assert_eq!(block.buffer.cursor, 1);
+        block.insert_byte(b'X');
+        block.leave_insert();
+        assert!(block.undo().unwrap());
+        assert_eq!(block.buffer.data, b"abcd\nefgh");
+    }
+
+    #[test]
+    fn visual_p_swaps_the_selection_and_the_clipboard() {
+        let mut editor = visual(b"one two", 4, VisualKind::Charwise, b"ll");
+        editor.clipboard = b"2".to_vec();
+        editor.visual_key(b'p');
+        assert_eq!(editor.buffer.data, b"one 2");
+        assert_eq!(editor.clipboard, b"two");
+        assert_eq!(editor.mode, Mode::Normal);
+        assert!(editor.undo().unwrap());
+        assert_eq!(editor.buffer.data, b"one two");
+
+        // Lines put over a charwise selection go on lines of their own.
+        let mut split = visual(b"abcdef", 2, VisualKind::Charwise, b"l");
+        split.clipboard = b"\nrow".to_vec();
+        split.visual_key(b'p');
+        assert_eq!(split.buffer.data, b"ab\nrow\nef");
+        assert_eq!(split.clipboard, b"cd");
+
+        // Over whole lines, the lines are replaced and come back linewise.
+        let mut lines = visual(b"a\nb\nc", 2, VisualKind::Linewise, b"");
+        lines.clipboard = b"\nx\ny".to_vec();
+        lines.visual_key(b'p');
+        assert_eq!(lines.buffer.data, b"a\nx\ny\nc");
+        assert_eq!(lines.clipboard, b"\nb");
+    }
+
+    #[test]
+    fn visual_o_swaps_the_ends_and_v_and_v_switch_or_leave() {
+        let mut editor = visual(b"abcdef", 1, VisualKind::Charwise, b"ll");
+        editor.visual_key(b'o');
+        assert_eq!(editor.buffer.cursor, 1);
+        editor.visual_key(b'h');
+        editor.visual_key(b'y');
+        assert_eq!(editor.clipboard, b"abcd");
+
+        let mut lines = visual(b"a\nb\nc", 0, VisualKind::Linewise, b"j");
+        lines.visual_key(b'o');
+        assert_eq!(lines.buffer.cursor, 0);
+        assert_eq!(lines.visual_rows(), Some((0, 3)));
+
+        // `V` in a charwise selection makes it linewise, `v` brings it
+        // back, and the key of the shape already selected leaves.
+        let mut shapes = visual(b"ab\ncd", 1, VisualKind::Charwise, b"j");
+        shapes.visual_key(b'V');
+        assert_eq!(shapes.visual.kind, VisualKind::Linewise);
+        assert_eq!((shapes.visual.start, shapes.visual.end), (0, 5));
+        shapes.visual_key(b'v');
+        assert_eq!(shapes.visual.kind, VisualKind::Charwise);
+        assert_eq!((shapes.visual.start, shapes.visual.end), (1, 4));
+        shapes.visual_key(b'v');
+        assert_eq!(shapes.mode, Mode::Normal);
+
+        let mut block = visual(b"ab", 0, VisualKind::Blockwise, b"");
+        block.visual_key(b'V');
+        assert_eq!(block.visual.kind, VisualKind::Linewise);
+        block.visual_key(b'V');
+        assert_eq!(block.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn visual_r_overwrites_the_selection_but_not_its_line_breaks() {
+        let mut editor = visual(b"abc\ndef", 1, VisualKind::Charwise, b"j");
+        assert!(editor.visual_replace(b"x"));
+        assert_eq!(editor.buffer.data, b"axx\nxxf");
+        assert_eq!(editor.buffer.cursor, 1);
+        assert_eq!(editor.mode, Mode::Normal);
+        assert!(editor.undo().unwrap());
+        assert_eq!(editor.buffer.data, b"abc\ndef");
+        assert!(!editor.undo().unwrap());
+
+        let mut lines = visual(b"ab\ncd\nef", 3, VisualKind::Linewise, b"");
+        lines.visual_replace(b"-");
+        assert_eq!(lines.buffer.data, b"ab\n--\nef");
+
+        let mut block = visual(b"abcd\nefgh", 1, VisualKind::Blockwise, b"jl");
+        block.visual_replace(b".");
+        assert_eq!(block.buffer.data, b"a..d\ne..h");
+        assert_eq!(block.buffer.cursor, 1);
+    }
+
+    #[test]
+    fn deleting_lines_puts_them_in_the_clipboard_linewise() {
+        let mut editor = keys(b"one\ntwo\nthree", 0, b"dd");
+        assert_eq!(editor.clipboard, b"\none");
+        editor.normal_key(b'p');
+        assert_eq!(editor.buffer.data, b"two\none\nthree");
+
+        let mut lines = visual(b"a\nb\nc", 0, VisualKind::Linewise, b"j");
+        lines.visual_key(b'd');
+        assert_eq!(lines.clipboard, b"\na\nb");
+        assert_eq!(lines.buffer.data, b"c");
     }
 
     #[test]

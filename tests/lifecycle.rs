@@ -98,3 +98,24 @@ fn lua_exit_propagates_without_initializing_the_terminal() {
     );
     assert!(output.stderr.is_empty());
 }
+
+#[test]
+fn only_the_exact_help_and_config_spellings_are_flags() {
+    let fixture = Fixture::new();
+    for spelling in ["--helpful", "--configuration", "--config-file=x.lua"] {
+        let output = fixture.run(&[Path::new(spelling), Path::new("x.lua")]);
+        assert_eq!(output.status.code(), Some(1), "{spelling}");
+        assert_eq!(output.stderr, b"Unexpected flag\n", "{spelling}");
+    }
+}
+
+#[test]
+fn an_unknown_help_page_lists_the_pages_and_fails_before_a_terminal() {
+    let fixture = Fixture::new();
+    let output = fixture.run(&[Path::new("--help=bogus")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        output.stderr,
+        b"No help page named bogus; pages: general, keys, cmds\n"
+    );
+}

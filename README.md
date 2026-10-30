@@ -1,864 +1,1035 @@
 # Cano
 
-Cano (kay-no) is a Vim-inspired modal terminal editor written in Rust using
-Ratatui and Crossterm. This implementation was created independently from Code
-Atlas migration specifications and does not depend on the original C
-implementation or an earlier Rust port. The original C implementation lives at
-[Cano-Projects/Cano](https://github.com/Cano-Projects/Cano).
+Cano (kay-no) is a small modal text editor for the terminal, in the style of
+Vim. It is written in Rust with [Ratatui](https://ratatui.rs) and
+[Crossterm](https://github.com/crossterm-rs/crossterm). You configure it in
+Lua 5.4. It has an optional built-in AI assistant.
 
-## Demo
+The original editor is written in C and lives at
+[Cano-Projects/Cano](https://github.com/Cano-Projects/Cano). This Rust version
+was written from migration specifications of that editor. It does not reuse
+the C source or an earlier Rust port. For the compatibility choices, see
+[`MIGRATION_NOTES.md`](MIGRATION_NOTES.md). For the product requirements, see
+[`PRD.md`](PRD.md).
+
 [![asciicast](https://asciinema.org/a/655184.svg)](https://asciinema.org/a/655184)
+
+## Contents
+
+- [Highlights](#highlights)
+- [Quick start](#quick-start)
+- [Installation](#installation)
+- [Command-line usage](#command-line-usage)
+- [Modes](#modes)
+- [Key reference](#key-reference)
+- [Operators, text objects and repeat](#operators-text-objects-and-repeat)
+- [Visual mode](#visual-mode)
+- [Search, highlight and replace](#search-highlight-and-replace)
+- [Commands](#commands)
+- [Options](#options)
+- [Configuration (`init.lua`)](#configuration-initlua)
+- [Syntax highlighting](#syntax-highlighting)
+- [Markdown display](#markdown-display)
+- [Invisible characters](#invisible-characters)
+- [Autoformat](#autoformat)
+- [File explorer and recent files](#file-explorer-and-recent-files)
+- [Backups](#backups)
+- [Mouse](#mouse)
+- [AI assistant](#ai-assistant)
+- [Files Cano reads and writes](#files-cano-reads-and-writes)
+- [Behaviour notes and limitations](#behaviour-notes-and-limitations)
+- [Development](#development)
+- [Project layout](#project-layout)
+- [License](#license)
+
+## Highlights
+
+- Five modes: Normal, Insert, Visual, Search and Command. Visual mode selects
+  charwise, linewise or blockwise.
+- The `d`/`y`/`c` operators, text objects (`iw aw ip ap i( a" …`), `.` repeat,
+  Vim-style counts (`3dd`, `d3w`, `3.`), and EasyMotion-style `s`/`t` jumps.
+- UTF-8 display and motions. Wide CJK and emoji characters take two cells, and
+  `h`/`l`/`x`/`r` act on whole characters.
+- Vim-style `:s` with ranges and the `g`/`c`/`i` flags, `*` word search with
+  match highlighting, and `:set` with Vim option names.
+- Built-in syntax highlighting for C, C++, Rust, Python, shell, Vim script,
+  Lua and JSON, plus custom `.cyntax` palettes.
+- Markdown display in place, `:set list`, `:autoformat` (JSON pretty-print or
+  whitespace tidy) and line-comment toggle.
+- A file explorer, a recent-files list that persists across sessions, prompt
+  history for each session, and timestamped backups on each save.
+- Mouse support: click, drag to select, wheel, and a scrollbar you can click.
+- An optional AI assistant panel (Anthropic or OpenAI). It explains Cano,
+  edits the buffer in steps you can undo, and runs commands with your
+  approval.
+- Atomic saves that keep permissions and symlinks. `:!` commands run in the
+  background.
+- A release binary of about 1 MB. Each GitHub release has prebuilt archives
+  for Linux, macOS and Windows.
 
 ## Quick start
 
-Cano requires a current Rust toolchain with Cargo. Lua 5.4 is built from vendored sources by the `mlua` dependency.
-
-1. Navigate to the Cano directory
-```sh
-cd path/to/cano
-```
-
-2. Build Cano
 ```sh
 cargo build --release --locked
-```
-
-3. Run Cano
-```sh
 ./target/release/cano path/to/file
 ```
 
-Opening a path that does not exist starts a new empty buffer; the file is
-created on the first save. To use a configuration file outside the default
-location, pass it explicitly:
+If the file does not exist, Cano opens an empty buffer and creates the file
+when you first save. If you give no file, the buffer is named `out.txt`.
+
+1. Press `i` to type text. Press `Esc` to stop.
+2. Type `:w` to save.
+3. Type `:q` to quit. Type `:q!` to quit and discard changes.
+
+If an API key is set, press `Ctrl-K` to open the AI assistant.
+
+## Installation
+
+### Prebuilt binaries
+
+Each [GitHub release](https://github.com/Phorena-Inc/cano-editor-rust/releases)
+has archives for these targets:
+
+- Linux: x86-64 and ARM64
+- macOS: Intel and Apple Silicon
+- Windows: x86-64
+
+Unpack an archive and put `bin/cano` on your `PATH`. The archive also contains
+`docs/help`. You do not need it, because the help pages are also built into
+the binary.
+
+### From source
+
+On every platform you need:
+
+- a current stable Rust toolchain from [rustup](https://rustup.rs). The code
+  uses let-chains, so use a recent stable release.
+- a **C compiler**. The `mlua` crate compiles the vendored Lua 5.4 during the
+  build.
+
+These runtime tools are optional:
+
+- `sh`, for `:!command` and the assistant's `run_shell` tool;
+- `curl`, for the AI assistant.
+
+#### Linux
 
 ```sh
-./target/release/cano --config path/to/init.lua path/to/file
+# Debian/Ubuntu: sudo apt install build-essential
+# Fedora:        sudo dnf group install development-tools
+# Arch:          sudo pacman -S base-devel
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+make                                  # release build, also copied to build/cano
+sudo make install PREFIX=/usr/local   # /usr/local/bin/cano + /usr/local/share/cano/help
 ```
 
-`-h`/`--help` opens the bundled help pages in the editor, and `-v`/`--version`
-prints the version and exits. The general help page is built into the binary,
-so help works even when no `docs/help` directory is found; a page on disk
-(from `CANO_HELP_DIR` or an install) is preferred when present.
+`make install` builds the binary with `CANO_HELP_DIR=$(PREFIX)/share/cano/help`
+built in. Give the same `PREFIX` to `make` and `make install`, so that the
+binary finds the help pages. `make uninstall` removes both.
 
-`make` remains available as a compatibility wrapper and copies the release binary to `build/cano`.
+On Nix (x86_64-linux), run `nix build .#cano`. `nix develop` opens a shell
+with cargo, rustc, rustfmt and clippy.
 
-Run the full validation suite with:
+#### macOS
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked --all-targets
+xcode-select --install
+brew install rustup-init && rustup-init   # or the rustup script above
+make && sudo make install PREFIX=/usr/local
 ```
+
+#### Windows
+
+```powershell
+winget install Rustlang.Rustup     # accept the Visual Studio C++ Build Tools
+cargo build --release --locked
+.\target\release\cano.exe .\file.txt
+```
+
+Copy `cano.exe` to a directory on your `PATH`.
+
+**Note:** Windows has no `sh`. `:!command` works only if an `sh` is on your
+`PATH`. `Ctrl-Z` has no shell to suspend into.
+
+Prebuilt packages such as the AUR package are for the original C editor, not
+for this version.
+
+## Command-line usage
+
+```
+cano [--config <init.lua>] [file]
+cano -h | --help
+cano -v | --version
+```
+
+| Argument | Effect |
+|----------|--------|
+| `file` | The file to edit. The default is `out.txt`. Cano ignores extra positional arguments. |
+| `--config <path>` / `--config=<path>` | Use this Lua config instead of `~/.config/cano/init.lua`. The file must exist. If you give it twice, the last one wins. |
+| `-h`, `--help` | Open the general help page, read-only, in the editor. |
+| `--help=<page>` | Open the `general`, `keys` or `cmds` page. For an unknown page, Cano lists the pages and exits with status 1. |
+| `-v`, `--version` | Print `cano <version>` and exit. This flag takes precedence over `--help`. |
+
+Flags must match exactly. `--helpful`, `--configuration` and any other
+argument that starts with `-` are errors.
+
+**Exit status:**
+
+| Status | When |
+|--------|------|
+| `0` | Normal quit, `--version`, or a startup command that quits. |
+| `1` | An argument, configuration, file-open or terminal error. |
+| `128 + signal` | After `SIGTERM` (143) or `SIGHUP` (129). Cano restores the terminal first. It does not save the buffer. |
+| The `cano.exit()` code | When `init.lua` calls `cano.exit()`. A negative code keeps its low byte, so `-1` exits as 255. A code above 255 becomes 255. |
+
+Cano looks for the help pages in this order:
+
+1. `$CANO_HELP_DIR`;
+2. the `CANO_HELP_DIR` set at build time;
+3. `docs/help` or `share/cano/help` relative to the binary;
+4. `./docs/help`;
+5. the copies built into the binary.
+
+All three pages are built in, so help always works. In the editor,
+`:help [page]` opens the same pages.
 
 ## Modes
-Normal - For motions, and for the operators that delete, yank and change \
-Insert - For inserting text \
-Visual - For selecting text and performing actions on them \
-Search - For searching of text in the current buffer \
-Command - For executing commands
 
-## Keybinds
-|Mode  | Keybind        | Action                                          |
-|------|----------------|-------------------------------------------------|
-|Global| Ctrl + Q       | Quit from any mode (refuses if there are unsaved changes) |
-|Normal| Ctrl + Z       | Suspend to the shell; `fg` returns                |
-|Global| Esc / Ctrl + C | Enter Normal Mode                               |
-|Normal| h              | Move cursor left                                |
-|Normal| j              | Move cursor down                                |
-|Normal| k              | Move cursor up                                  |
-|Normal| l              | Move cursor right                               |
-|Normal| x              | Delete character                                |
-|Normal| g              | Go to first line                                |
-|Normal| G              | Go to last line                                 |
-|Normal| 0              | Go to beginning of line                         |
-|Normal| $              | Go to end of line                               |
-|Normal| w              | Go to next word                                 |
-|Normal| b              | Go to last word                                 |
-|Normal| e              | Go to end of next word                          |
-|Normal| o              | Create line below current                       |
-|Normal| O              | Create line above current                       |
-|Normal| Ctrl + o       | Create line below current without changing mode |
-|Normal| %              | Go to corresponding brace                       |
-|Normal| i              | Enter insert mode                               |
-|Normal| I              | Enter insert mode at the first non-blank character |
-|Normal| a              | Insert mode on next char                        |
-|Normal| A              | Insert mode at end of line                      |
-|Normal| v              | Enter visual mode                               |
-|Normal| V              | Enter visual mode by line                       |
-|Normal| dd             | Delete current line                             |
-|Normal| yy             | Yank current line                               |
-|Normal| p              | Paste                                           |
-|Normal| u              | Undo                                            |
-|Normal| U / Ctrl + r   | Redo                                            |
-|Normal| /              | Enter Search mode                               |
-|Normal| n              | Jump to next search                             |
-|Normal| N              | Jump to previous search                         |
-|Normal/Insert| Ctrl + S| Save and exit                                   |
-|Normal| r              | Replace current char with the next typed key (Esc cancels) |
-|Normal| d + motion     | Delete over the next motion                     |
-|Normal| y + motion     | Yank over the next motion                       |
-|Normal| c + motion     | Change over the next motion, then Insert mode   |
-|Normal| cc             | Change the current line, keeping the line       |
-|Normal| d/y/c + i/a + object | Act on the text object under the cursor   |
-|Normal| .              | Repeat the last change                          |
-|Normal| (n) + motion   | Repeat next motion n times (also `n`, `N`, `u`, `U`) |
-|Normal| (n) + d        | Delete n lines                                  |
-|Normal| (n) + g / G    | Go to line n                                    |
-|Normal| Ctrl + n       | Toggle file explorer (Esc closes it)            |
-|Normal| Ctrl + p       | Toggle the recent-file list (Esc closes it)     |
-|Normal| [space] n      | Leader mapping for Ctrl + n                     |
-|Normal| [space] r      | Leader mapping for Ctrl + p                     |
-|Normal| Ctrl + m       | Toggle markdown display (Enter is the same key) |
-|Normal/Visual| s{char} | EasyMotion: jump to any {char} on screen, forward or back |
-|Normal| t{char}        | EasyMotion: jump just before the next {char} (forward only) |
-|Normal| *              | Search the word under the cursor and highlight every match |
-|Normal| [space] i      | Leader mapping for `*`                          |
-|Normal| [space] o      | Leader mapping for `:nohl`                      |
-|Normal| [space] l      | Leader mapping for `:set list!`                 |
-|Normal| [space] f      | Leader mapping for `:autoformat`                |
-|Visual| Ctrl + e       | Toggle line comments over the selected lines    |
-|Visual| [space] e      | Leader spelling of Ctrl + e                     |
-|Normal/Visual| Arrow keys | Move like h/j/k/l                            |
-|Insert| Tab            | Insert the configured indentation               |
+| Mode | Use | Enter with | Status line shows |
+|------|-----|------------|-------------------|
+| Normal | Motions, operators, commands | `Esc` / `Ctrl-C` from any mode | `NORMAL` |
+| Insert | Type text | `i I a A o O`, `c…` | `INSERT` |
+| Visual | Select text (charwise, linewise, blockwise) | `v`, `V`, `Ctrl-V` | `VISUAL` |
+| Search | Type a `/` search | `/` | `SEARCH` |
+| Command | Type a `:` command | `:` | `COMMAND` |
 
-### Scrolling and paging
-A count works on all six: `3` then `Ctrl + e` scrolls three lines.
+The status line reads `MODE file [MD] (col,row) Saved|Modified`. When the
+assistant is available, an `AI` button follows at the right end. The column is
+the display column, so a tab or a wide character counts as the cells it takes.
 
-|Mode  | Keybind        | Action                                          |
-|------|----------------|-------------------------------------------------|
-|Normal| Ctrl + f       | Forward one screen                              |
-|Normal| Ctrl + b       | Back one screen                                 |
-|Normal| Ctrl + d       | Forward half a screen                           |
-|Normal| Ctrl + u       | Back half a screen                              |
-|Normal| Ctrl + e       | Scroll one line down, leaving the cursor where it is |
-|Normal| Ctrl + y       | Scroll one line up, leaving the cursor where it is |
+Messages on the bottom line (the message line) clear after about one second.
 
-`Ctrl + f` and `Ctrl + b` keep two lines of the old screen, so there is always
-something to find your place against. All six bring the cursor along only as
-far as they must: it moves when the view would otherwise leave it behind.
+## Key reference
 
-They are Normal-mode keys here, unlike in vim, where they are motions in
-Visual mode too. `Ctrl + e` already toggles line comments over a selection,
-and one key cannot mean both — so rather than make Visual mode the one place
-`Ctrl + e` does something else, scrolling stays out of it entirely.
+### All modes
 
-### Editing and information
-|Mode  | Keybind        | Action                                          |
-|------|----------------|-------------------------------------------------|
-|Normal| Ctrl + a       | Add one to the number at or after the cursor    |
-|Normal| Ctrl + x       | Take one off it (`5` then `Ctrl + x` takes five) |
-|Normal| Ctrl + g       | Report the file, its length, and how far down it the cursor is |
-|Normal| Ctrl + l       | Redraw the screen and clear the message line    |
-|Normal| Ctrl + v       | Enter blockwise Visual mode                     |
-|Visual| Ctrl + v       | Turn the selection into a rectangle, or leave Visual mode if it already is |
+| Key | Action |
+|-----|--------|
+| `Esc` / `Ctrl-C` | Go back to Normal mode. Cancel a pending count, operator or prompt. |
+| `Ctrl-Q` | Quit. Cano refuses while there are unsaved changes. |
+| `Ctrl-S` | Save, then quit (Normal and Insert mode). |
+| `Ctrl-K` | Open or close the AI assistant panel. |
 
-`Ctrl + v` selects a rectangle rather than a run of bytes. `d` and `x` cut it
-in a single undo step and `y` copies it, both keeping the shape of a line too
-short to reach the block as the blank it is. Cano's clipboard has no shape of
-its own, so `p` puts those rows back as lines rather than as a column. `>`,
-`<` and `=` act on every row the rectangle touches.
+### Normal mode: movement
 
-`Ctrl + a` and `Ctrl + x` read decimal and `0x` hexadecimal — vim's default
-`nrformats` without its binary and octal forms. Zero padding survives (`007`
-counts up to `008`), a leading `-` is part of the number (`-1` counts up to
-`0`), hex keeps its width and the case of its digits, and the cursor lands on
-the last digit of the answer.
+| Key | Action |
+|-----|--------|
+| `h j k l`, arrows | Left, down, up, right |
+| `0` / `$` | Start / end of line |
+| `w` / `b` / `e` | Next word / previous word / end of word |
+| `g` / `G` | First line / last line |
+| `N g`, `N G` | Go to line N |
+| `%` | Matching bracket. Brackets inside quotes do not count. |
+| `s{char}` | EasyMotion: label every visible `{char}` above and below the cursor. Type a label to jump to it. |
+| `t{char}` | EasyMotion, forward only. The cursor stops one character before the match. |
+| `Ctrl-F` / `Ctrl-B` | Forward / back one screen, with 2 lines of overlap |
+| `Ctrl-D` / `Ctrl-U` | Forward / back half a screen |
+| `Ctrl-E` / `Ctrl-Y` | Scroll one line down / up. The cursor moves only if it would leave the view. |
+| `N` + motion | Do the motion N times. A count also multiplies the scroll keys. |
+
+EasyMotion labels come from `asdghklqwertyuiopzxcvbnmfj;`. The nearest match
+gets the first label. When there are more matches than keys, labels become two
+keys long. If there is only one match, Cano jumps at once. `Esc`, or a key
+that matches no label, cancels. Only rows on the screen are targets.
+
+### Normal mode: editing
+
+| Key | Action |
+|-----|--------|
+| `i` / `I` | Insert before the cursor / at the first non-blank |
+| `a` / `A` | Insert after the cursor / at the end of the line |
+| `o` / `O` | Open an auto-indented line below / above |
+| `Ctrl-O` | Open a line below and stay in Normal mode |
+| `x` | Delete the character (`3x` deletes three) |
+| `r{char}` | Replace the character (`3rX` replaces three). `Enter` writes a line break. `Esc` cancels. |
+| `dd` / `yy` / `cc` | Delete / yank / change the line (`3dd` acts on three lines) |
+| `d`/`y`/`c` + motion or text object | See [Operators](#operators-text-objects-and-repeat) |
+| `p` | Paste. Linewise clipboard text goes below the current line. `3p` pastes three times. |
+| `u` | Undo |
+| `U` / `Ctrl-R` | Redo |
+| `.` | Repeat the last change (`3.` repeats it with a count of 3) |
+| `Ctrl-A` / `Ctrl-X` | Add / subtract 1 (or the count) to the number at or after the cursor |
+
+`Ctrl-A` and `Ctrl-X` read decimal numbers and `0x` hexadecimal numbers:
+
+- A leading `-` is part of the number.
+- Zero padding stays: `007` becomes `008`.
+- Hex numbers keep their width and letter case.
+- The cursor stops on the last digit.
+
+### Normal mode: panes, search and other keys
+
+| Key | Action |
+|-----|--------|
+| `/` · `n` · `N` | Search · next match · previous match (both wrap) |
+| `*` | Search for the word under the cursor as a whole word, and highlight all matches (`3*` goes to the third) |
+| `:` | Open the command prompt |
+| `:help` | Open a help page (see [Commands](#commands)) |
+| `v` / `V` / `Ctrl-V` | Charwise / linewise / blockwise Visual mode |
+| `Ctrl-N` | Open or close the file explorer |
+| `Ctrl-P` | Open or close the recent-files list |
+| `Ctrl-M` / `Enter` | Turn Markdown display on or off. Most terminals send the same byte for both keys. |
+| `Ctrl-G` | Show the file name, line count and position |
+| `Ctrl-L` | Redraw the screen and clear the message |
+| `Ctrl-W` | Vim's window prefix. Cano has no splits, so it ignores the next key and tells you so. |
+| `Ctrl-Z` | Suspend to the shell. Type `fg` to resume (Unix only). |
+
+### Leader key (space)
+
+| Keys | Same as |
+|------|---------|
+| `space i` | `*` |
+| `space o` | `:nohl` |
+| `space n` | `Ctrl-N` (explorer) |
+| `space r` | `Ctrl-P` (recent files) |
+| `space l` | `:set list!` |
+| `space f` | `:autoformat` |
+| `space e` (Visual) | `Ctrl-E` (comment toggle) |
 
 ### Insert mode
-|Mode  | Keybind        | Action                                          |
-|------|----------------|-------------------------------------------------|
-|Insert| Ctrl + h       | Delete the character before the cursor           |
-|Insert| Ctrl + w       | Delete the word before the cursor                |
-|Insert| Ctrl + u       | Delete back to the first non-blank; again for the indent |
-|Insert| Ctrl + t       | Indent the current line one shiftwidth           |
-|Insert| Ctrl + d       | Unindent the current line one shiftwidth         |
-|Insert| Ctrl + n       | Complete the word being typed from the buffer, forwards |
-|Insert| Ctrl + p       | The same, backwards                              |
-|Insert| Ctrl + o       | Run one Normal-mode command, then carry on typing |
 
-`Ctrl + n` and `Ctrl + p` take the keyword in front of the cursor and offer
-every distinct word in the buffer that extends it, nearest first and wrapping
-at the end of the file. Pressing the key again walks the list, and walking off
-either end puts back what you actually typed, so nothing is ever out of reach.
-The status line counts your place: `match 2 of 5`.
+| Key | Action |
+|-----|--------|
+| `Esc` / `Ctrl-C` | Go back to Normal mode |
+| `Backspace` / `Ctrl-H` | Delete the character before the cursor |
+| `Ctrl-W` | Delete the word before the cursor |
+| `Ctrl-U` | Delete back to the first non-blank. Press again to delete the indent. |
+| `Ctrl-T` / `Ctrl-D` | Indent / unindent the line by one `indent` width |
+| `Tab` | Insert `indent` spaces, or a tab when `indent` is 0 |
+| `Enter` | Start a new line, indented to the bracket depth |
+| `Ctrl-N` / `Ctrl-P` | Complete the word before the cursor from words in the buffer, nearest first |
+| `Ctrl-O` | Run one Normal-mode command, then go back to Insert mode |
+| Arrows | Move the cursor. This ends the current undo step. |
 
-`Ctrl + o` arms exactly one command, not one keystroke: `Ctrl + o` `d` `d`
-deletes the line and drops you back where you were typing. A command that
-chooses a mode of its own — `:`, `/`, `i` — keeps it instead.
+Brackets:
 
-### Command line and search
-|Mode  | Keybind        | Action                                          |
-|------|----------------|-------------------------------------------------|
-|Command/Search| Up / Down | Walk the history for that prompt              |
-|Command/Search| Ctrl + f | Open the history as a list                    |
-|Command/Search| Ctrl + c | Abandon the line                              |
+- When you type `(`, `[` or `{`, Cano also inserts the closing bracket.
+- When you type a closing bracket in front of the same bracket, the cursor
+  steps over it.
+- When you press `Enter` between a bracket pair, Cano opens an indented line
+  between them.
 
-Each prompt keeps its own history of the last 50 lines it ran, and a line run
-again moves to the front rather than being stored twice. `Ctrl + f` opens them
-newest first: `j`/`k` and the arrow keys move, Enter runs the entry under the
-cursor, and Esc closes the list. The mouse only moves the selection there —
-Enter is what runs a line, because a command run from the list can ask for a
-save or a quit.
+Completion moves through the list each time you press the key. If you move
+past either end, your original text comes back. The status line shows the
+position, for example `match 2 of 5`.
 
-The history is per session; it is not written to disk.
+### Command and Search prompts
 
-### Windows
-`Ctrl + w` is vim's window prefix. Cano has one window and no splits, so the
-prefix swallows the key that follows it and says so rather than let `Ctrl + w`
-`v` fall through and start Visual mode. Esc cancels it silently.
+| Key | Action |
+|-----|--------|
+| `Enter` | Run the line |
+| `Esc` / `Ctrl-C` | Discard the line |
+| `Left` / `Right`, `Backspace` | Edit the line |
+| `Up` / `Down` | Move through this prompt's history |
+| `Ctrl-F` | Show the history as a list. `j`/`k` move, `Enter` runs, `Esc` closes. |
 
-## Operators and text objects
-`d`, `y` and `c` are operators: each waits for something to work on, and takes
-either a motion (`0`, `$`, `w`, `b`, `e`, `g`, `G`) or a text object. Doubling
-the key acts on the line — `dd` removes it, `cc` empties it but leaves the line
-to type on, the way vim's do.
+Each prompt keeps its last 50 different lines for the current session.
 
-`c` deletes and then opens Insert mode where the text was, in one undo step:
-`u` puts back both what was removed and what was typed. `cw` on a non-blank
-changes to the end of the word rather than through the blanks after it, which
-is vim's one irregular operator-motion pair and the reason typing after `cw`
-does not run into the next word.
+## Operators, text objects and repeat
 
-A count in front of `c` is dropped rather than applied — `3cw` changes one
-word, not three. `3d` deletes three lines, so the two operators disagree here;
-the count is refused on `c` because repeating the key the way a count does
-would complete `cc` on the second press and type the motion into the line it
-had just opened.
+The operators `d` (delete), `y` (yank) and `c` (change) take one of these
+targets:
 
-A text object is `i` (inner) or `a` (around) and then the kind:
+- a motion: `0 $ w b e g G`;
+- the same key again, for the whole line: `dd`, `yy`, `cc`;
+- a text object.
 
-| Object | Takes |
-|--------|-------|
-| `w`    | The run of like bytes under the cursor: a word, a run of punctuation, or a run of blanks |
-| `p`    | A paragraph: the run of blank or non-blank rows the cursor is in |
-| `(` `)` `b` | The innermost parentheses enclosing the cursor |
+Any other key cancels the operator.
+
+`c` deletes the target and then starts Insert mode. The deletion and all the
+text you type are **one undo step**. As in Vim, `cw` on a word changes only to
+the end of the word.
+
+**Counts** apply to the motion as in Vim:
+
+- `3dw` and `d3w` both delete three words. `2d3w` deletes six.
+- `3dd`, `3yy` and `3cc` act on three lines.
+- `3d` alone waits for its motion.
+- `d2aw` deletes two words and their blanks.
+- Cano drops a count that comes before `s`, `t`, `:`, `/` or space.
+
+| Text object (`i` inner / `a` around) | Selects |
+|--------------------------------------|---------|
+| `w` | The run of word characters, punctuation or blanks under the cursor |
+| `p` | The paragraph: the run of blank or non-blank lines |
+| `(` `)` `b` | The innermost parentheses |
 | `[` `]` | The innermost square brackets |
 | `{` `}` `B` | The innermost braces |
 | `<` `>` | The innermost angle brackets |
-| `"` `'` `` ` `` | The quoted run the cursor is in, or the first one after it on the row |
+| `"` `'` `` ` `` | The quoted string under the cursor, or the next one on the line |
 
-So `diw` removes the word under the cursor, `ci"` retypes the contents of a
-string, and `ya{` copies a block with its braces. `a` takes the delimiters as
-well as what is between them; for `aw` and `a"` it also takes the blanks that
-follow, and `aw` reaches backwards instead when the word ends the line, so
-neither leaves a double space behind.
+- The `a` form includes the delimiters.
+- `aw` and `a"` also take the blanks after the object. At the end of a line,
+  they take the blanks before it.
+- Bracket matching ignores brackets inside quotes.
+- If the text object does not exist, nothing happens. An example is `di(`
+  outside any parentheses.
 
-Brackets are matched with quoting in mind, the same way `%` is: the `(` in
-`f("(", x)` is inside a string literal and does not open a pair. An object that
-is not there — `di(` outside any parentheses — does nothing at all rather than
-guessing at a range.
+### The `.` repeat
 
-## Repeating a change
-`.` types the last change again. A change is anything that edited the buffer:
-`x`, an operator and its target, `p`, `r`, `Ctrl + a` / `Ctrl + x`, or an Insert
-mode entry (`i`, `a`, `o`, and their capitals) together with everything typed
-before Esc. `ciwword` then Esc, `w`, `.` rewrites the next word the same way.
+`.` repeats the last change. A change is one of these:
 
-Motions, searches, undo and the file panes are not changes and leave `.` alone,
-so moving somewhere and pressing `.` repeats the edit rather than the move. A
-command that turned out to change nothing — an operator abandoned with Esc, an
-insert that typed nothing — does not displace what `.` is holding either.
+- `x`, `p` or `r`;
+- an operator and its target;
+- `Ctrl-A` / `Ctrl-X`;
+- an Insert session and all the text typed before `Esc`.
 
-The keys are replayed as typed, so a `set-map` expansion repeats as the key that
-was mapped rather than what it stood for. A change interrupted by a `:` or `/`
-prompt is abandoned rather than recorded.
+`.` uses the count of the original change, so `3x` then `.` deletes three more
+characters. A count before `.` replaces the stored count. The new count stays
+for the next `.`.
 
-## Mouse
-The mouse is on by default and can be turned off with `:set-var mouse 0`, or
-from `init.lua` with `setup({ mouse = false })`. The setting takes effect
-immediately, without a restart.
+These do not replace the stored change:
 
-| Gesture | Action |
+- motions, searches, undo and panes;
+- a command that changed nothing;
+- a command interrupted by a `:` or `/` prompt;
+- Visual-mode edits, which are not recorded.
+
+Cano replays the keys as you typed them, so a mapped key repeats its mapping.
+
+## Visual mode
+
+| Key | Action |
+|-----|--------|
+| `h j k l 0 $ w b e g G %`, arrows | Extend the selection. Counts work: `3j`. |
+| `s{char}` | Extend the selection to an EasyMotion label |
+| `d` / `x` | Delete the selection, including the character under the cursor |
+| `y` | Yank the selection |
+| `c` | Delete the selection and type the new text, as one undo step. In linewise mode, one empty line stays. |
+| `p` | Put the clipboard text over the selection. The replaced text goes into the clipboard. |
+| `o` | Move the cursor to the other end of the selection |
+| `r{char}` | Replace every selected character. Line breaks stay. |
+| `v` / `V` | Change to charwise / linewise. Press the key of the current kind to leave Visual mode. |
+| `>` / `<` | Indent / unindent the selected lines |
+| `=` | Format the selected lines (whitespace tidy; see [Autoformat](#autoformat)) |
+| `Ctrl-E` / `space e` | Toggle line comments |
+| `Ctrl-V` | Change to blockwise. If the selection is already blockwise, leave Visual mode. |
+
+**Blockwise mode** (`Ctrl-V`) selects a rectangle:
+
+- `d`/`x` cut the rectangle in one undo step. `y` copies it.
+- Lines too short to reach the block count as blank.
+- The clipboard does not store the shape, so `p` pastes the rows back as
+  lines.
+- `>`, `<` and `=` act on every row that the block touches.
+
+**Comment toggle** uses the comment marker for the file type:
+
+| Marker | File types |
+|--------|------------|
+| `//` | C, C++, Rust |
+| `#` | Python, shell |
+| `--` | Lua |
+| `"` | Vim script |
+
+- If all non-blank selected lines have comments, Cano removes them. If not,
+  Cano adds comments to all of them, at the column of the smallest indent.
+- Blank lines are skipped.
+- The whole toggle is one undo step.
+- For an unknown file type, JSON, or a read-only buffer, Cano shows an error.
+
+## Search, highlight and replace
+
+### Search
+
+`/text` searches forward from the cursor for the literal text. The search is
+case-sensitive and wraps at the end of the file. Matches stay highlighted.
+
+- `n`/`N` repeat the search forward and back. They accept a count.
+- `*` searches for the word under the cursor as a whole word.
+- `:nohl` (or `:nohlsearch`) hides the highlight. `n` still uses the pattern.
+
+### Legacy replace: `/s/old/new`
+
+This shortcut comes from the C editor. It replaces the *next* `old` after the
+cursor and moves the cursor there. It is one undo step. It is refused on a
+read-only buffer. It takes no flags; use `:s` for flags.
+
+### Substitute: `:s`
+
+```
+:[range]s/pattern/replacement/[flags]
+```
+
+| Part | Meaning |
+|------|---------|
+| range | `%` the whole file, `N` line N, `.` the current line, `$` the last line, `a,b` lines a to b. If you omit it, Cano uses the current line. |
+| `s` | Any prefix of `substitute` also works. |
+| delimiter | Any punctuation except `\`. For example, `:%s#http://#https://#g` works. |
+| pattern | Literal text, not a regular expression. `\<` and `\>` mark word boundaries. `\` escapes the delimiter and itself. |
+| flags | `g` replaces every match on a line. `c` asks before each match: `y` yes, `n` no, `a` all the rest, `q`/`Esc` stop. `i` ignores case. |
+
+One `:s` command is one undo step, with or without `c`. It is refused on a
+read-only buffer.
+
+## Commands
+
+To run a command, type `:`, then the command, then press `Enter`.
+
+| Command | Action |
 |---------|--------|
-| Click | Move the cursor there. A click in the gutter goes to the start of that line, and a click past the end of a line goes to its end. |
-| Click and drag | Select from where the button went down, in charwise Visual mode. |
-| Wheel | Scroll three lines, bringing the cursor along only as far as it must. |
-| Click or drag the scrollbar | Scroll to that position. The thumb lands on the row you clicked and follows a drag, which keeps working even if the pointer strays off the column. |
-| Click in the explorer or recent list | Select that entry; clicking the entry already selected opens it, so a double click opens. Its scrollbar moves the selection instead, and never opens anything. |
+| `:w` | Save. If you set a path with `set-output`, Cano saves there. |
+| `:q` | Quit. Cano refuses if there are unsaved changes. |
+| `:q!` | Quit and discard changes |
+| `:wq` | Save and quit |
+| `:e` / `:we` | Legacy aliases for `:q` / `:wq`. `:e` does **not** open a file. |
+| `:help [page]` / `:h [page]` | Open `general` (the default), `keys` or `cmds` read-only in place of the buffer. Cano refuses if there are unsaved changes; `:help!` discards them. `Ctrl-P` takes you back to your file. |
+| `:[range]s/…/…/[gci]` | Substitute (see above) |
+| `:set …` | Set options (see [Options](#options)) |
+| `:set-var name expr` | Set an option to an integer expression |
+| `:set-output "path"` | Change the path that `:w` saves to. The quotes are required. |
+| `:set-map key "keys"` | Map a Normal-mode key to a key sequence |
+| `:imap lhs rhs…` | Map a key sequence typed in Insert mode |
+| `:let name [=] expr` | Define an integer variable |
+| `:echo name` / `:echo "text"` | Show a variable or a literal |
+| `:nohl` / `:nohlsearch` | Hide the search highlight |
+| `:autoformat` / `:Autoformat` | Format the buffer |
+| `:!command` | Run `sh -c command` in the background (see below) |
 
-While Cano has the mouse the terminal does not, so its own click-to-select stops
-working. Most terminals still offer a native selection with Shift held; turning
-`mouse` off hands it back entirely.
+Expressions use integers and `+ - * /`. Cano evaluates them strictly from left
+to right. There is no operator precedence.
 
-A click is not a key: it cannot answer the save prompt, complete an `:imap`, or
-pick an `s`/`t` jump label.
+### `:!command`
 
-## Autoformat
-`:autoformat` (or `:Autoformat`) pretty-prints a valid `.json` document. For
-other files it tidies the whole buffer's whitespace as the fallback that
-[vim-autoformat](https://github.com/vim-autoformat/vim-autoformat) runs when no
-external formatter is configured, in the same order and each behind its own
-switch:
+The command runs in the background, so you can keep editing.
 
-| Step | Option | Does |
-|------|--------|------|
-| Re-indent | `autoformat_autoindent` | Sets each line's indentation from its bracket nesting, like `gg=G`. A line opening with a closing bracket sits a level out; a blank line is left blank |
-| Retab | `autoformat_retab` | Rewrites leading whitespace as tabs or spaces to match `indent`, preserving the column it found |
-| Strip line ends | `autoformat_remove_trailing_spaces` | Removes trailing spaces and tabs |
+- While it runs, the message line shows `Running: <command> (Ns)`.
+- When it ends, the message line shows the last non-blank line of its
+  standard output. If standard output is empty, it shows the last non-blank
+  line of standard error.
+- On failure, the status comes first, for example `[exit 2] error: foo`.
+- Only one command can run at a time.
 
-All three are on by default. Turn one off with `:set noautoformat_retab` — worth
-knowing for a Makefile, where a leading tab is not decoration.
+### `set-map`
 
-Indentation follows `indent`: a width of `0` means one tab per level, anything
-else that many spaces. Brackets inside string literals are ignored, so `a =
-"{";` does not open a block. The rewrite is **one undo step**, and this
-non-JSON fallback never changes how many lines a file has.
-
-For JSON, object order, duplicate keys, number spellings, string escapes and a
-final newline are preserved. Indentation follows `indent`; malformed JSON is
-left untouched and its parse error is shown. Visual `=` still applies the
-selected-line whitespace formatter rather than trying to parse a fragment as a
-complete JSON document.
-
-It reports what it did (`Formatted 4 lines`, or `Already formatted`), and
-refuses on a read-only help page. There is no on-save hook — run it when you
-want it, or bind it:
+`set-map` works in Normal mode. The key is one character or a special key
+name. To submit a `:` command, put a literal line break in the right-hand
+side:
 
 ```lua
 cano.command([[set-map <c-f> ":autoformat
 "]])
 ```
 
-## Showing invisible characters
-`:set list` draws the characters that otherwise show nothing, and `:set
-listchars=` decides what it draws:
+- If you map the same key twice, Cano keeps the *first* mapping.
+- Expansion has limits: 64 levels deep and 10,000 keys. A map that refers to
+  itself cannot hang the editor.
+
+### `imap`
+
+`imap` maps a sequence of keys typed in Insert mode, for example
+`:imap jk <Esc>`. A `<…>` name becomes its byte. All other text is literal. If
+the right-hand side contains spaces, put it in quotes.
+
+- A mapping runs as soon as you type its last key. So if a longer mapping
+  starts with a shorter one, the longer one can never run.
+- If you move the cursor, a partly typed sequence is reset.
+- If you map the same left-hand side again, the new mapping replaces the old
+  one.
+
+### Special key names
+
+These names work in `set-map` and `imap`:
+
+- `<space> <esc>/<escape> <tab> <nul>`
+- `<cr>/<enter>/<return> <bs>/<backspace>`
+- `<up> <down> <left> <right> <home> <end>`
+- `<delete>/<del> <insert>/<ins>`
+- `<pageup>/<page-up> <pagedown>/<page-down>`
+- `<c-a>`…`<c-z>` (also `<ctrl-a>`…), `<c-?>`
+
+## Options
+
+`:set` works as in Vim:
+
+| Form | Effect |
+|------|--------|
+| `:set name` / `:set noname` | Turn the option on / off |
+| `:set name!` | Toggle the option |
+| `:set name=N` | Set an integer (`listchars` takes a spec) |
+| `:set name?` | Show the current value |
+
+You can set several options in one line: `:set cursorline rnu sw=2`. A
+backslash escapes a space inside a value. `:set-var name expr` sets an option
+from an expression.
+
+| Option | Aliases | Default | Meaning |
+|--------|---------|---------|---------|
+| `syntax` | `syn` | on | Syntax highlighting |
+| `relative` | `relativenumber`, `rnu` | off | Relative line numbers. The cursor line shows its absolute number. |
+| `indent` | `shiftwidth`, `sw` | 4 | Spaces per indent level. `0` means a tab. |
+| `tabstop` | `ts` | 4 | Width of a tab in columns (1–32). Retab also uses it. |
+| `cursorline` | `cursor-line`, `cul` | off | Underline the cursor line |
+| `mouse` | | on | Cano handles the mouse. The change takes effect at once. |
+| `backup` | `bk` | on | Back up the file on disk before each save |
+| `list` | | off | Show invisible characters |
+| `wrap` | | on | Continue long lines on the next screen row. `:set nowrap` scrolls sideways instead. |
+| `listchars` | `lcs` | see below | Glyphs for `list` |
+| `autoformat_autoindent` | | on | `:autoformat` re-indents |
+| `autoformat_retab` | | on | `:autoformat` converts leading whitespace to match `indent` |
+| `autoformat_remove_trailing_spaces` | | on | `:autoformat` removes trailing whitespace |
+| `auto_indent` | `auto-indent`, `autoindent`, `ai` | on | Kept for compatibility. It has no effect: `Enter`, `o` and `O` always auto-indent. |
+| `undo_size` | `undo-size` | 32 | Number of undo steps kept. `0` or less means no limit. |
+
+**Note:** Each tab is `tabstop` columns wide wherever it is. Cano does not
+align tabs to tab stops as Vim does.
+
+## Configuration (`init.lua`)
+
+Cano runs `~/.config/cano/init.lua` if it exists. With `--config`, it runs the
+file you give instead. The home directory comes from `HOME`. If `HOME` is not
+set, Cano uses `USERPROFILE`. Without `--config`, Cano creates
+`~/.config/cano/` at startup.
+
+```lua
+local cano = setup({
+    syntax = true,       -- syntax highlighting
+    relative = true,     -- relative line numbers
+    cursorline = true,   -- underline the cursor line
+    mouse = true,        -- false gives the mouse back to the terminal
+    backup = true,       -- copy what each save overwrites into .backups/
+    list = false,        -- show invisible characters
+    wrap = true,         -- wrap long lines at the screen edge
+    indent = false,      -- false: tabs; true: ONE space (see below)
+    auto_indent = false, -- compatibility no-op
+})
+
+cano.command([[set sw=2 listchars=tab:»\ ,trail:~,eol:$]])
+cano.command("imap jk <Esc>")
+-- cano.exit(0, "bye")
+```
+
+### `setup(table)`
+
+- `setup` is optional. Its argument must be a table. A second call merges with
+  the earlier ones.
+- **Only Lua booleans count.** `true` means 1 and `false` means 0. Cano
+  ignores any other value, such as `indent = 2`. This is why `indent = true`
+  gives an indent of one space.
+- For other widths, use `cano.command("set sw=2")`. For the undo limit, use
+  `cano.command("set undo_size=100")`. A boolean `undo_size` in `setup` sets
+  the limit to 1 or 0.
+
+### `cano.command` and `cano.exit`
+
+`setup` returns a table with two functions:
+
+- `cano.command(line)` queues a `:` command line. The leading `:` is optional.
+  - The lines run in order, after Cano applies the `setup` options and
+    **before the terminal opens**.
+  - If a line fails, Cano reports the error and does not apply that line.
+  - This is the only way to set non-boolean options and the `autoformat_*`
+    options from Lua.
+  - For commands that contain backslashes, use a Lua `[[long string]]`.
+- `cano.exit(code[, message])` stops Cano before the editor opens. It prints
+  `Exiting as specified in the configuration, message: <message>` and exits
+  with `code`.
+
+**Warning:** The Lua state has the full standard library (`io`, `os`, …).
+Treat `init.lua` as trusted code.
+
+For a commented example, see [`examples/init.lua`](examples/init.lua).
+
+## Syntax highlighting
+
+| Language | Selected by |
+|----------|-------------|
+| C | `c`, `h` |
+| C++ | `cc cpp cxx c++ hh hpp hxx h++ ipp tpp` |
+| Rust | `rs` |
+| Python | `py pyi pyw` |
+| Shell | Extensions `sh bash zsh ksh ash dash`; file names `.bashrc .bash_profile .bash_aliases .bash_logout .profile .zshrc .zprofile .zshenv .zlogin .zlogout .kshrc bashrc profile` |
+| Vim script | Extensions `vim vimrc`; file names `.vimrc _vimrc vimrc .gvimrc _gvimrc gvimrc .exrc` |
+| Lua | `lua` |
+| JSON | `json` |
+
+Each language has its own scanner, not only its own keyword list. So each
+token has the meaning that its language gives it:
+
+- `//` is a comment in C, but floor division in Python.
+- `'a` is a lifetime in Rust.
+- `#` is a directive, an attribute or a comment, depending on the language. In
+  shell, it starts a comment only at the start of a word.
+- `"` starts a comment in Vim script.
+- `--` starts a comment in Lua.
+- The scanners also handle Rust raw strings and nested block comments, Python
+  prefixed and triple-quoted strings, shell `${…}`, Vim `<key>` notation and
+  Lua long brackets.
+
+`:set nosyntax` turns highlighting off.
+
+### Custom palettes (`.cyntax`)
+
+Put `<extension>.cyntax` in the same directory as your config, for example
+`~/.config/cano/go.cyntax`. The file is a list of groups. Each group ends with
+`.` and has comma-separated fields: `tag,r,g,b,word,word,…`.
+
+```text
+k,170,68,68,
+auto,struct,break,else,switch,case,return.
+t,255,165,0,
+int,char,float,double,size_t.
+w,128,160,255,
+NULL,EOF.
+```
+
+| Tag | Group | An empty word list means |
+|-----|-------|--------------------------|
+| `k` | Keywords | Use the language's built-in keywords (C keywords for an unknown extension) |
+| `t` | Types | Use the language's built-in types |
+| `w` | Extra words | Highlight nothing |
+
+- Colour values are integers from 0 to 255. Cano ignores whitespace around
+  fields.
+- A palette changes colours and words. It never changes the scanner.
+- Cano finds palettes by extension only. A file recognised by its name (such
+  as `.vimrc`) cannot use a palette.
+- Cano ignores a malformed palette without a message and uses the built-in
+  colours.
+
+## Markdown display
+
+Markdown display is on by default for `.md .markdown .mdown .mkd .mkdn .mdx`
+files. When it is on, the status line shows `[MD]`. `Ctrl-M` or `Enter`
+turns it on or off.
+
+It colours these elements in place:
+
+- headings (ATX and setext), emphasis and strikethrough;
+- code spans and code fences;
+- links, autolinks and bare URLs;
+- lists and task boxes, block quotes, tables, horizontal rules and front
+  matter.
+
+The Markdown punctuation is dimmed, not hidden. Every character stays in its
+column, so editing and motions work the same as with the display off.
+
+## Invisible characters
+
+`:set list` (or `space l`) shows invisible characters. The glyphs come from
+`listchars`:
 
 ```vim
-:set listchars=tab:▸\ ,trail:·,eol:↲,nbsp:⎵,space:·
-:set list!
+:set listchars=tab:▸\ ,trail:·,eol:↲,nbsp:⎵,space:·    " the default
+:set listchars?                                       " show the current set
 ```
 
 | Item | Marks |
 |------|-------|
-| `tab:xy` | A tab: `x` in its first column, `y` filling the rest |
-| `trail:x` | Whitespace at the end of a line |
-| `eol:x` | The line ending |
-| `nbsp:x` | A non-breaking space |
-| `space:x` | Any space that is not trailing |
+| `tab:xy[z]` | A tab: `x` first, then `y` as fill (`z` is optional) |
+| `trail:x` | Trailing whitespace |
+| `eol:x` | End of line |
+| `nbsp:x` | Non-breaking space |
+| `space:x` | All other spaces |
 
-The default is the line above, so `list` shows something useful without being
-configured first:
+- A new `listchars` value replaces the whole set. Cano does not show the items
+  you leave out.
+- A backslash escapes the next character. This is how a space can be a glyph.
+- The glyphs are dimmed. Nothing moves: a tab keeps its width.
 
-```vim
-listchars=tab:▸ ,trail:·,eol:↲,nbsp:⎵,space:·
-```
+## Autoformat
 
-(Vim leaves this at `eol:$`, which marks only line endings and with a character
-that also occurs in text; `:set listchars=eol:$` restores it.) A `listchars=`
-of your own replaces the whole set, and items you leave out are then not drawn
-at all. `:set listchars?` reports the current set.
+`:autoformat` (`space f`) formats the whole buffer.
 
-A backslash escapes the next character, which is how the space in `tab:▸\ `
-survives being split off as a separate argument. Glyphs are drawn subdued and
-**nothing moves** — a tab keeps its four columns — so the cursor, selections,
-mouse and jump labels behave exactly as they do with `list` off.
+**`.json` files:** Cano validates the JSON and pretty-prints it at the
+`indent` width. It keeps key order, duplicate keys, number spellings, string
+escapes and the final newline. If the JSON is not valid, the buffer does not
+change and Cano shows the parse error.
 
-`list` is off by default. `[space] l` toggles it, as does `:set list!`, and
-`setup({ list = true })` turns it on at startup.
+**All other files:** Cano uses the
+[vim-autoformat](https://github.com/vim-autoformat/vim-autoformat) fallback.
+It has up to three steps. An option controls each step:
 
-To change the glyphs from `~/.config/cano/init.lua`, run the command from
-there. A Lua `[[long string]]` keeps backslashes as written, so the line is the
-vim one verbatim:
+1. Re-indent from the bracket nesting. Brackets in strings do not count
+   (`autoformat_autoindent`).
+2. Convert leading whitespace to match `indent` (`autoformat_retab`).
+3. Remove trailing whitespace (`autoformat_remove_trailing_spaces`).
 
-```lua
-local cano = setup({ list = true })
+The number of lines never changes.
 
-cano.command([[set listchars=tab:»\ ,trail:~,eol:$]])
-```
+**Note:** In a Makefile, turn off the retab step with
+`:set noautoformat_retab`, so that the tabs stay.
 
-`cano.command` runs anything you could type at the `:` prompt — `set`, `imap`,
-`set-map`, `nohl` — so an option needs no configuration slot of its own. A
-leading `:` is accepted. Commands run after the `setup` table is applied, in
-the order given, and a mistake is reported rather than applied.
+In Visual mode, `=` applies the whitespace tidy to the selected lines, also in
+JSON files.
 
-Note the backslash before the space in `tab:▸\ `: `:set` splits its arguments
-on whitespace, so without it the value ends at `tab:▸` and the rest is read as
-another option. This is the same rule vim has. In an ordinary quoted Lua
-string the backslash must be doubled (`"...tab:▸\\ ,..."`), which is why the
-long-string form is easier.
+In both cases:
 
-### `:set`
-The `listchars` line above needs vim's `:set`, so Cano understands it:
+- The format is one undo step.
+- Cano reports `Formatted N lines` or `Already formatted`.
+- Cano refuses on a read-only buffer.
 
-| Form | Action |
-|------|--------|
-| `:set name` / `:set noname` | Turn an option on or off |
-| `:set name!` | Toggle it |
-| `:set name=value` | Assign it |
-| `:set name?` | Report its current value |
+## File explorer and recent files
 
-Several options can be given at once (`:set cursorline rnu sw=2`), and vim's
-own names are accepted alongside Cano's where they differ — `relativenumber`
-and `rnu` for `relative`, `autoindent` for `auto_indent`, `shiftwidth` and
-`tabstop` for `indent`, `lcs` for `listchars`. `:set-var` is unchanged and
-still takes an expression.
+The file explorer and the recent-files list are the two panes. Each pane
+fills the screen, so when you open one, the other closes.
 
-## Suspending
-`Ctrl + Z` stops the editor and hands the terminal back to the shell, exactly
-as it does elsewhere; `fg` returns to the buffer where you left it. Unsaved
-changes are no obstacle — suspending is not leaving.
+**File explorer (`Ctrl-N` / `space n`)**
 
-Raw mode switches off the terminal's own signal generation, so `Ctrl + Z`
-arrives as an ordinary keystroke rather than stopping the process. Cano gives
-the terminal back, raises `SIGTSTP` on itself, and takes the terminal again
-when the shell resumes it. As in vim it is a Normal-mode key; in Insert mode it
-types.
+- Shows the current working directory, including hidden entries.
+- Directory names end in `/`. Select `..` to go up. Symbolic links are not
+  shown.
+- `j`/`k` or the arrows move, `Enter` opens, `Esc` closes.
 
-Not available on Windows, which has no job control to suspend into.
+**Recent-files list (`Ctrl-P` / `space r`)**
+
+- Shows the files you opened, newest first.
+- Keeps up to 50 files. Files that no longer exist are skipped. Help pages
+  are not added.
+- Cano stores the list in a file named `recent` in the config directory, so
+  it stays across sessions.
+- Long paths are shortened from the left.
+
+If the buffer has unsaved changes, both panes first ask
+`Save changes? (y/n, Esc cancels)`:
+
+| Key | Result |
+|-----|--------|
+| `y` | Save, then open the pane. If the save fails, the pane does not open. |
+| `n` | Open the pane. The changes stay in memory. |
+| `Esc` | Stay in the buffer. |
 
 ## Backups
-Every save first copies what is already on disk into a `.backups` directory
-beside the file, so `src/main.rs` is backed up to `src/.backups/`. The copy is
-of the version being **replaced** — if the buffer you just wrote was wrong, the
-backup has what was there before.
 
-Copies are named `<file>.<YYYYMMDD-HHMMSS>`, in UTC so they sort the way they
-read, with a `.1`, `.2` suffix if you save twice within the same second. The
-newest 10 per file are kept and older ones are dropped. A file that does not
-exist yet has nothing to back up, so first saves create nothing.
+Before each save, Cano copies the file **as it is on disk** to a `.backups/`
+directory next to it. So you can always get back the version that the save
+overwrote.
 
-It is on by default; `:set-var backup 0`, or `setup({ backup = false })`, turns
-it off. If a backup cannot be written the save still goes ahead and the reason
-is reported — the unsaved edit is the thing at risk, not the copy. Browse the
-copies with the file explorer (`Ctrl + n`, then open `.backups/`).
-
-## Recent files
-`Ctrl + p` opens a list of the files you have opened before, most recent first.
-`j`/`k` and the arrow keys move through it, Enter opens the selection, and Esc
-or a second `Ctrl + p` closes it. It shares the pane with the file explorer, so
-opening one closes the other.
-
-It used to be `Ctrl + r`, which is vim's redo; the picker moved to `Ctrl + p`,
-where every other editor puts "open something I had open".
-
-If the buffer has unsaved changes, both keys ask `Save changes? (y/n, Esc
-cancels)` before leaving it: `y` writes the file and then opens the pane, `n`
-opens it and keeps the changes in the buffer, and Esc stays put. A failed write
-leaves the pane shut, so unsaved work is never one keystroke from being
-replaced.
-
-The list is stored beside the effective configuration file — `~/.config/cano/recent`
-by default — as one absolute path per line, and it survives across sessions. It
-holds up to 50 entries, records a file each time one is opened, and never offers
-an entry whose file has since been deleted. Built-in help pages are left out of
-it. Long paths are shown with their beginning elided, because the file name is
-the part that tells two entries apart.
-
-## Jump motions
-`s` and `t` are the two find motions from
-[vim-easymotion](https://github.com/easymotion/vim-easymotion). Both ask for one
-character, label every occurrence you can see, and jump to whichever label you
-type next. They differ the way the plugin's do:
-
-- `s{char}` finds the character **in both directions**.
-- `t{char}` is **forward only** and stops one byte **before** the match, like
-  vim's own `t`. (Upstream's bidirectional till is a separate `bd-t` mapping.)
-
-Labels come from EasyMotion's default key order, `asdghklqwertyuiopzxcvbnmfj;`,
-and are handed out nearest-first, so the closest match is always one keystroke.
-When there are more matches than keys the trailing keys become prefixes for
-two-key labels, and typing the first key narrows the labels still on screen. A
-single match skips the label and jumps straight there. Escape, or any key that
-matches no label, cancels.
-
-`s` also works in Visual mode, where it is a motion like any other: the labels
-appear over the text and picking one extends the selection to it, keeping the
-anchor where you started. A linewise selection (`V`) still grows by whole rows.
-Escape cancels the jump and leaves the selection alone, so it takes a second
-Escape to leave Visual mode.
-
-Targets are limited to the rows currently on screen, because a label you cannot
-read is not a label you can reach. While a jump is collecting keys it owns the
-keyboard, so a `set-map` mapping cannot fire out from under the labels.
-
-## Search and replace
-`:s` is vim's substitute command:
-
-```vim
-:%s/foo/bar/g
+```
+src/.backups/main.rs.20261016-142233      (UTC timestamp)
+src/.backups/main.rs.20261016-142233.1    (a second save in the same second)
 ```
 
-| Command | Action |
-|---------|--------|
-| `:%s/foo/bar/g` | Replace every `foo` with `bar` in the whole file |
-| `:%s/foo/bar/gc` | Confirm each change (`y` yes, `n` no, `a` all the rest, `q` stop) |
-| `:%s/foo/bar/gi` | Case-insensitive: also matches `Foo`, `FOO` |
-| `:%s/\<foo\>/bar/g` | Whole word only, so `foobar` and `seafood` are left alone |
-| `:5,12s/foo/bar/g` | Only lines 5 through 12 |
-| `:s/foo/bar/g` | Only the line the cursor is on |
-| `:%s#http://#https://#g` | Any punctuation can be the delimiter, so slashes need no escaping |
+- Cano keeps the 10 newest backups of each file.
+- A new file has no earlier version, so its first save makes no backup.
+- The backup has the same permissions as the original file.
+- If the backup fails, Cano shows the error and still saves the file.
+- To turn backups off, use `:set nobackup` or `setup({ backup = false })`.
+- You can browse the backups in the file explorer.
 
-The range may be `%` for the whole file, a line number, `.` for the current
-line, `$` for the last, or a `from,to` pair of any of those; without one the
-command acts on the cursor's line. Without `g` only the first match on each line
-is replaced. Flags may be combined, as in `gc` or `gi`. `substitute` may be
-spelled out in place of `s`.
+## Mouse
 
-One `:s` command is **one undo step**, however many lines it changed — including
-a confirmed run, where `u` takes back everything you said yes to.
+| Action | Result |
+|--------|--------|
+| Click | Move the cursor. A click in the gutter goes to the start of the line. A click past the end goes to the end of the line. |
+| Drag | Select text in charwise Visual mode |
+| Wheel | Scroll 3 lines |
+| Scrollbar (rightmost column) | Click or drag to scroll |
+| Click in a pane or the history list | Select an entry. Click the selected entry again to open it. |
+| `AI` button / panel title bar | Click to open the assistant / drag to resize the panel |
 
-Patterns are literal text rather than regular expressions, with the two vim
-assertions `\<` and `\>` for word boundaries. Inside the pattern or the
-replacement, `\` escapes the delimiter and itself.
+While Cano has the mouse, you can usually still use the terminal's own
+selection if you hold Shift. `:set nomouse` gives the mouse back to the
+terminal completely.
 
-## Highlighting the word under the cursor
-`*` takes the word under the cursor (or the next one on the line), moves to its
-next **whole-word** occurrence, and highlights every match — so `*` on `the`
-leaves `then` and `other` alone. `/` highlights its matches too, as a substring
-search, and `n` repeats whichever kind was last used.
+Mouse clicks never answer prompts and never select jump labels.
 
-`n` repeats the search forward and `N` repeats it backward; both wrap around
-the end of the buffer and take a count, so `3N` goes back three matches.
+## AI assistant
 
-`:nohl` (or `:nohlsearch`) stops showing the highlight without forgetting the
-pattern, so `n` and `N` keep working afterwards.
+Cano can show an assistant panel above the status line. The assistant
+**explains Cano** and **does tasks** in the editor.
 
-The leader is space, giving the two mappings:
+### Turn it on
 
-```vim
-let mapleader = " "
-map <leader>i *          " [space] [i] to highlight a word
-map <leader>o :nohl<cr>  " [space] [o] to un-highlight all words
-```
-
-Both are built in, so no configuration is needed. Space followed by any other
-key does nothing.
-
-## Markdown
-Markdown display formats the buffer in place: headings, emphasis, code, links,
-lists, quotes, tables and rules are colored, and the syntax punctuation is
-dimmed rather than hidden. Every byte keeps the cell it occupies in the normal
-display, so the cursor, selections, search and every motion behave identically
-and the file stays fully editable while it is on.
-
-It is on by default for `.md`, `.markdown`, `.mdown`, `.mkd`, `.mkdn` and
-`.mdx` files, replaces source-code highlighting while active, and is shown as
-`[MD]` in the status line. `Ctrl + m` toggles it; most terminals send the same
-byte for `Ctrl + m` and `Enter`, so `Enter` toggles it in Normal mode too.
-
-## Visual
-Visual mode works the same as Normal mode, except it works on the entire selection, instead of character by character.
-The motions `h j k l 0 $ w b e g G %` and the arrow keys extend the selection.
-
-The selection is what the operators act on here, so they take no target of
-their own: `d` and `y` work on what is already highlighted. Text objects and
-`c` belong to Normal mode — `ciw` is how a word is changed, rather than
-selecting it first.
-| Keybind        | Action                                          |
-|----------------|-------------------------------------------------|
-| s{char}        | Extend the selection to any {char} on screen    |
-| d / x          | Delete the selection                            |
-| y              | Yank the selection                              |
-| >              | Indent current selection                        |
-| <              | Unindent current selection                      |
-| =              | Autoformat the selected lines                   |
-| Ctrl + e       | Toggle line comments over the selected lines    |
-| [space] e      | Leader spelling of Ctrl + e                     |
-
-`Ctrl + e` (or `[space] e`) comments the lines the selection touches, and
-uncomments them instead when every one of them is already commented — one key
-each way, like `gc` in
-[commentary.vim](https://github.com/tpope/vim-commentary). The marker comes
-from the file name: `//` for C, C++ and Rust, `#` for Python and shell, `--`
-for Lua, `"` for vimscript. A file whose type Cano does not recognise says so
-rather than guessing.
-
-Markers line up in one column, chosen from the shallowest line in the
-selection, so a block keeps its shape. Blank lines are skipped — a marker on
-an empty line is noise, and counting them would stop a block that ends on one
-from ever being recognised as fully commented. Uncommenting takes back the one
-space the toggle added and leaves any others alone. The whole toggle is a
-single undo step, however many lines it touched.
-
-## Search
-Search mode takes a string and finds it in the file.
-if prepended with 's/' then it will replace the first substring with the second.
-
-Example: Using the following command
-```sh
-s/hello/goodbye
-```
-Will replace hello with goodbye.
-
-## Commands 
-
-Press `:` in Normal mode, type a command, and press Enter. Cano supports these
-Vim-compatible file commands:
-
-| Command | Action |
-|---------|--------|
-| `:w`    | Write the current buffer without exiting |
-| `:q`    | Quit if the buffer has no unsaved changes |
-| `:q!`   | Quit and discard unsaved changes |
-| `:wq`   | Write the current buffer and quit |
-| `:e`    | Exit without writing (legacy alias for `:q`) |
-| `:we`   | Write the current buffer and exit (legacy alias for `:wq`) |
-
-`:q`, `:e`, and Ctrl+Q refuse to close a modified buffer. Use `:wq` to save
-it or `:q!` to discard the changes.
-
-Additional commands:
-
-| Command               | Action                                                    |
-|-----------------------|-----------------------------------------------------------|
-| set-output "(file)"   | change output file (the quotes are required)              |
-| echo (v)              | echo value (v) where v is either an ident or a literal    |
-| set-var (var) (value) | Change a config variable                                  |
-| set-map (a) "(b)"     | Map key a to any combination of keys b                    |
-| let (n) (v)           | Create variable (n) with value (v)                        |
-| !(command)            | Execute a shell command                                   |
-
-Mappings expand in Normal mode. An expansion can run a colon command by
-including the newline that submits it, for example
-`set-map <c-p> ":wq\n"` typed with a literal Enter inside the quotes.
-
-### Special Keys
-These special key spellings are accepted by `set-map`:
-| Key |
-|-----|
-| `<space>` `<esc>`/`<escape>` `<tab>` `<nul>` |
-| `<enter>`/`<cr>`/`<return>` `<bs>`/`<backspace>` |
-| `<up>` `<down>` `<left>` `<right>` |
-| `<home>` `<end>` `<delete>`/`<del>` `<insert>`/`<ins>` |
-| `<pageup>`/`<page-up>` `<pagedown>`/`<page-down>` |
-| `<c-a>` through `<c-z>` (also spelled `<ctrl-a>` … `<ctrl-z>`), `<c-?>` |
-
-## Config file
-The config file is stored in ~/.config/cano/init.lua by default (on Windows
-the home directory comes from `USERPROFILE`, e.g.
-`C:\Users\you\.config\cano\init.lua`), or can be set at runtime like so:
-```sh
-./cano --config <config_file>
-```
-
-The `init.lua` is the entrypoint of your cano configuration.
-Call the setup() function to make changes to the default configuration.
-Cano preserves the legacy option semantics: every option is read as a Lua
-Boolean, and non-Boolean values are ignored. Options you do not set keep the
-editor's built-in defaults (syntax highlighting on, `indent` of four spaces,
-relative numbers off). In particular, numeric `indent` and `undo_size` values
-are ignored by the compatibility API; use `false` for tab indentation or
-`true` for one-space indentation. `auto_indent` and `undo_size` are retained
-compatibility settings but do not currently change editor behavior.
-
-A ready-to-copy configuration is available at [`examples/init.lua`](examples/init.lua).
-
-```lua
-setup({
-	syntax = true, -- toggle syntax highlighting on-off
-	auto_indent = true, -- retained compatibility no-op
-	relative = true, -- toggle relative line numbers
-	indent = false, -- false: tabs, true: one space
-	undo_size = false, -- retained compatibility no-op
-})
-```
-
-The first parameter of the setup() function must be a table.
-You are free to decide which of the settings above you want to change.
-Settings you never set keep the editor defaults. Repeated `setup` calls retain values from earlier calls.
-
-Therefore, it is also perfectly valid to call setup() with an empty table:
-```lua
-setup({})
-```
-
-There is also a way to interact with cano from your configuration.
-The setup() function returns a table of functions you can use to do so.
-```lua
-local cano = setup({
-	syntax = true, -- toggle syntax highlighting on-off
-	auto_indent = true, -- retained compatibility no-op
-	relative = true, -- toggle relative line numbers
-	indent = false,
-	undo_size = false,
-})
-
-cano.exit(42, "Yoo")
-```
-
-The following functions are available:
-```lua
----@param code The return code of cano on exit (clamped to 0–255)
----@param message Optional; printed on exit when provided
-function exit(code, message) end
-```
-
-## Syntax highlighting
-Cano highlights C, C++, Rust, Python, Bash, Vimscript, Lua and JSON out of the
-box, with no configuration.
-The language is chosen from the file's extension:
-
-| Language | Extensions |
-|----------|------------|
-| C        | `c`, `h` |
-| C++      | `cc`, `cpp`, `cxx`, `c++`, `hh`, `hpp`, `hxx`, `h++`, `ipp`, `tpp` |
-| Rust     | `rs` |
-| Python   | `py`, `pyi`, `pyw` |
-| Bash     | `sh`, `bash`, `zsh`, `ksh`, `ash`, `dash`, and the names `.bashrc`, `.bash_profile`, `.bash_aliases`, `.bash_logout`, `.profile`, `.zshrc`, `.zprofile`, `.zshenv`, `.zlogin`, `.zlogout`, `.kshrc` |
-| Vimscript | `vim`, `vimrc`, and the names `.vimrc`, `_vimrc`, `.gvimrc`, `.exrc` |
-| Lua      | `lua` |
-| JSON     | `json` |
-
-The language picks the scanner as well as the word lists, because the languages
-disagree about what the same characters mean: `//` opens a comment in C, C++ and
-Rust but is floor division in Python; `'a` is a lifetime in Rust and a string
-delimiter elsewhere; `#` is a directive in C and C++, an attribute in Rust, a
-comment in Python, and in shell a comment only at the start of a word so that
-`${name#prefix}` survives; `"` is a string everywhere except vimscript, where it
-is also the comment marker; `--` is a comment in Lua and a minus sign elsewhere.
-Rust raw strings (`r#"…"#`) and nested block comments, Python triple-quoted and
-prefixed (`f"…"`, `rb'…'`) strings, shell parameter expansion, vim key notation
-(`<leader>`, `<C-x>`) and Lua long brackets (`[[…]]`, `[=[…]=]`) are all
-understood. JSON strings and numbers are colored along with its `true`, `false`
-and `null` literals; comments stay plain because JSON has no comment syntax.
-
-Because `.vimrc` and `.bashrc` have no extension at all, the whole file name is
-consulted before falling back to one. A `.cyntax` palette is still keyed by
-extension, so a file named rather than extended gets the built-in colors but
-cannot be given a custom palette.
-
-Any other extension is left uncolored unless you supply a `.cyntax` palette for
-it, and `:set-var syntax 0` turns highlighting off entirely.
-
-There is a secondary config file, which is for custom syntax highlighting. It is stored in the same folder as the regular config, but uses a different naming format.
-An example is ~/.config/cano/c.cyntax (spelled cyntax, with a c). The c can be replaced with whatever the file extension of your language is, such as go.cyntax for Golang.
-Here is an example of a cyntax file:
-```sh
-k,170,68,68,
-auto,struct,break,else,switch,case,
-enum,register,typedef,extern,return,
-union,continue,for,signed,void,do,
-if,static,while,default,goto,sizeof,
-volatile,const,unsigned.
-t,255,165,0,
-double,size_t,int,
-long,char,float,short.
-w,128,160,255.
-```
-There's a bit to unpack here, basically the single characters represent the type of the keywords:
-k - Keyword
-t - Type
-w - Word
-The type is then followed by the RGB values, all comma separated <b>without</b> spaces. After the RGB values, there is the actual keywords. End each type with a dot '.' as seen above, to indicate to Cano that the list is finished. The words are meant to be left blank, as it will highlight any words not found in the keywords above with the chosen RGB color.
-If you wish to only set the color, you can provide no keywords to any, and it will fill in the keywords with the built-in list for that file's language (C for an extension Cano does not recognize). A `.cyntax` file supplies colors and words only; it never changes how the file is scanned, so `rs.cyntax` still gets Rust's lexer.
-
-## Insert-mode mappings
-`:imap {keys} {rhs}` maps a sequence of keys typed in Insert mode:
-
-```vim
-imap ;; <Esc>
-imap jk <Esc>
-imap ,d hello
-```
-
-The left-hand side may be more than one key. The right-hand side is a key
-sequence: `<...>` spellings become their byte and everything else is taken
-literally, so `imap ;; <Esc> :w <CR>` works too. Whitespace separates tokens, so
-quote a right-hand side that needs spaces of its own.
-
-Only an uninterrupted run of typed keys completes a mapping — moving the cursor
-or leaving Insert mode between them breaks the run. Because there is no input
-timeout to wait on, a mapping fires as soon as its keys are all in, which means
-a longer mapping sharing a shorter one's prefix is unreachable. Re-running
-`:imap` with the same left-hand side replaces the earlier binding. Keys with no
-single-byte spelling (the arrows, say) cannot be a right-hand side, because
-replay feeds it back one byte at a time.
-
-## Config Variables
-Config variables can also be modified at runtime by using `:set-var ...`.
-Both the `init.lua` spellings (`auto_indent`, `undo_size`) and the dashed
-spellings (`auto-indent`, `undo-size`) are accepted.
+1. Make sure that `curl` is on your `PATH`.
+2. Set an API key.
+3. Start Cano.
 
 ```sh
-relative # toggle relative line numbers
-auto-indent # retained compatibility no-op
-syntax # toggle syntax highlighting on-off
-indent # set indent
-undo-size # retained compatibility no-op
-cursorline # mark the line the cursor is on (also spelled cursor-line)
-mouse # let Cano handle the mouse
-backup # keep a copy of what each save overwrites
-list # draw the invisible characters named by listchars
-autoformat_autoindent # :autoformat re-indents
-autoformat_retab # :autoformat normalises leading whitespace
-autoformat_remove_trailing_spaces # :autoformat strips line ends
+export ANTHROPIC_API_KEY=sk-ant-...     # or OPENAI_API_KEY=sk-...
+cano notes.md
 ```
 
-`cursorline` is vim's option of the same name, off by default as it is in vim.
-It underlines the cursor's line rather than tinting its background, which is
-what vim itself does in a terminal (`CursorLine` defaults to `cterm=underline`)
-and the only thing that stays readable without knowing whether the terminal's
-background is light or dark. It can also be set from `init.lua`:
+| Variable | Effect |
+|----------|--------|
+| `ANTHROPIC_API_KEY` | Use Anthropic's Messages API. This is the default when both keys are set. |
+| `OPENAI_API_KEY` | Use OpenAI's Chat Completions API |
+| `CANO_AI_PROVIDER=openai` | Use OpenAI when both keys are set |
+| `CANO_AI_MODEL` | Set the model. The default is `claude-opus-5-5`, or `gpt-5` for OpenAI. |
+| `CANO_AI_EFFORT` | Set the effort level sent to Anthropic. The default is `medium`. |
 
-```lua
-setup({ cursorline = true })
+Without a key, the assistant is off. `Ctrl-K` then tells you how to turn it
+on.
+
+### Panel keys
+
+| Key | Action |
+|-----|--------|
+| `Ctrl-K` / click `AI` | Open or close the panel |
+| `Enter` | Send the message |
+| `Esc` | Stop the running request, or move focus back to the editor |
+| `Ctrl-L`, or send `/clear` | Start a new chat |
+| `Up`/`Down`/`PgUp`/`PgDn`, wheel, scrollbar | Scroll the chat |
+| `Left`/`Right`, `Home`/`Ctrl-A`, `End`/`Ctrl-E`, `Ctrl-U`, `Backspace`, `Delete` | Edit the input line |
+| Click the panel / drag its title bar | Move focus to the panel / resize it |
+
+### Tools
+
+The assistant uses these tools:
+
+| Tool | Needs your approval |
+|------|---------------------|
+| `get_editor_state`: file, mode, cursor, line count, modified flag | no |
+| `read_buffer` / `edit_buffer`: read and replace lines by number. Each edit is one undo step, so `u` reverts it. | no |
+| `run_editor_command`: any `:` command. It can save, but it can never quit. | no |
+| `read_file`, `list_directory` | no |
+| `run_shell`: runs `sh -c` and returns the exit status and output | **yes** |
+| `write_file`: writes any file except the one open in the editor | **yes** |
+
+When the assistant asks for approval, press one of these keys:
+
+| Key | Result |
+|-----|--------|
+| `y` / `Enter` | Allow this step |
+| `n` | Refuse this step |
+| `a` | Always allow this tool for the rest of the session |
+| `Esc` | Stop the whole task |
+
+Limits:
+
+- 40 model round trips per request;
+- 30,000 characters per tool result;
+- 2,000 lines per read;
+- a 600-second request timeout.
+
+### Privacy
+
+- Cano gives the API key to `curl` on its standard input, never on its command
+  line.
+- After each completed round, Cano saves the chat to `ai-history.json` in the
+  config directory. On Unix, the file has mode `0600`. Cano loads the chat
+  again at the next start.
+- If the provider or model changed after the chat was saved, Cano shows the
+  old chat but does not send its context to the model.
+- `Ctrl-L` clears the chat.
+
+**Caution:** Cano sends everything the assistant reads (buffer text, files,
+command output) to the selected provider.
+
+## Files Cano reads and writes
+
+| Path | Use |
+|------|-----|
+| `~/.config/cano/init.lua` | Configuration (optional) |
+| `~/.config/cano/<ext>.cyntax` | Custom syntax palettes |
+| `~/.config/cano/recent` | Recent-files list |
+| `~/.config/cano/ai-history.json` | AI chat history (only when a key is set) |
+| `<dir>/.backups/<file>.<stamp>` | Backups made before each save |
+| `$PREFIX/share/cano/help/{general,keys,cmds}` | Help pages (optional; also built in) |
+
+The config directory is the directory of the config file. It is
+`~/.config/cano` by default. With `--config`, it is the directory of the file
+you give, and Cano reads and writes the files above there.
+
+## Behaviour notes and limitations
+
+- **Cano writes files exactly as they are in the buffer.** It does not convert
+  line endings or add a final newline. CRLF files stay CRLF, and each `\r`
+  shows as `�`.
+- **Saves are atomic.** Cano writes a temporary file next to the target, then
+  renames it into place.
+  - The file keeps its permissions. On Unix, it also keeps its owner when the
+    system allows it.
+  - A symlink stays a symlink.
+  - Cano refuses to save over a read-only file.
+  - Cano writes FIFOs, devices and hard-linked files in place, so they keep
+    their identity.
+- **Display.** Cano draws valid UTF-8 as characters at their display width.
+  Invalid UTF-8 bytes and control characters show as `�`. Each tab is
+  `tabstop` columns wide. Blockwise Visual mode counts columns in characters,
+  not cells, so a block next to wide characters can look uneven.
+- **There is one window and one buffer.** When you open a file from a pane, or
+  open `:help`, it replaces the current buffer. Cano does not support
+  `:e file` or `:w file`.
+- **There is one unnamed clipboard.** Cano has no registers and does not use
+  the system clipboard.
+- **The scroll keys work in Normal mode only.** In Visual mode, `Ctrl-E`
+  toggles comments.
+- **`Ctrl-Z` works in Normal mode only.** In Insert mode it does nothing.
+- **If you quit while a `:!` command runs,** the command keeps running.
+- **Cano does not have these Vim features:**
+  - character search `f` `F` `;` `,` (in Cano, `s`/`t` are jump labels);
+  - `P`, `J`, `D`, `C`, `S`, `Y`, `~`, `^`, `H` `M` `L`, `{` `}`, `#`;
+  - `>>`/`<<` in Normal mode (use Visual `>`/`<`);
+  - macros (`q`, `@`) and marks (`m`, `` ` ``);
+  - named registers and regular expressions;
+  - `:e`/`:w` with a file name.
+
+  You can use `set-map` to bind most of these keys to key sequences that Cano
+  has.
+
+[`MIGRATION_NOTES.md`](MIGRATION_NOTES.md) lists more compatibility choices
+from the C editor.
+
+## Development
+
+```sh
+make             # release build -> build/cano
+make debug       # debug build   -> build/cano-debug
+make test        # cargo test --locked --all-targets
+make smoke       # release build + PTY smoke test (needs Python 3)
+
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
 ```
 
-## Installation
+Test suites:
 
-Cano builds from source on Windows, Linux, and macOS. All three platforms
-need a current Rust toolchain (installed with [rustup](https://rustup.rs))
-and a C compiler, because the vendored Lua 5.4 is compiled by the `mlua`
-dependency during the build.
+| Suite | What it tests |
+|-------|---------------|
+| Unit tests in `src/` (about 440) | The buffer, history, editor, app, commands, syntax, display, rendering, saves, the assistant and more |
+| `tests/lifecycle.rs` | Startup errors, exact flag parsing, exit codes, and config runs without a terminal |
+| `tests/help.rs` | `:help` and its check for unsaved changes |
+| `tests/pty_smoke.py` | The real binary in a pseudo-terminal: resize, save and quit checks, `--help=` and `:help`, comment toggle, number increment, block delete, Insert-mode keys, background `:!`, and terminal restore after `SIGTERM`/`SIGHUP` |
 
-### Windows
+GitHub Actions (`.github/workflows/release.yml`) builds release archives for
+all five targets on each push to any branch. When you push a `v*` tag, it
+also publishes them as a GitHub release.
 
-1. Install rustup, either with winget or from <https://rustup.rs>:
-   ```powershell
-   winget install Rustlang.Rustup
-   ```
-2. When prompted, install the Visual Studio C++ Build Tools (rustup offers
-   this automatically); the default `stable-msvc` toolchain is what you want.
-3. Build and run from a fresh terminal:
-   ```powershell
-   cd path\to\cano
-   cargo build --release --locked
-   .\target\release\cano.exe .\file.txt
-   ```
-   Copy `target\release\cano.exe` somewhere on your `PATH` to install it.
-   Note that `:!command` shell execution requires `sh` and is not available
-   on Windows.
+Debug builds check the design-by-contract invariants with `debug_assert!`.
+For details, see [`docs/dbc-ponytail-report.md`](docs/dbc-ponytail-report.md).
 
-### Linux
+The release profile is built for size: `opt-level = "z"`, LTO, one codegen
+unit, stripped symbols, and `panic = "abort"`. A panic hook restores the
+terminal before the process stops.
 
-1. Install a C toolchain if you do not have one (`sudo apt install
-   build-essential` on Debian/Ubuntu, `sudo dnf group install
-   development-tools` on Fedora, `sudo pacman -S base-devel` on Arch).
-2. Install rustup:
-   ```sh
-   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-   ```
-3. Build and install:
-   ```sh
-   cd path/to/cano
-   cargo build --release --locked
-   sudo make install PREFIX=/usr/local
-   ```
-   `make install` places the binary at `/usr/local/bin/cano` and the help
-   pages under `/usr/local/share/cano/help`.
+## Project layout
 
-   On Nix or NixOS you can instead build the `.#cano` package from the
-   included flake.
-
-### macOS
-
-1. Install the Xcode command-line tools for the C compiler:
-   ```sh
-   xcode-select --install
-   ```
-2. Install rustup, either with Homebrew (`brew install rustup-init &&
-   rustup-init`) or the script above.
-3. Build and install:
-   ```sh
-   cd path/to/cano
-   cargo build --release --locked
-   sudo make install PREFIX=/usr/local
-   ```
-
-Prebuilt distribution packages (such as the AUR package) target the original
-C implementation; see [Cano-Projects/Cano](https://github.com/Cano-Projects/Cano)
-for those.
+| Module | Responsibility |
+|--------|----------------|
+| `main.rs` | Startup order, event loop, effects (save, quit, shell, suspend) |
+| `cli.rs` | Argument parsing |
+| `config.rs` | Lua runtime, `setup`, `cano.command`, `cano.exit` |
+| `app.rs` | Input routing, panes, prompts, mouse, repeat, mappings |
+| `editor.rs` | Modal editing state, operators, Insert and Visual behaviour |
+| `buffer.rs` | Byte buffer, row index, cursor, motions |
+| `history.rs` | Undo and redo records |
+| `command.rs` | `:` command language, options, variables, mappings |
+| `substitute.rs` | `:s` parsing and execution |
+| `textobject.rs` | Text-object ranges |
+| `jump.rs` | EasyMotion labels |
+| `comment.rs` | Line-comment toggle |
+| `autoformat.rs` | JSON and whitespace formatting |
+| `syntax.rs` | Language scanners and `.cyntax` palettes |
+| `markdown.rs` | Markdown display spans |
+| `listchars.rs` | `listchars` parsing |
+| `display.rs` | UTF-8 decoding, character widths, byte-to-cell layout |
+| `render.rs` | Ratatui drawing: gutter, text, scrollbar, status line, panes, AI panel |
+| `terminal.rs` | Crossterm session, input decoding, suspend, panic hook, SIGTERM/SIGHUP |
+| `io.rs` | File load, atomic save, path canonicalization, help lookup, built-in help |
+| `process.rs` | `sh -c` execution, background jobs, output summary |
+| `explorer.rs` / `recent.rs` / `backup.rs` | File explorer, recent-files list, backups |
+| `assistant.rs` | AI panel, provider backends, tool loop, chat history |
 
 ## License
 

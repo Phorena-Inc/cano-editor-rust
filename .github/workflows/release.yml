@@ -1,10 +1,12 @@
-# Builds a release binary for each supported platform.  Pull requests and
-# manual runs keep the archives as workflow artifacts; pushing a `v*` tag
-# also publishes them on a GitHub release for that tag.
+# Builds a release binary for each supported platform: Linux, macOS and
+# Windows, on x86-64 and ARM where the runners exist.  Branch pushes, pull
+# requests and manual runs keep the archives as workflow artifacts; pushing
+# a `v*` tag also publishes them on a GitHub release for that tag.
 name: Release binaries
 
 on:
   push:
+    branches: ["**"]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:

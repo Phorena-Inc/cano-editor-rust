@@ -2,7 +2,7 @@
 //! otherwise show nothing.
 //!
 //! These are display substitutions, never buffer contents. A byte keeps the
-//! cells it always occupied — a tab is still four columns wide — so the
+//! cells it always occupied — a tab is still `tabstop` columns wide — so the
 //! cursor, mouse mapping, selections and jump labels are unaffected by
 //! turning `list` on.
 

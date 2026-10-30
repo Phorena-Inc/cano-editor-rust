@@ -38,6 +38,7 @@ pub struct LuaConfig {
     pub mouse: Option<i64>,
     pub backup: Option<i64>,
     pub list: Option<i64>,
+    pub wrap: Option<i64>,
     /// Command lines the configuration asked to run at startup, in the order
     /// it asked. Anything spelled as a `:` command can be configured this way
     /// without needing a slot of its own.
@@ -58,6 +59,7 @@ impl LuaConfig {
             (&mut self.mouse, update.mouse),
             (&mut self.backup, update.backup),
             (&mut self.list, update.list),
+            (&mut self.wrap, update.wrap),
         ] {
             *slot = value.or(*slot);
         }
@@ -135,6 +137,7 @@ fn evaluate_named(source: &[u8], name: &str) -> Result<LuaConfig, ConfigError> {
             mouse: boolean_slot(&table, "mouse")?,
             backup: boolean_slot(&table, "backup")?,
             list: boolean_slot(&table, "list")?,
+            wrap: boolean_slot(&table, "wrap")?,
             ..LuaConfig::default()
         };
         with_config(&setup_state, |config| config.merge(update))?;
@@ -242,7 +245,7 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("configuration evaluated without deadlocking");
         // One `cano.command` call per slot the setup table was asked for.
-        assert_eq!(commands.expect("valid configuration"), 9);
+        assert_eq!(commands.expect("valid configuration"), 10);
     }
     use std::time::{SystemTime, UNIX_EPOCH};
 

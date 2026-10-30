@@ -1,19 +1,25 @@
-Cano — byte-oriented modal terminal editor
+Cano — modal terminal editor
 
 Usage
   cano [--config init.lua] [file]
-  cano -h, --help
+  cano -h, --help          this page
+  cano --help=keys|cmds    the key or command reference
   cano -v, --version
+
+  Inside the editor, :help [general|keys|cmds] (or :h) opens a page in place
+  of the buffer, read-only; :help! discards unsaved changes first. Ctrl-P
+  takes you back to the file you were editing.
 
   A file that does not exist yet opens as an empty buffer and is created on
   the first save.
 
 Modes
   Normal   motions, editing, undo/redo, explorer, recents, search, commands
-  Insert   byte insertion, indentation and brace autoclose
-  Visual   character/line selection, jumps, delete, yank, indent, format
+  Insert   typing, indentation and brace autoclose
+  Visual   character/line/block selection: delete, yank, change, put,
+           replace, indent, format, comment
   Search   wrapped search and s/old/new replacement
-  Command  runtime commands and ! shell execution
+  Command  runtime commands, :help and ! shell execution
 
 Global keys
   Ctrl-Q   quit from any mode (refuses if there are unsaved changes)
@@ -29,7 +35,7 @@ Global keys
 Markdown display
   Formats the buffer in place: headings, emphasis, code, links, lists,
   quotes, tables and rules are colored and the syntax punctuation is dimmed.
-  Bytes keep their cells, so every motion and edit works unchanged. It starts
+  Characters keep their cells, so every motion and edit works unchanged. It starts
   on for .md and related extensions, replaces syntax highlighting while it is
   active, and shows as [MD] in the status line.
 
@@ -69,21 +75,34 @@ Invisible characters
 Options
   Anything spelled as a command can also be run from init.lua with
   cano.command, which is how options without a Boolean slot are configured:
-  cano.command([[set listchars=tab:> ,trail:.,eol:$]]). A leading : is
+  cano.command([[set listchars=tab:>\ ,trail:.,eol:$]]). A leading : is
   accepted, commands run in order after the setup table, and a Lua long
   string keeps the backslash that :set needs to hold a space in a value.
 
   :set name / :set noname turn an option on or off, :set name! toggles,
   :set name=value assigns and :set name? reports. Several may be given at
   once, and vim's names are accepted where they differ from Cano's
-  (relativenumber, autoindent, shiftwidth, tabstop, lcs).
+  (relativenumber, autoindent, shiftwidth, lcs).
+
+  tabstop (ts) is how many columns a tab is drawn across, 1 to 32, default
+  4; autoformat's retab measures tabs with it too. indent (shiftwidth, sw)
+  is the indent step: spaces per level, or 0 for a tab. undo_size caps how
+  many steps u can take back (default 32; 0 means unlimited).
 
 Backups
   Each save first copies the version on disk into a .backups directory beside
-  the file, named <file>.<YYYYMMDD-HHMMSS> in UTC. The newest 10 per file are
-  kept. A file that does not exist yet has nothing to copy. On by default;
-  :set-var backup 0 turns it off. A backup that cannot be written is reported
-  but does not stop the save. Browse them with the explorer.
+  the file, named <file>.<YYYYMMDD-HHMMSS> in UTC, with the original's
+  permissions. The newest 10 per file are kept. A file that does not exist
+  yet has nothing to copy. On by default; :set-var backup 0 turns it off. A
+  backup that cannot be written is reported but does not stop the save.
+  Browse them with the explorer.
+
+Saving
+  A save writes a temporary file beside the target and renames it over the
+  original, so a crash never leaves half a file. The file keeps its
+  permissions, a symlink stays a symlink (the file it points to is
+  written), and a file you may not write is refused as before. The bytes
+  are written exactly as they are: no line-ending or final-newline changes.
 
 Recent files
   Ctrl-P lists the files opened before, most recent first. j/k and the arrows
@@ -109,12 +128,30 @@ Numbers
   and the case of its digits, and the cursor lands on the last digit.
 
 Blockwise Visual
-  Ctrl-V selects a rectangle instead of a run of bytes; in Visual mode it
+  Ctrl-V selects a rectangle instead of a run of characters; in Visual mode it
   turns the selection already made into one. d and x cut the rectangle in a
   single undo step and y copies it, both keeping the shape of short lines as
   the blank they are. The clipboard has no shape of its own, so p puts the
   rows back as lines rather than as a column. > < and = act on every row the
   rectangle touches.
+
+Visual mode keys
+  c changes the selection (one undo step with what you type), p puts the
+  clipboard over it and keeps what it replaced, o jumps to the other end,
+  r{char} overwrites every selected character, and v or V switch between
+  charwise and linewise or leave when pressed in their own kind. Motions
+  take counts.
+
+Counts
+  A count works the vim way: 3w, 3x, 3p, 3rX, 3* and 3. repeat; 3dd, 3yy
+  and 3cc take three lines; d3w, 3dw and 2d3w (six words) all reach the
+  motion. A bare 3d waits for its motion. . repeats a change with the count
+  it had, and a new count in front of . replaces it.
+
+Undo
+  A change (c, o, O, an insert) is one undo step together with what you
+  typed, until an arrow key or a click moves the cursor. A new edit clears
+  what redo could bring back. undo_size limits how many steps are kept.
 
 Completion
   In Insert mode Ctrl-N and Ctrl-P complete the keyword in front of the
@@ -135,7 +172,7 @@ Windows
 Jump motions
   s and t are vim-easymotion's find motions. Each asks for one character,
   labels every occurrence on screen and jumps to the label you type. s
-  searches both directions; t is forward only and stops one byte before the
+  searches both directions; t is forward only and stops one character before the
   match. Labels use asdghklqwertyuiopzxcvbnmfj; nearest-first, growing to two
   keys when there are more matches than keys. A single match jumps at once,
   and Escape cancels. s also works in Visual mode, where picking a label
@@ -160,6 +197,8 @@ Search and replace
   case. \<foo\> matches whole words. Any punctuation may be the delimiter,
   so :%s#http://#https://#g needs no escaping. Patterns are literal text, not
   regular expressions, and one :s command is one undo step.
+  Typing s/old/new at the / prompt replaces the next old after the cursor
+  (one undo step; refused on a read-only buffer).
 
 File commands
   :w       save
@@ -169,6 +208,10 @@ File commands
   :nohl    stop showing the search highlight (:nohlsearch also works)
   :imap    map a key sequence in Insert mode
   :s       substitute; see Search and replace above
+  :help    open a help page (general, keys, cmds); :h for short
+  :!cmd    run cmd through sh -c in the background; the editor keeps
+           working, Running: shows meanwhile, then the last output line
+           (stderr if stdout was silent) with [exit N] when it failed
 
 Syntax highlighting
   C, C++, Rust, Python, shell, Vim script and Lua are highlighted out of the
@@ -193,6 +236,18 @@ Configuration
   cano.exit(code[, message]) stops Cano before the editor opens, printing
   the message and exiting with that status.
 
+Text and display
+  Valid UTF-8 is drawn as characters at their display width (two cells for
+  CJK and emoji); h, l, x, r and Backspace move over whole characters. Bytes
+  that are not valid UTF-8, and control characters such as a CR, show as a
+  replacement mark. The status line column is the display column.
+  wrap is on by default: a line longer than the screen continues on the
+  next screen row, and only its first row is numbered. A wide character
+  that does not fit at the edge moves to the next row. :set nowrap scrolls
+  the view sideways instead.
+  SIGTERM or SIGHUP restores the terminal and exits with 128 + the signal,
+  without saving.
+
 AI ASSISTANT
   With ANTHROPIC_API_KEY (or OPENAI_API_KEY) set, an AI button appears at the
   right of the status line. Click it or press Ctrl-K to open a chat panel at
@@ -203,7 +258,8 @@ AI ASSISTANT
   In the panel Enter sends, Esc goes back to the editor (or stops a running
   request), Ctrl-L starts a new chat, and the arrows, the wheel or the
   scrollbar on the right scroll back. Click the panel to type in it, and drag
-  its top bar to resize it.
+  its top bar to resize it. The chat is kept between runs, in ai-history.json
+  beside init.lua, until Ctrl-L (or typing /clear) starts a new one.
   CANO_AI_PROVIDER=openai picks OpenAI when both keys are set; CANO_AI_MODEL
   and CANO_AI_EFFORT override the model (claude-opus-5-5 by default) and the
   effort level (medium).
