@@ -745,21 +745,23 @@ mod model_conformance {
                             ),
                             (
                                 "Undo",
-                                !grp && undo >= 1,
+                                undo >= 1,
                                 M {
                                     undo: undo.saturating_sub(1),
                                     redo: redo + 1,
-                                    ..m
+                                    grp: false,
+                                    st: false,
                                 },
                                 |h, b| assert!(h.undo(b).unwrap()),
                             ),
                             (
                                 "Redo",
-                                !grp && redo >= 1,
+                                redo >= 1,
                                 M {
                                     undo: undo + 1,
                                     redo: redo.saturating_sub(1),
-                                    ..m
+                                    grp: false,
+                                    st: false,
                                 },
                                 |h, b| assert!(h.redo(b).unwrap()),
                             ),

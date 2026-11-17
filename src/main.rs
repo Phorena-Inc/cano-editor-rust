@@ -275,8 +275,7 @@ fn run() -> Result<u8, String> {
             continue;
         };
 
-        let mut effects = app.handle(input);
-        effects.extend(app.assistant_poll());
+        let effects = app.handle_with_poll(input);
         app.assistant.persist();
         // Suspending needs the terminal, which the effect applier does not
         // have, and it has to happen before anything is drawn again.

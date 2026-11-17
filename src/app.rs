@@ -288,6 +288,16 @@ impl App {
         self.saved_buffer.clone_from(&self.editor.buffer.data);
     }
 
+    /// One pass of the main loop for a key.  Replies that have arrived are
+    /// taken first, so the key acts on the buffer as it now is: handled the
+    /// other way round, `:q` could decide on a clean buffer that an
+    /// assistant edit dirtied before the quit was applied.
+    pub fn handle_with_poll(&mut self, input: Input) -> Vec<AppEffect> {
+        let mut effects = self.assistant_poll();
+        effects.extend(self.handle(input));
+        effects
+    }
+
     pub fn handle(&mut self, input: Input) -> Vec<AppEffect> {
         // Keys typed into the assistant panel are not editor commands: they
         // must not be recorded for `.`, mapped, or seen by any mode.
@@ -2560,6 +2570,15 @@ impl App {
     fn open_file(&mut self, path: &Path) {
         match load_buffer(path) {
             Ok(bytes) => {
+                // A request or a tool in flight was about the old file: its
+                // line numbers would land in this one.
+                if self.assistant.busy() || self.assistant.approving().is_some() {
+                    self.assistant.cancel();
+                    self.assistant.push(
+                        crate::assistant::Role::Info,
+                        "Stopped: another file was opened.",
+                    );
+                }
                 self.editor = Editor::new(bytes);
                 self.sync_widths();
                 self.markdown = is_markdown(path);

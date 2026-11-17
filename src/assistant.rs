@@ -466,7 +466,7 @@ impl Assistant {
         self.ratio = (f32::from(rows) / f32::from(height)).clamp(0.05, 0.95);
     }
 
-    fn push(&mut self, role: Role, text: impl Into<String>) {
+    pub(crate) fn push(&mut self, role: Role, text: impl Into<String>) {
         self.dirty = true;
         let text = text.into();
         let text = text.trim_end();
@@ -572,7 +572,7 @@ impl Assistant {
 
     /// Abandons whatever is in flight, leaving a conversation the API will
     /// still accept: every tool call that was asked for gets an answer.
-    fn cancel(&mut self) {
+    pub(crate) fn cancel(&mut self) {
         let was_busy = !matches!(self.phase, Phase::Idle);
         let mut pending = std::mem::take(&mut self.results);
         if let Phase::Shell { id, pid, .. } = &self.phase {
@@ -1982,36 +1982,54 @@ mod tests {
     }
 
     /// Every editor state that can hold buffer offsets across keys, hit by
-    /// an assistant edit that empties the buffer or grows it.  The panel is
-    /// unfocused the way a click in the text does it.  After the edit, a
+    /// an assistant edit that empties the buffer or grows it.  Each row
+    /// first checks that its state was really entered.  After the edit, a
     /// fixed run of keys must leave the buffer valid and must not panic.
+    /// The oracle is structural (`validate`), so it cannot see an edit that
+    /// is lost; the separate tests above cover those.
     #[test]
     fn an_assistant_edit_in_any_editor_state_leaves_a_valid_buffer() {
+        use crate::editor::Mode;
         use Input::{Byte, Control, Enter, Escape};
         let k = |s: &str| s.bytes().map(Byte).collect::<Vec<_>>();
         let cat = |parts: Vec<Vec<Input>>| parts.concat();
-        let states: Vec<(&str, Vec<Input>)> = vec![
-            ("normal", vec![]),
-            ("insert", k("Axy")),
-            ("insert completion", cat(vec![k("Ao"), vec![Control(14)]])),
-            ("visual", k("vll")),
-            ("visual line", k("Vj")),
-            ("visual block", cat(vec![vec![Control(22)], k("jl")])),
-            ("pending operator", k("d")),
-            ("counted operator", k("2d")),
-            ("find character", k("f")),
-            ("command prompt", k(":s/o")),
-            ("search prompt", k("/t")),
+        type Entered = fn(&App) -> bool;
+        let states: Vec<(&str, Vec<Input>, Entered)> = vec![
+            ("normal", vec![], |a| a.editor.mode == Mode::Normal),
+            ("insert", k("Axy"), |a| a.editor.mode == Mode::Insert),
+            (
+                "insert after Ctrl-N",
+                cat(vec![k("Ao"), vec![Control(14)]]),
+                |a| a.editor.mode == Mode::Insert,
+            ),
+            ("visual", k("vll"), |a| a.editor.mode == Mode::Visual),
+            ("visual line", k("Vj"), |a| a.editor.mode == Mode::Visual),
+            ("visual block", cat(vec![vec![Control(22)], k("jl")]), |a| {
+                a.editor.mode == Mode::Visual
+            }),
+            ("pending operator", k("d"), |a| a.editor.pending_operator()),
+            ("counted operator", k("2d"), |a| a.editor.pending_operator()),
+            ("jump waiting for a character", k("s"), |a| {
+                a.pending_hint() == "s-"
+            }),
+            ("jump labels shown", k("se"), |a| a.pending_hint() == "jump"),
+            ("command prompt", k(":s/o"), |a| {
+                a.editor.mode == Mode::Command
+            }),
+            ("search prompt", k("/t"), |a| a.editor.mode == Mode::Search),
             (
                 "confirm substitute",
                 cat(vec![k(":%s/o/0/gc"), vec![Enter]]),
+                |a| a.confirming.is_some(),
             ),
-            ("file explorer", vec![Control(14)]),
-            ("recent files", vec![Control(16)]),
-            ("save prompt", cat(vec![k("x"), vec![Control(14)]])),
+            ("file explorer", vec![Control(14)], |a| a.explorer.is_some()),
+            ("save prompt", cat(vec![k("x"), vec![Control(14)]]), |a| {
+                a.save_prompt.is_some()
+            }),
         ];
         let edits = [("empty", 1, 3, ""), ("grow", 1, 1, "a\nb\nc\nd\ne")];
         let after = cat(vec![
+            vec![Control(14)],
             k("yn"),
             vec![Enter, Escape],
             k("lxu"),
@@ -2019,16 +2037,23 @@ mod tests {
             k("pvdu"),
         ]);
         let mut failures = Vec::new();
-        for (name, keys) in &states {
+        for (name, keys, entered) in &states {
             for (edit, start, end, text) in edits {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut app = app_with_assistant(b"one\ntwo\nthree\n");
+                    app.viewport.rows = 3;
+                    app.viewport.content_x = 5;
+                    app.viewport.content_width = 40;
+                    app.mark_rendered();
                     app.handle(Control(11));
                     type_text(&mut app, "edit");
                     app.handle(Enter);
-                    app.assistant.focused = false;
+                    app.handle(Control(11)); // Ctrl-K closes the panel; the request runs on
                     for key in keys {
                         app.handle(*key);
+                    }
+                    if !entered(&app) {
+                        return Err("the state was not entered".to_owned());
                     }
                     reply(
                         &mut app,
@@ -2072,7 +2097,7 @@ mod tests {
         app.handle(Input::Control(11));
         type_text(&mut app, "edit");
         app.handle(Input::Enter);
-        app.assistant.focused = false;
+        app.handle(Input::Control(11)); // Ctrl-K closes the panel; the request runs on
         type_text(&mut app, ":%s/o/0/gc");
         app.handle(Input::Enter);
         app.handle(Input::Byte(b'y'));
@@ -2257,14 +2282,15 @@ mod tests {
             Event::Escape,
             Event::Clear,
         ];
+        // Keys go in every state, including ones the model never takes them
+        // in; only a reply needs a request in flight, and only a finished
+        // shell needs one running.
         let enabled = |a: &Assistant, e: Event| {
-            let (req, appr, shell, ..) = abstract_state(a);
+            let (req, _, shell, ..) = abstract_state(a);
             match e {
-                Event::Send => req + appr + shell == 0,
                 Event::Text | Event::Fail | Event::Calls(_) => req == 1,
-                Event::Key(_) => appr == 1,
                 Event::ShellDone => shell == 1,
-                Event::Escape | Event::Clear => true,
+                Event::Send | Event::Key(_) | Event::Escape | Event::Clear => true,
             }
         };
         let mut seen = BTreeSet::new();
@@ -2341,17 +2367,14 @@ mod tests {
 
     #[test]
     fn an_assistant_edit_under_an_open_file_list_is_not_lost() {
-        let root = std::env::temp_dir().join(format!("cano-pane-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        let other = root.join("other.txt");
-        std::fs::write(&other, b"from disk\n").unwrap();
         let mut app = app_with_assistant(b"one\ntwo\n");
         app.handle(Input::Control(11));
         type_text(&mut app, "edit");
         app.handle(Input::Enter);
-        app.assistant.focused = false;
-        // The buffer is clean, so the explorer opens without asking.
-        app.open_explorer(&root).unwrap();
+        app.handle(Input::Control(11)); // Ctrl-K closes the panel; the request runs on
+        // The buffer is clean, so Ctrl-N opens the explorer without asking.
+        app.handle(Input::Control(14));
+        assert!(app.explorer.is_some());
         reply(
             &mut app,
             json!([{"type": "tool_use", "id": "e", "name": "edit_buffer",
@@ -2364,22 +2387,91 @@ mod tests {
             "end_turn",
         );
         assert_eq!(app.editor.buffer.data, b"ONE\ntwo\n");
-        // Enter on the file list must not replace the edited buffer unasked.
+        // The user picks Cargo.toml if the list is still up (setting the
+        // cursor stands in for pressing j) and presses Enter.
         if let Some(explorer) = app.explorer.as_mut() {
             explorer.cursor = explorer
                 .entries
                 .iter()
-                .position(|e| e.path == other)
+                .position(|e| e.path.ends_with("Cargo.toml"))
+                .expect("Cargo.toml is listed");
+        }
+        app.handle(Input::Enter);
+        assert_eq!(
+            app.editor.buffer.data, b"ONE\ntwo\n",
+            "the edit was dropped without asking"
+        );
+    }
+
+    /// Puts a reply in the slot without polling, as the worker thread does.
+    fn deliver(app: &App, content: Value, stop: &str) {
+        let Phase::Requesting { slot, .. } = app.assistant.phase.clone() else {
+            panic!("no request in flight");
+        };
+        *slot.lock().unwrap() = Some(Ok(json!({"content": content, "stop_reason": stop})));
+    }
+
+    #[test]
+    fn a_reply_that_arrives_with_q_is_seen_before_q_decides() {
+        // In one main-loop pass, `:q` used to be handled first and the reply
+        // polled after: `:q` saw a clean buffer, the edit then made it dirty,
+        // and Quit was still applied.
+        let start = |app: &mut App| {
+            app.handle(Input::Control(11));
+            type_text(app, "edit");
+            app.handle(Input::Enter);
+            app.handle(Input::Control(11));
+            type_text(app, ":q");
+            deliver(
+                app,
+                json!([{"type": "tool_use", "id": "e", "name": "edit_buffer",
+                        "input": {"start_line": 1, "end_line": 1, "new_text": "ONE"}}]),
+                "tool_use",
+            );
+        };
+        // The old order, for the record.
+        let mut old = app_with_assistant(b"one\n");
+        start(&mut old);
+        let mut effects = old.handle(Input::Enter);
+        effects.extend(old.assistant_poll());
+        assert!(effects.contains(&AppEffect::Quit) && !old.saved());
+        // The loop now polls first.
+        let mut app = app_with_assistant(b"one\n");
+        start(&mut app);
+        let effects = app.handle_with_poll(Input::Enter);
+        assert_eq!(app.editor.buffer.data, b"ONE\n");
+        assert!(!effects.contains(&AppEffect::Quit), "{effects:?}");
+    }
+
+    #[test]
+    fn opening_another_file_stops_work_meant_for_the_old_one() {
+        let root = std::env::temp_dir().join(format!("cano-switch-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let other = root.join("other.txt");
+        std::fs::write(&other, std::fs::read("Cargo.toml").unwrap().as_slice()).unwrap();
+        let mut app = app_with_assistant(b"one\n");
+        app.handle(Input::Control(11));
+        type_text(&mut app, "edit line 1");
+        app.handle(Input::Enter);
+        app.handle(Input::Control(11));
+        app.handle(Input::Control(14)); // Ctrl-N over a clean buffer
+        assert!(app.explorer.is_some());
+        if let Some(explorer) = app.explorer.as_mut() {
+            // stands in for pressing j until the file is selected
+            explorer.cursor = explorer
+                .entries
+                .iter()
+                .position(|e| e.path.ends_with("Cargo.toml"))
                 .unwrap();
         }
         app.handle(Input::Enter);
-        let kept = app.editor.buffer.data == b"ONE\ntwo\n";
         let _ = std::fs::remove_dir_all(&root);
-        assert!(
-            kept,
-            "the edit was dropped: {:?}",
-            String::from_utf8_lossy(&app.editor.buffer.data)
+        assert_eq!(
+            app.editor.buffer.data,
+            std::fs::read("Cargo.toml").unwrap().as_slice()
         );
+        assert!(!app.assistant.busy());
+        assert!(unanswered_calls(&app.assistant.messages).is_empty());
     }
 
     #[test]
