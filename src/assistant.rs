@@ -1394,11 +1394,7 @@ impl App {
         // keep the user's insertion and the tool's edit as separate steps.
         let edits = matches!(call.name.as_str(), "edit_buffer" | "run_editor_command");
         if edits {
-            // A `:s///c` waiting for an answer holds offsets into the buffer
-            // as it stands; end it here, keeping what was already accepted
-            // as one undo step, the way Escape would.
-            self.finish_confirm();
-            self.editor.close_insert_step();
+            self.settle_for_outside_edit();
         }
         let outcome = self.tool(&call, &mut effects);
         if edits {
@@ -1553,10 +1549,25 @@ impl App {
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
+    match (resolve(a), resolve(b)) {
+        (Some(a), Some(b)) => a == b,
         _ => a == b,
     }
+}
+
+/// The canonical form of `path`.  A file that does not exist yet (an open
+/// buffer never saved) is resolved through its directory, so `./new.txt`
+/// and `new.txt` still name the same file.
+fn resolve(path: &Path) -> Option<PathBuf> {
+    if let Ok(full) = path.canonicalize() {
+        return Some(full);
+    }
+    let name = path.file_name()?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    Some(parent.canonicalize().ok()?.join(name))
 }
 
 #[cfg(test)]
@@ -1995,11 +2006,14 @@ mod tests {
                 "confirm substitute",
                 cat(vec![k(":%s/o/0/gc"), vec![Enter]]),
             ),
+            ("file explorer", vec![Control(14)]),
+            ("recent files", vec![Control(16)]),
+            ("save prompt", cat(vec![k("x"), vec![Control(14)]])),
         ];
         let edits = [("empty", 1, 3, ""), ("grow", 1, 1, "a\nb\nc\nd\ne")];
         let after = cat(vec![
             k("yn"),
-            vec![Escape],
+            vec![Enter, Escape],
             k("lxu"),
             vec![Control(18)],
             k("pvdu"),
@@ -2115,6 +2129,257 @@ mod tests {
             assert!(Instant::now() < deadline, "the command is still running");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    /// The model `CanoAssistantProtocol`'s view of the assistant
+    /// (rust-verifier/case_studies/cano/specs/assistant_protocol.json).
+    fn abstract_state(a: &Assistant) -> (u8, u8, u8, usize, usize) {
+        let (req, appr, shell) = match a.phase {
+            Phase::Idle => (0, 0, 0),
+            Phase::Requesting { .. } => (1, 0, 0),
+            Phase::Approving => (0, 1, 0),
+            Phase::Shell { .. } => (0, 0, 1),
+        };
+        (req, appr, shell, a.queue.len(), a.results.len())
+    }
+
+    /// The API's rule, read off the real conversation: every `tool_use` the
+    /// model sent has a `tool_result`.
+    fn unanswered_calls(messages: &[Value]) -> Vec<String> {
+        let mut asked = Vec::new();
+        let mut answered = Vec::new();
+        for m in messages {
+            for block in m["content"].as_array().into_iter().flatten() {
+                match block["type"].as_str() {
+                    Some("tool_use") => asked.push(block["id"].as_str().unwrap_or("").to_owned()),
+                    Some("tool_result") => {
+                        answered.push(block["tool_use_id"].as_str().unwrap_or("").to_owned())
+                    }
+                    _ => {}
+                }
+            }
+        }
+        asked.retain(|id| !answered.contains(id));
+        asked
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Event {
+        Send,
+        Text,
+        Fail,
+        Calls(&'static [&'static str]),
+        Key(u8),
+        ShellDone,
+        Escape,
+        Clear,
+    }
+
+    fn apply_event(app: &mut App, event: Event, dir: &Path, n: &mut usize) {
+        match event {
+            Event::Send => {
+                app.assistant.focused = true;
+                type_text(app, "go");
+                app.handle(Input::Enter);
+            }
+            Event::Text => {
+                reply(app, json!([{"type": "text", "text": "ok"}]), "end_turn");
+            }
+            Event::Fail => {
+                let Phase::Requesting { slot } = app.assistant.phase.clone() else {
+                    unreachable!()
+                };
+                *slot.lock().unwrap() = Some(Err("network".to_owned()));
+                app.assistant_poll();
+            }
+            Event::Calls(kinds) => {
+                let calls: Vec<Value> = kinds
+                    .iter()
+                    .map(|kind| {
+                        *n += 1;
+                        let id = format!("c{n}");
+                        match *kind {
+                            "shell" => json!({"type": "tool_use", "id": id, "name": "run_shell", "input": {"command": "true"}}),
+                            "write" => json!({"type": "tool_use", "id": id, "name": "write_file",
+                                "input": {"path": dir.join(format!("w{n}")).display().to_string(), "content": "x"}}),
+                            _ => json!({"type": "tool_use", "id": id, "name": "read_buffer", "input": {}}),
+                        }
+                    })
+                    .collect();
+                reply(app, Value::Array(calls), "tool_use");
+            }
+            Event::Key(byte) => {
+                app.assistant.focused = true;
+                app.handle(Input::Byte(byte));
+            }
+            Event::ShellDone => {
+                let deadline = Instant::now() + std::time::Duration::from_secs(10);
+                while matches!(app.assistant.phase, Phase::Shell { .. }) {
+                    app.assistant_poll();
+                    assert!(Instant::now() < deadline, "the shell never finished");
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+            Event::Escape => {
+                app.assistant.focused = true;
+                app.handle(Input::Escape);
+            }
+            Event::Clear => {
+                app.assistant.focused = true;
+                app.handle(Input::Control(12));
+            }
+        }
+    }
+
+    /// Explores the real assistant breadth-first over these events, and
+    /// checks the model's invariant and the API's rule after every one.
+    #[test]
+    fn the_assistant_follows_the_protocol_model_in_every_reachable_state() {
+        use std::collections::{BTreeSet, VecDeque};
+        let dir = std::env::temp_dir().join(format!("cano-protocol-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let events = [
+            Event::Send,
+            Event::Text,
+            Event::Fail,
+            Event::Calls(&["read"]),
+            Event::Calls(&["read", "read"]),
+            Event::Calls(&["shell"]),
+            Event::Calls(&["write"]),
+            Event::Calls(&["read", "shell"]),
+            Event::Calls(&["shell", "read"]),
+            Event::Calls(&["write", "read"]),
+            Event::Calls(&["shell", "write"]),
+            Event::Key(b'y'),
+            Event::Key(b'n'),
+            Event::Key(b'a'),
+            Event::ShellDone,
+            Event::Escape,
+            Event::Clear,
+        ];
+        let enabled = |a: &Assistant, e: Event| {
+            let (req, appr, shell, ..) = abstract_state(a);
+            match e {
+                Event::Send => req + appr + shell == 0,
+                Event::Text | Event::Fail | Event::Calls(_) => req == 1,
+                Event::Key(_) => appr == 1,
+                Event::ShellDone => shell == 1,
+                Event::Escape | Event::Clear => true,
+            }
+        };
+        let mut seen = BTreeSet::new();
+        let mut queue: VecDeque<Vec<Event>> = VecDeque::from([vec![]]);
+        let mut steps = 0;
+        while let Some(path) = queue.pop_front() {
+            for &event in &events {
+                let mut app = app_with_assistant(b"one\ntwo\n");
+                app.handle(Input::Control(11));
+                let mut n = 0;
+                for &e in &path {
+                    apply_event(&mut app, e, &dir, &mut n);
+                }
+                if !enabled(&app.assistant, event) {
+                    continue;
+                }
+                apply_event(&mut app, event, &dir, &mut n);
+                steps += 1;
+                let a = &app.assistant;
+                let (req, appr, shell, q, r) = abstract_state(a);
+                let (req, appr, shell) = (req as usize, appr as usize, shell as usize);
+                let mut next = path.clone();
+                next.push(event);
+                assert!(
+                    2 * req + q + r + shell <= 2 && req + appr + shell <= 1 && appr <= q,
+                    "invariant broken after {next:?}: {:?}",
+                    abstract_state(a)
+                );
+                assert!(
+                    q + r <= 2 * appr + 2 * shell,
+                    "work left behind after {next:?}"
+                );
+                if req == 1 {
+                    assert!(
+                        unanswered_calls(&a.messages).is_empty(),
+                        "a request went out with unanswered calls after {next:?}"
+                    );
+                }
+                if req + appr + shell == 0 {
+                    assert!(
+                        unanswered_calls(&a.messages).is_empty(),
+                        "the settled conversation has unanswered calls after {next:?}"
+                    );
+                }
+                let key = (abstract_state(a), a.always.clone(), next.len().min(6));
+                if next.len() < 6 && seen.insert(key) {
+                    queue.push_back(next);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(steps > 100, "{steps}");
+    }
+
+    #[test]
+    fn write_file_refuses_the_open_file_before_it_is_ever_saved() {
+        let dir = std::env::temp_dir().join(format!("cano-same-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let open = dir.join("new.txt"); // not on disk yet
+        for other in [
+            dir.join(".").join("new.txt"),
+            dir.join("sub").join("..").join("new.txt"),
+        ] {
+            assert!(
+                same_file(&other, &open),
+                "{} vs {}",
+                other.display(),
+                open.display()
+            );
+        }
+        assert!(!same_file(&dir.join("other.txt"), &open));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_assistant_edit_under_an_open_file_list_is_not_lost() {
+        let root = std::env::temp_dir().join(format!("cano-pane-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let other = root.join("other.txt");
+        std::fs::write(&other, b"from disk\n").unwrap();
+        let mut app = app_with_assistant(b"one\ntwo\n");
+        app.handle(Input::Control(11));
+        type_text(&mut app, "edit");
+        app.handle(Input::Enter);
+        app.assistant.focused = false;
+        // The buffer is clean, so the explorer opens without asking.
+        app.open_explorer(&root).unwrap();
+        reply(
+            &mut app,
+            json!([{"type": "tool_use", "id": "e", "name": "edit_buffer",
+                    "input": {"start_line": 1, "end_line": 1, "new_text": "ONE"}}]),
+            "tool_use",
+        );
+        reply(
+            &mut app,
+            json!([{"type": "text", "text": "ok"}]),
+            "end_turn",
+        );
+        assert_eq!(app.editor.buffer.data, b"ONE\ntwo\n");
+        // Enter on the file list must not replace the edited buffer unasked.
+        if let Some(explorer) = app.explorer.as_mut() {
+            explorer.cursor = explorer
+                .entries
+                .iter()
+                .position(|e| e.path == other)
+                .unwrap();
+        }
+        app.handle(Input::Enter);
+        let kept = app.editor.buffer.data == b"ONE\ntwo\n";
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            kept,
+            "the edit was dropped: {:?}",
+            String::from_utf8_lossy(&app.editor.buffer.data)
+        );
     }
 
     #[test]

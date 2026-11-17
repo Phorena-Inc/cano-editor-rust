@@ -327,10 +327,16 @@ impl History {
     }
 
     pub fn undo(&mut self, buffer: &mut Buffer) -> Result<bool, HistoryError> {
+        // Undo moves the open group's step away, so the group cannot carry
+        // on: a later push would join whatever step is below.  No caller
+        // undoes mid-group today; ending it here keeps that true by
+        // construction.
+        self.end_group();
         step(&mut self.undo, &mut self.redo, buffer)
     }
 
     pub fn redo(&mut self, buffer: &mut Buffer) -> Result<bool, HistoryError> {
+        self.end_group();
         step(&mut self.redo, &mut self.undo, buffer)
     }
 }
@@ -597,5 +603,204 @@ mod tests {
         let inverse = apply_record(&mut buffer, UndoRecord::insert_chars(1, Vec::new())).unwrap();
         assert_eq!(buffer.data, b"abc");
         assert_eq!(inverse, UndoRecord::delete_multiple(1, 1));
+    }
+}
+
+/// Checks `History` against the model `CanoUndoHistory`
+/// (rust-verifier/case_studies/cano/specs/undo_history.json) in every state
+/// that model allows, with `undo_size` 3.
+#[cfg(test)]
+mod model_conformance {
+    use super::*;
+
+    /// The model's view: steps on each stack, whether a group is open, and
+    /// whether it has started its step.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct M {
+        undo: usize,
+        redo: usize,
+        grp: bool,
+        st: bool,
+    }
+
+    fn view(h: &History) -> M {
+        M {
+            undo: h.steps(),
+            redo: h.redo.iter().filter(|r| !r.joined).count(),
+            grp: h.grouping(),
+            st: h.group == Group::Open { started: true },
+        }
+    }
+
+    /// A history in model state `m`.  Each undo step undoes an insertion of
+    /// "x" at 0; the open group's started step has `extra` joined records.
+    fn build(m: M, extra: usize) -> (History, Buffer) {
+        let mut h = History::new();
+        h.limit = 3;
+        for _ in 0..m.undo {
+            h.undo.push(UndoRecord::insert_chars(0, b"x".to_vec()));
+        }
+        if m.st {
+            for _ in 0..extra {
+                let mut r = UndoRecord::insert_chars(0, b"x".to_vec());
+                r.joined = true;
+                h.undo.push(r);
+            }
+        }
+        for _ in 0..m.redo {
+            h.redo.push(UndoRecord::delete_multiple(0, 1));
+        }
+        h.group = match (m.grp, m.st) {
+            (false, _) => Group::Closed,
+            (true, started) => Group::Open { started },
+        };
+        (h, Buffer::new(vec![b'x'; 16]))
+    }
+
+    /// An action's name, whether the model enables it here, the state the
+    /// model expects after it, and the code that performs it.
+    type Case = (&'static str, bool, M, fn(&mut History, &mut Buffer));
+
+    fn rec() -> UndoRecord {
+        UndoRecord::delete_multiple(0, 1)
+    }
+
+    #[test]
+    fn every_action_in_every_model_state_matches_the_model() {
+        let mut checked = 0;
+        for undo in 0..=3 {
+            for redo in 0..=3 - undo {
+                for (grp, st) in [(false, false), (true, false), (true, true)] {
+                    if st && undo == 0 {
+                        continue; // the invariant `st <= undo`
+                    }
+                    let m = M {
+                        undo,
+                        redo,
+                        grp,
+                        st,
+                    };
+                    for extra in 0..=2 {
+                        // (name, enabled in the model, expected model state, code)
+                        let cases: Vec<Case> = vec![
+                            (
+                                "PushFresh",
+                                !grp && undo < 3,
+                                M {
+                                    undo: undo + 1,
+                                    redo: 0,
+                                    ..m
+                                },
+                                |h, _| h.push_undo(rec()),
+                            ),
+                            (
+                                "PushFreshAtCap",
+                                !grp && undo == 3,
+                                M { redo: 0, ..m },
+                                |h, _| h.push_undo(rec()),
+                            ),
+                            (
+                                "BeginGroup",
+                                !grp,
+                                M {
+                                    grp: true,
+                                    st: false,
+                                    ..m
+                                },
+                                |h, _| h.begin_group(),
+                            ),
+                            (
+                                "PushGroupFirst",
+                                grp && !st && undo < 3,
+                                M {
+                                    undo: undo + 1,
+                                    redo: 0,
+                                    st: true,
+                                    ..m
+                                },
+                                |h, _| h.push_undo(rec()),
+                            ),
+                            (
+                                "PushGroupFirstAtCap",
+                                grp && !st && undo == 3,
+                                M {
+                                    redo: 0,
+                                    st: true,
+                                    ..m
+                                },
+                                |h, _| h.push_undo(rec()),
+                            ),
+                            ("PushGroupJoined", grp && st, M { redo: 0, ..m }, |h, _| {
+                                h.push_undo(rec())
+                            }),
+                            (
+                                "EndGroup",
+                                grp,
+                                M {
+                                    grp: false,
+                                    st: false,
+                                    ..m
+                                },
+                                |h, _| h.end_group(),
+                            ),
+                            (
+                                "Undo",
+                                !grp && undo >= 1,
+                                M {
+                                    undo: undo.saturating_sub(1),
+                                    redo: redo + 1,
+                                    ..m
+                                },
+                                |h, b| assert!(h.undo(b).unwrap()),
+                            ),
+                            (
+                                "Redo",
+                                !grp && redo >= 1,
+                                M {
+                                    undo: undo + 1,
+                                    redo: redo.saturating_sub(1),
+                                    ..m
+                                },
+                                |h, b| assert!(h.redo(b).unwrap()),
+                            ),
+                        ];
+                        for (name, enabled, want, run) in cases {
+                            if !enabled {
+                                continue;
+                            }
+                            let (mut h, mut b) = build(m, extra);
+                            assert_eq!(view(&h), m, "build {m:?}");
+                            run(&mut h, &mut b);
+                            assert_eq!(view(&h), want, "{name} from {m:?} (extra {extra})");
+                            assert!(
+                                h.undo.first().is_none_or(|r| !r.joined),
+                                "{name}: undo starts mid-step"
+                            );
+                            assert!(
+                                h.redo.first().is_none_or(|r| !r.joined),
+                                "{name}: redo starts mid-step"
+                            );
+                            assert!(b.invariants_hold(), "{name}: buffer");
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 100, "{checked}");
+    }
+
+    #[test]
+    fn undo_in_the_middle_of_a_group_ends_it() {
+        let mut h = History::new();
+        let mut b = Buffer::new(vec![b'x'; 8]);
+        h.push_undo(rec()); // an older step
+        h.begin_group();
+        h.push_undo(rec());
+        assert!(h.undo(&mut b).unwrap());
+        h.push_undo(rec());
+        // The new record is a step of its own, not part of the older one.
+        assert_eq!(h.steps(), 2);
+        assert!(!h.grouping());
     }
 }

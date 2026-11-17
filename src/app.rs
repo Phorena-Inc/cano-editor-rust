@@ -1919,7 +1919,7 @@ impl App {
     }
 
     /// Ends the confirmation, recording it as one undoable step.
-    pub(crate) fn finish_confirm(&mut self) {
+    fn finish_confirm(&mut self) {
         let Some(state) = self.confirming.take() else {
             return;
         };
@@ -2381,6 +2381,25 @@ impl App {
         } else {
             self.save_prompt = Some(pane);
         }
+    }
+
+    /// Settles every state that holds buffer offsets, or a decision about
+    /// the buffer, before the buffer is changed from outside the keyboard
+    /// (the assistant's tools).  Each one assumed the buffer would not move
+    /// under it:
+    /// - a `:s///c` waiting for an answer keeps match offsets: it ends, and
+    ///   what was already accepted stays one undo step, as Escape leaves it;
+    /// - a file list opened over a clean buffer would replace the edited
+    ///   buffer without asking: it closes, and opening it again asks;
+    /// - a pending "Save changes?" answer would apply to text the user has
+    ///   not seen: the question is dropped;
+    /// - the insertion being typed becomes its own undo step.
+    pub(crate) fn settle_for_outside_edit(&mut self) {
+        self.finish_confirm();
+        self.close_panes();
+        self.save_prompt = None;
+        self.pending_pane = None;
+        self.editor.close_insert_step();
     }
 
     fn close_panes(&mut self) {
