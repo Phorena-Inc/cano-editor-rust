@@ -1919,7 +1919,7 @@ impl App {
     }
 
     /// Ends the confirmation, recording it as one undoable step.
-    fn finish_confirm(&mut self) {
+    pub(crate) fn finish_confirm(&mut self) {
         let Some(state) = self.confirming.take() else {
             return;
         };

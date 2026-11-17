@@ -340,6 +340,9 @@ enum Phase {
     Shell {
         slot: Slot<String>,
         id: String,
+        /// The command's process id once it has started, so that stopping
+        /// the task can stop the command too.
+        pid: Slot<u32>,
     },
 }
 
@@ -572,8 +575,13 @@ impl Assistant {
     fn cancel(&mut self) {
         let was_busy = !matches!(self.phase, Phase::Idle);
         let mut pending = std::mem::take(&mut self.results);
-        if let Phase::Shell { id, .. } = &self.phase {
+        if let Phase::Shell { id, pid, .. } = &self.phase {
             pending.push(cancelled(id));
+            // Esc cancels the task (FR-AI-6), so the command it started
+            // stops too, rather than running on unseen in the background.
+            if let Some(pid) = *pid.lock().unwrap_or_else(|e| e.into_inner()) {
+                stop_process_group(pid);
+            }
         }
         pending.extend(self.queue.drain(..).map(|call| cancelled(&call.id)));
         if !pending.is_empty()
@@ -978,11 +986,20 @@ fn line_edit(
     Ok((from, to, bytes))
 }
 
-fn shell(command: &str) -> String {
-    let output = Command::new("sh")
+fn shell(command: &str, started: &Slot<u32>) -> String {
+    let mut builder = Command::new("sh");
+    builder
         .args(["-c", command])
         .stdin(Stdio::null())
-        .output();
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Its own process group, so stopping it also stops what it started.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut builder, 0);
+    let output = builder.spawn().and_then(|child| {
+        *started.lock().unwrap_or_else(|e| e.into_inner()) = Some(child.id());
+        child.wait_with_output()
+    });
     match output {
         Ok(output) => {
             let mut text = format!(
@@ -1001,6 +1018,20 @@ fn shell(command: &str) -> String {
         }
         Err(error) => format!("could not start the shell: {error}"),
     }
+}
+
+/// Asks a shell command's process group to stop.
+fn stop_process_group(pid: u32) {
+    #[cfg(unix)]
+    if let Ok(pid) = libc::pid_t::try_from(pid) {
+        // SAFETY: `kill` takes plain integers; a group that has already
+        // exited makes it fail with ESRCH, which is ignored.
+        unsafe {
+            libc::kill(-pid, libc::SIGTERM);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 // ---- the editor side -------------------------------------------------------
@@ -1246,7 +1277,7 @@ impl App {
                 }
                 None => Vec::new(),
             },
-            Phase::Shell { slot, id } => match take(&slot) {
+            Phase::Shell { slot, id, .. } => match take(&slot) {
                 Some(output) => {
                     self.assistant.phase = Phase::Idle;
                     let first = output.lines().next().unwrap_or_default().to_owned();
@@ -1345,16 +1376,34 @@ impl App {
                 .unwrap_or_default()
                 .to_owned();
             let slot: Slot<String> = Arc::default();
-            let writer = Arc::clone(&slot);
+            let pid: Slot<u32> = Arc::default();
+            let (writer, started) = (Arc::clone(&slot), Arc::clone(&pid));
             std::thread::spawn(move || {
-                let output = shell(&command);
+                let output = shell(&command, &started);
                 *writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(output);
             });
-            self.assistant.phase = Phase::Shell { slot, id: call.id };
+            self.assistant.phase = Phase::Shell {
+                slot,
+                id: call.id,
+                pid,
+            };
             return Vec::new();
         }
         let mut effects = Vec::new();
+        // A tool that changes the buffer can arrive while the user is typing:
+        // keep the user's insertion and the tool's edit as separate steps.
+        let edits = matches!(call.name.as_str(), "edit_buffer" | "run_editor_command");
+        if edits {
+            // A `:s///c` waiting for an answer holds offsets into the buffer
+            // as it stands; end it here, keeping what was already accepted
+            // as one undo step, the way Escape would.
+            self.finish_confirm();
+            self.editor.close_insert_step();
+        }
         let outcome = self.tool(&call, &mut effects);
+        if edits {
+            self.editor.resume_insert_step();
+        }
         let (content, is_error) = match outcome {
             Ok(content) => (content, false),
             Err(error) => {
@@ -1859,6 +1908,213 @@ mod tests {
         app.handle(Input::Escape);
         app.handle(Input::Byte(b'u'));
         assert_eq!(app.editor.buffer.data, b"one\ntwo\nthree\n");
+    }
+
+    /// Real keys only: the user is typing on line 3, opens the panel with
+    /// Ctrl-K (which leaves the editor in Insert mode), asks for a change,
+    /// and the reply edits line `line`.  Escape then goes back to the editor.
+    fn edit_while_typing(line: u64) -> App {
+        let mut app = app_with_assistant(b"one\ntwo\nthree\n");
+        app.handle(Input::Byte(b'j'));
+        app.handle(Input::Byte(b'j'));
+        app.handle(Input::Byte(b'i'));
+        type_text(&mut app, "XY");
+        assert_eq!(app.editor.buffer.data, b"one\ntwo\nXYthree\n");
+        app.handle(Input::Control(11));
+        assert!(app.assistant.focused);
+        type_text(&mut app, "change a line");
+        app.handle(Input::Enter);
+        assert_eq!(app.editor.mode, crate::editor::Mode::Insert);
+        reply(
+            &mut app,
+            json!([{"type": "tool_use", "id": "e", "name": "edit_buffer",
+                    "input": {"start_line": line, "end_line": line, "new_text": "ONE!!"}}]),
+            "tool_use",
+        );
+        reply(
+            &mut app,
+            json!([{"type": "text", "text": "Done."}]),
+            "end_turn",
+        );
+        app.handle(Input::Escape); // the panel lets go of the keyboard
+        assert!(!app.assistant.focused);
+        app
+    }
+
+    #[test]
+    fn an_assistant_edit_while_typing_is_its_own_undo_step() {
+        // The edit lands above the text being typed, which moves it.
+        let mut app = edit_while_typing(1);
+        assert_eq!(app.editor.buffer.data, b"ONE!!\ntwo\nXYthree\n");
+        assert_eq!(app.editor.mode, crate::editor::Mode::Insert);
+        type_text(&mut app, "Z");
+        app.handle(Input::Escape);
+        // One `u` per step, newest first: the typing after the edit, the
+        // edit, then the typing before it.
+        app.handle(Input::Byte(b'u'));
+        assert_eq!(app.editor.buffer.data, b"ONE!!\ntwo\nXYthree\n");
+        app.handle(Input::Byte(b'u'));
+        assert_eq!(app.editor.buffer.data, b"one\ntwo\nXYthree\n");
+        app.handle(Input::Byte(b'u'));
+        assert_eq!(app.editor.buffer.data, b"one\ntwo\nthree\n");
+    }
+
+    #[test]
+    fn an_assistant_edit_below_the_typing_is_its_own_undo_step_too() {
+        let mut app = edit_while_typing(3);
+        assert_eq!(app.editor.buffer.data, b"one\ntwo\nONE!!\n");
+        app.handle(Input::Escape);
+        app.handle(Input::Byte(b'u'));
+        assert_eq!(app.editor.buffer.data, b"one\ntwo\nXYthree\n");
+        app.handle(Input::Byte(b'u'));
+        assert_eq!(app.editor.buffer.data, b"one\ntwo\nthree\n");
+    }
+
+    /// Every editor state that can hold buffer offsets across keys, hit by
+    /// an assistant edit that empties the buffer or grows it.  The panel is
+    /// unfocused the way a click in the text does it.  After the edit, a
+    /// fixed run of keys must leave the buffer valid and must not panic.
+    #[test]
+    fn an_assistant_edit_in_any_editor_state_leaves_a_valid_buffer() {
+        use Input::{Byte, Control, Enter, Escape};
+        let k = |s: &str| s.bytes().map(Byte).collect::<Vec<_>>();
+        let cat = |parts: Vec<Vec<Input>>| parts.concat();
+        let states: Vec<(&str, Vec<Input>)> = vec![
+            ("normal", vec![]),
+            ("insert", k("Axy")),
+            ("insert completion", cat(vec![k("Ao"), vec![Control(14)]])),
+            ("visual", k("vll")),
+            ("visual line", k("Vj")),
+            ("visual block", cat(vec![vec![Control(22)], k("jl")])),
+            ("pending operator", k("d")),
+            ("counted operator", k("2d")),
+            ("find character", k("f")),
+            ("command prompt", k(":s/o")),
+            ("search prompt", k("/t")),
+            (
+                "confirm substitute",
+                cat(vec![k(":%s/o/0/gc"), vec![Enter]]),
+            ),
+        ];
+        let edits = [("empty", 1, 3, ""), ("grow", 1, 1, "a\nb\nc\nd\ne")];
+        let after = cat(vec![
+            k("yn"),
+            vec![Escape],
+            k("lxu"),
+            vec![Control(18)],
+            k("pvdu"),
+        ]);
+        let mut failures = Vec::new();
+        for (name, keys) in &states {
+            for (edit, start, end, text) in edits {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut app = app_with_assistant(b"one\ntwo\nthree\n");
+                    app.handle(Control(11));
+                    type_text(&mut app, "edit");
+                    app.handle(Enter);
+                    app.assistant.focused = false;
+                    for key in keys {
+                        app.handle(*key);
+                    }
+                    reply(
+                        &mut app,
+                        json!([{"type": "tool_use", "id": "e", "name": "edit_buffer",
+                                "input": {"start_line": start, "end_line": end, "new_text": text}}]),
+                        "tool_use",
+                    );
+                    reply(
+                        &mut app,
+                        json!([{"type": "text", "text": "ok"}]),
+                        "end_turn",
+                    );
+                    for (i, key) in after.iter().enumerate() {
+                        app.handle(*key);
+                        if let Err(error) = app.editor.buffer.validate() {
+                            return Err(format!("after key {i} ({key:?}): {error:?}"));
+                        }
+                    }
+                    Ok(())
+                }));
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(why)) => failures.push(format!("{name} / {edit}: {why}")),
+                    Err(panic) => failures.push(format!(
+                        "{name} / {edit}: panic {}",
+                        panic
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or(panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                            .unwrap_or_default()
+                    )),
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn an_assistant_edit_ends_a_substitute_waiting_for_confirmation() {
+        let mut app = app_with_assistant(b"one\ntwo\nthree\n");
+        app.handle(Input::Control(11));
+        type_text(&mut app, "edit");
+        app.handle(Input::Enter);
+        app.assistant.focused = false;
+        type_text(&mut app, ":%s/o/0/gc");
+        app.handle(Input::Enter);
+        app.handle(Input::Byte(b'y'));
+        assert_eq!(app.editor.buffer.data, b"0ne\ntwo\nthree\n");
+        assert!(app.confirming.is_some());
+        reply(
+            &mut app,
+            json!([{"type": "tool_use", "id": "e", "name": "edit_buffer",
+                    "input": {"start_line": 3, "end_line": 3, "new_text": ""}}]),
+            "tool_use",
+        );
+        assert!(app.confirming.is_none());
+        reply(
+            &mut app,
+            json!([{"type": "text", "text": "ok"}]),
+            "end_turn",
+        );
+        app.handle(Input::Byte(b'u'));
+        assert_eq!(app.editor.buffer.data, b"0ne\ntwo\nthree\n");
+        app.handle(Input::Byte(b'u'));
+        assert_eq!(app.editor.buffer.data, b"one\ntwo\nthree\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escape_stops_a_running_shell_command() {
+        let mut app = app_with_assistant(b"");
+        app.handle(Input::Control(11));
+        type_text(&mut app, "wait");
+        app.handle(Input::Enter);
+        reply(
+            &mut app,
+            json!([{"type": "tool_use", "id": "s", "name": "run_shell",
+                    "input": {"command": "sleep 30"}}]),
+            "tool_use",
+        );
+        app.handle(Input::Byte(b'y'));
+        let Phase::Shell { pid, .. } = app.assistant.phase.clone() else {
+            panic!("not running: {:?}", app.assistant.phase);
+        };
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let pid = loop {
+            if let Some(pid) = *pid.lock().unwrap() {
+                break pid as libc::pid_t;
+            }
+            assert!(Instant::now() < deadline, "the command never started");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        app.handle(Input::Escape);
+        assert!(!app.assistant.busy());
+        // The group is gone once the worker has reaped `sh`.
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while unsafe { libc::kill(-pid, 0) } == 0 {
+            assert!(Instant::now() < deadline, "the command is still running");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]

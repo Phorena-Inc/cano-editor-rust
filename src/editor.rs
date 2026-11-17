@@ -174,6 +174,29 @@ impl Editor {
         }
     }
 
+    /// Ends the insertion being typed as its own undo step, staying in
+    /// Insert mode.  Call it before the buffer is changed from outside the
+    /// keyboard (the assistant's tools): otherwise the outside edit joins the
+    /// user's open step, and the insertion record keeps offsets that the
+    /// edit has moved, so `u` fails and the typed text can never be undone.
+    /// Pair it with [`Editor::resume_insert_step`] once the edit is done.
+    pub fn close_insert_step(&mut self) {
+        if self.mode != Mode::Insert {
+            return;
+        }
+        self.active_insert.end = self.buffer.cursor;
+        self.push_active_insert();
+        self.history.end_group();
+        self.begin_insert_record();
+    }
+
+    /// Starts a fresh insertion record at the cursor after an outside edit.
+    pub fn resume_insert_step(&mut self) {
+        if self.mode == Mode::Insert {
+            self.begin_insert_record();
+        }
+    }
+
     pub fn leave_insert(&mut self) -> bool {
         if self.mode != Mode::Insert {
             return false;
